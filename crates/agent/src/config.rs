@@ -7,6 +7,7 @@ pub struct Config {
     #[serde(default)]
     pub agent: AgentSection,
     pub auth: AuthConfig,
+    #[serde(default)]
     pub claude: ClaudeConfig,
 }
 
@@ -59,6 +60,16 @@ fn default_upstream() -> String {
 
 fn default_anthropic_beta() -> Vec<String> {
     vec!["oauth-2025-04-20".into()]
+}
+
+impl Default for ClaudeConfig {
+    fn default() -> Self {
+        Self {
+            credentials_path: default_credentials_path(),
+            upstream: default_upstream(),
+            anthropic_beta: default_anthropic_beta(),
+        }
+    }
 }
 
 impl Config {

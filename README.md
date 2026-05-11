@@ -4,8 +4,8 @@
 
 ## 组件
 
-- **`cloudcode-hub`** —— 中转层，做账号鉴权、ACL、JSONL 审计
-- **`cloudcode-agent`** —— 部署在已 `claude /login` 的机器，按订阅凭据转发请求（也可直连 API key）
+- **`cloudcode-hub`** —— 中转层，做账号鉴权、ACL、JSONL 审计；公网部署
+- **`cloudcode-agent`** —— 出站连 hub 的 WS 隧道端点，按订阅凭据转发请求；与日常 `claude /login` 同一系统账号下运行即可
 - **`cloudcode`** —— 客户端 launcher，开发者本地启动 claude
 
 ## 架构
@@ -16,12 +16,21 @@
 
 ## 安装
 
-```bash
-# 远端
-curl -fsSL https://raw.githubusercontent.com/initialz/cloudcode/main/install.sh | sh -s -- hub
-curl -fsSL https://raw.githubusercontent.com/initialz/cloudcode/main/install.sh | sh -s -- agent
+Hub（公网机器）：
 
-# 本地
+```bash
+curl -fsSL https://raw.githubusercontent.com/initialz/cloudcode/main/install.sh | sh -s -- hub
+```
+
+Agent（任意已 `claude /login` 的机器，NAT 后也可以）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/initialz/cloudcode/main/install.sh | sh -s -- agent
+```
+
+Client（开发者本机）：
+
+```bash
 curl -fsSL https://raw.githubusercontent.com/initialz/cloudcode/main/install.sh | sh -s -- client
 ```
 
@@ -29,26 +38,29 @@ curl -fsSL https://raw.githubusercontent.com/initialz/cloudcode/main/install.sh 
 
 ## 使用
 
-### Agent（一次性设置）
-
-在一台已 `claude /login` 过的机器：
-
-```bash
-cloudcode-agent gen-secret               # 生成 hub<->agent 共享密钥
-chmod 600 ~/.claude/.credentials.json    # 让 agent 能读
-$EDITOR ./agent.toml                     # 粘 shared_secret_hash + credentials_path
-cloudcode-agent daemon start --config ./agent.toml
-```
-
 ### Hub（管理员）
 
 ```bash
-cloudcode-hub gen-token alice            # 为每个用户生成 token
-$EDITOR ./hub.toml                       # 加 [[agents]] 与 [[accounts]]
-cloudcode-hub daemon start --config ./hub.toml
+cloudcode-hub gen-token alice      # 为每个用户生成 token
+$EDITOR ./hub.toml                 # 加 [[accounts]] 和 [[agents]]
+cloudcode-hub serve --config ./hub.toml          # 前台运行，日志打到 stdout
+# 或
+cloudcode-hub daemon start --config ./hub.toml   # 后台运行
 ```
 
-> Daemon 日志在 `~/.local/state/cloudcode/{hub,agent}.log`，`cloudcode-hub|cloudcode-agent daemon {status,stop,restart}` 管理生命周期。
+### Agent（一次性设置）
+
+跟你日常 `claude /login` 同一个系统账号下运行就好，agent 会自己读 `~/.claude/.credentials.json`，不用复制文件或改权限。
+
+```bash
+cloudcode-agent gen-secret         # 一次性生成 shared_secret + 哈希
+$EDITOR ./agent.toml               # 粘 [hub].url + [auth].shared_secret
+cloudcode-agent serve --config ./agent.toml          # 前台运行，日志打到 stdout
+# 或
+cloudcode-agent daemon start --config ./agent.toml   # 后台运行
+```
+
+`gen-secret` 的输出里还包含 `[[agents]]` 段落 —— 把那段交给 hub 管理员加到 `hub.toml`。
 
 ### Client（开发者）
 
@@ -64,6 +76,8 @@ cloudcode run claude
 ```
 
 体验和原生 `claude` 一致——所有 API 调用经 hub 鉴权、路由、留审计。
+
+> Daemon 模式日志写到 `~/.local/state/cloudcode/{hub,agent}.log`，用 `cloudcode-hub|cloudcode-agent daemon {status,stop,restart}` 管理生命周期。
 
 ## 配置参考
 

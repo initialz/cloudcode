@@ -1,26 +1,26 @@
 # Cloudcode Agent 配置示例
 # 复制为 agent.toml 后填入真实值。
-# 启动（前台）：cloudcode-agent serve --config agent.toml
-# 启动（守护）：cloudcode-agent daemon start --config agent.toml
+# 前台运行：cloudcode-agent serve --config agent.toml   （日志打到标准输出）
+# 后台运行：cloudcode-agent daemon start --config agent.toml
 
 [hub]
-# Hub 的 WebSocket 端点（公网地址）。生产用 wss://，本机调试可用 ws://127.0.0.1:7000/v1/agent/ws。
+# Hub 的 WebSocket 端点。生产用 wss://；本机调试可用 ws://127.0.0.1:7000/v1/agent/ws。
 url = "wss://hub.example.com/v1/agent/ws"
 
 [agent]
 # 可选。不填则自动用 `<hostname>-<user>`（小写，非法字符转 `-`）。
-# 如果 hub 报 name_taken，再来填这个固定值。
+# 如果 hub 报 name_taken，再填一个固定值。
 # name = "peter-mbp"
 
 [auth]
 # 由 `cloudcode-agent gen-secret` 生成的明文 secret。hub 端持其 argon2id 哈希。
 shared_secret = "ag_xxxxxxxxxxxxxxxxxxxx"
 
-[claude]
-# claude OAuth 凭据所在路径。建议把 ~/.claude/.credentials.json
-# 复制到本路径并 chown 给 cloudcode 用户、chmod 600。
-credentials_path = "/var/lib/cloudcode-agent/credentials.json"
-
-# 一般不动。
-# upstream = "https://api.anthropic.com"
-# anthropic_beta = ["oauth-2025-04-20"]
+# [claude] 段可整段省略 —— 默认就够用：
+# - credentials_path 默认 ~/.claude/.credentials.json
+# - 推荐 agent 跟你日常 `claude /login` 同一系统账号下运行，直接读默认路径
+#   即可，不必复制文件或改权限。
+# [claude]
+# credentials_path = "/custom/path/credentials.json"
+# upstream         = "https://api.anthropic.com"
+# anthropic_beta   = ["oauth-2025-04-20"]
