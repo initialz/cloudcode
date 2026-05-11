@@ -2,6 +2,9 @@ mod audit;
 mod auth;
 mod config;
 mod proxy;
+mod registry;
+mod tunnel;
+mod ws_handler;
 
 use anyhow::Context;
 use axum::{routing::get, routing::post, Router};
@@ -11,11 +14,13 @@ use std::sync::Arc;
 
 use crate::audit::AuditLog;
 use crate::config::Config;
+use crate::registry::AgentRegistry;
 
 pub struct AppState {
     pub config: Config,
     pub http: reqwest::Client,
     pub audit: AuditLog,
+    pub registry: Arc<AgentRegistry>,
 }
 
 #[derive(Parser)]
@@ -61,8 +66,8 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
-    let config = Config::load(&config_path)
-        .with_context(|| format!("loading {}", config_path.display()))?;
+    let config =
+        Config::load(&config_path).with_context(|| format!("loading {}", config_path.display()))?;
     let audit = AuditLog::open(&config.server.audit_log)?;
     let http = reqwest::Client::builder().build()?;
     let listen = config.server.listen.clone();
@@ -71,10 +76,12 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         config,
         http,
         audit,
+        registry: Arc::new(AgentRegistry::new()),
     });
 
     let app = Router::new()
         .route("/anthropic/v1/messages", post(proxy::anthropic_messages))
+        .route("/v1/agent/ws", get(ws_handler::upgrade))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state);
 

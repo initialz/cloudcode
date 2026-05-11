@@ -21,7 +21,11 @@ pub struct OAuthCredentials {
     pub expires_at: i64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scopes: Vec<String>,
-    #[serde(rename = "subscriptionType", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "subscriptionType",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub subscription_type: Option<String>,
 }
 
@@ -71,8 +75,7 @@ fn read_file(path: &Path) -> Result<CredentialsFile> {
 fn write_file(path: &Path, creds: &CredentialsFile) -> Result<()> {
     let s = serde_json::to_string_pretty(creds)?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, s)
-        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::write(&tmp, s).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, path)
         .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
     Ok(())

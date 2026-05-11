@@ -1,0 +1,183 @@
+use crate::tunnel::{ClientMsg, RejectReason, ServerMsg, PROTOCOL_VERSION};
+use crate::AppState;
+use anyhow::anyhow;
+use futures::{SinkExt, StreamExt};
+use rand::Rng;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::Message;
+
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const SEND_QUEUE: usize = 128;
+
+pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
+    let mut backoff = Backoff::new();
+    loop {
+        match run_once(state.clone()).await {
+            Ok(()) => {
+                tracing::info!("hub session closed; reconnecting shortly");
+                backoff.reset();
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(RunError::Fatal(reason)) => {
+                return Err(anyhow!(
+                    "hub rejected agent ({reason}); fix config and restart"
+                ));
+            }
+            Err(RunError::Transient(e)) => {
+                let delay = backoff.next();
+                tracing::warn!(error = %e, delay_ms = delay.as_millis(), "hub connection failed");
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum RunError {
+    /// Hub explicitly rejected us; reconnecting will not help.
+    Fatal(String),
+    /// Network / parse / unexpected disconnect; retry with backoff.
+    Transient(String),
+}
+
+async fn run_once(state: Arc<AppState>) -> Result<(), RunError> {
+    let url = state.config.hub.url.clone();
+    tracing::info!(url = %url, name = %state.name, "connecting to hub");
+
+    let (ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .map_err(|e| RunError::Transient(format!("connect: {}", e)))?;
+    let (mut sink, mut stream) = ws.split();
+
+    let hello = ClientMsg::Hello {
+        name: state.name.clone(),
+        secret: state.config.auth.shared_secret.clone(),
+        version: PROTOCOL_VERSION.into(),
+    };
+    let hello_json = serde_json::to_string(&hello)
+        .map_err(|e| RunError::Transient(format!("encode hello: {}", e)))?;
+    sink.send(Message::Text(hello_json))
+        .await
+        .map_err(|e| RunError::Transient(format!("send hello: {}", e)))?;
+
+    let first = tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.next())
+        .await
+        .map_err(|_| RunError::Transient("welcome timeout".into()))?;
+    match first {
+        Some(Ok(Message::Text(s))) => {
+            let msg: ServerMsg = serde_json::from_str(&s)
+                .map_err(|e| RunError::Transient(format!("parse welcome: {}", e)))?;
+            match msg {
+                ServerMsg::Welcome { name } => {
+                    tracing::info!(agent = %name, "connected to hub");
+                }
+                ServerMsg::Rejected { reason } => {
+                    return Err(RunError::Fatal(reject_label(reason).into()));
+                }
+                _ => return Err(RunError::Transient("unexpected handshake frame".into())),
+            }
+        }
+        Some(Ok(_)) => return Err(RunError::Transient("non-text handshake frame".into())),
+        Some(Err(e)) => return Err(RunError::Transient(format!("ws: {}", e))),
+        None => return Err(RunError::Transient("eof before welcome".into())),
+    }
+
+    let (tx, mut rx) = mpsc::channel::<ClientMsg>(SEND_QUEUE);
+
+    let writer = tokio::spawn(async move {
+        while let Some(m) = rx.recv().await {
+            let text = match serde_json::to_string(&m) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(error = %e, "encode frame failed");
+                    continue;
+                }
+            };
+            if sink.send(Message::Text(text)).await.is_err() {
+                break;
+            }
+        }
+        let _ = sink.close().await;
+    });
+
+    let read_result = read_loop(state.clone(), tx.clone(), &mut stream).await;
+    drop(tx);
+    let _ = writer.await;
+    read_result
+}
+
+async fn read_loop<S>(
+    state: Arc<AppState>,
+    tx: mpsc::Sender<ClientMsg>,
+    stream: &mut S,
+) -> Result<(), RunError>
+where
+    S: futures::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    while let Some(item) = stream.next().await {
+        let msg = item.map_err(|e| RunError::Transient(format!("ws: {}", e)))?;
+        match msg {
+            Message::Text(s) => match serde_json::from_str::<ServerMsg>(&s) {
+                Ok(ServerMsg::Request {
+                    req_id,
+                    method,
+                    path,
+                    headers,
+                    body_b64,
+                }) => {
+                    let st = state.clone();
+                    let send = tx.clone();
+                    tokio::spawn(async move {
+                        crate::proxy::forward(st, req_id, method, path, headers, body_b64, send)
+                            .await;
+                    });
+                }
+                Ok(ServerMsg::Ping) => {
+                    let _ = tx.send(ClientMsg::Pong).await;
+                }
+                Ok(ServerMsg::Welcome { .. }) => {
+                    tracing::warn!("duplicate welcome from hub; ignoring");
+                }
+                Ok(ServerMsg::Rejected { reason }) => {
+                    return Err(RunError::Fatal(reject_label(reason).into()));
+                }
+                Err(e) => tracing::warn!(error = %e, "bad frame from hub"),
+            },
+            Message::Binary(_) => tracing::warn!("unexpected binary frame from hub"),
+            Message::Ping(_) | Message::Pong(_) => {}
+            Message::Close(_) => return Ok(()),
+            Message::Frame(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn reject_label(r: RejectReason) -> &'static str {
+    match r {
+        RejectReason::NameInvalid => "name_invalid (hub has no [[agents]] entry with this name)",
+        RejectReason::NameTaken => "name_taken (another agent with this name is already connected)",
+        RejectReason::AuthFailed => "auth_failed (shared_secret does not match)",
+        RejectReason::VersionMismatch => "version_mismatch (upgrade agent or hub)",
+    }
+}
+
+struct Backoff {
+    next_ms: u64,
+}
+
+impl Backoff {
+    fn new() -> Self {
+        Self { next_ms: 1000 }
+    }
+    fn reset(&mut self) {
+        self.next_ms = 1000;
+    }
+    fn next(&mut self) -> Duration {
+        let cur = self.next_ms;
+        self.next_ms = (cur * 2).min(30_000);
+        let jitter = rand::thread_rng().gen_range(0..500);
+        Duration::from_millis(cur + jitter)
+    }
+}

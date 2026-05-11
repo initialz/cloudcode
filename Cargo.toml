@@ -18,7 +18,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 futures = "0.3"
@@ -27,3 +27,9 @@ argon2 = "0.5"
 rand = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dirs = "5"
+dashmap = "6"
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+gethostname = "0.5"
+whoami = "1"
+base64 = "0.22"
+url = "2"

@@ -53,7 +53,9 @@ fn state_dir() -> Result<PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("state")))
-        .context("could not determine state dir; set CLOUDCODE_STATE_DIR, XDG_STATE_HOME, or HOME")?;
+        .context(
+            "could not determine state dir; set CLOUDCODE_STATE_DIR, XDG_STATE_HOME, or HOME",
+        )?;
     let dir = base.join("cloudcode");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     Ok(dir)

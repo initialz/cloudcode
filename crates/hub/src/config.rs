@@ -18,9 +18,9 @@ pub struct Config {
 #[derive(Debug, Deserialize, Clone)]
 pub struct AgentConfig {
     pub name: String,
-    pub url: String,
-    /// Plain shared secret sent as `Authorization: Bearer <secret>` to the agent.
-    pub shared_secret: String,
+    /// argon2id hash of the shared secret. The agent presents the plaintext
+    /// secret in its `hello` frame when connecting to /v1/agent/ws.
+    pub shared_secret_hash: String,
 }
 
 #[derive(Debug, Deserialize)]

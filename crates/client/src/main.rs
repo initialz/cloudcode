@@ -3,7 +3,10 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "cloudcode", about = "Cloudcode client: launch AI CLI tools via cloudcode hub")]
+#[command(
+    name = "cloudcode",
+    about = "Cloudcode client: launch AI CLI tools via cloudcode hub"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,

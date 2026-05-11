@@ -3,21 +3,31 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
-    pub server: ServerConfig,
+    pub hub: HubConfig,
+    #[serde(default)]
+    pub agent: AgentSection,
     pub auth: AuthConfig,
     pub claude: ClaudeConfig,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ServerConfig {
-    pub listen: String,
+pub struct HubConfig {
+    /// WebSocket URL of the hub, e.g. `wss://hub.example.com/v1/agent/ws`.
+    pub url: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct AgentSection {
+    /// Override the auto-generated agent name (`<hostname>-<user>`).
+    /// Set this when the auto-generated name collides on the hub.
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct AuthConfig {
-    /// argon2id hash of the shared secret that hubs present in
-    /// `Authorization: Bearer <secret>` when calling this agent.
-    pub shared_secret_hash: String,
+    /// Plaintext secret presented to the hub in the `hello` frame. The hub
+    /// stores its argon2id hash in `[[agents]].shared_secret_hash`.
+    pub shared_secret: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -31,8 +41,6 @@ pub struct ClaudeConfig {
     pub upstream: String,
 
     /// Anthropic-beta header values to send (joined with ',').
-    /// Claude Code itself sends `oauth-2025-04-20` plus a handful of
-    /// claude-code-specific feature flags. Override here if you need extra ones.
     #[serde(default = "default_anthropic_beta")]
     pub anthropic_beta: Vec<String>,
 }

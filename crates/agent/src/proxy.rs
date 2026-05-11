@@ -1,28 +1,33 @@
-use crate::{auth, AppState};
-use axum::body::Body;
-use axum::extract::State;
-use axum::http::{HeaderMap, Request, StatusCode};
-use axum::response::{IntoResponse, Response};
+use crate::tunnel::ClientMsg;
+use crate::AppState;
+use base64::Engine;
+use futures::StreamExt;
+use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
-const MAX_BODY: usize = 32 * 1024 * 1024;
-
-pub async fn messages(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    req: Request<Body>,
-) -> Response {
-    // Hub-to-agent auth: Bearer <shared_secret>
-    let Some(presented) = auth::extract_secret(&headers) else {
-        return (StatusCode::UNAUTHORIZED, "missing bearer").into_response();
-    };
-    if !auth::verify_secret(&presented, &state.config.auth.shared_secret_hash) {
-        return (StatusCode::UNAUTHORIZED, "invalid bearer").into_response();
-    }
-
-    let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_BODY).await {
+/// Forward a single hub-pushed request to the upstream Anthropic API and
+/// stream the response back as `RespHead`/`RespChunk`/`RespEnd` frames.
+pub async fn forward(
+    state: Arc<AppState>,
+    req_id: u64,
+    _method: String,
+    _path: String,
+    headers: HashMap<String, String>,
+    body_b64: String,
+    send: mpsc::Sender<ClientMsg>,
+) {
+    let body = match base64::engine::general_purpose::STANDARD.decode(body_b64.as_bytes()) {
         Ok(b) => b,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("body: {}", e)).into_response(),
+        Err(e) => {
+            let _ = send
+                .send(ClientMsg::RespError {
+                    req_id,
+                    message: format!("body decode: {}", e),
+                })
+                .await;
+            return;
+        }
     };
 
     let creds = state.credentials.snapshot();
@@ -40,8 +45,7 @@ pub async fn messages(
         .header("content-type", "application/json");
 
     if !beta_value.is_empty() {
-        // forward client's anthropic-beta plus our oauth-required flag
-        let combined = match headers.get("anthropic-beta").and_then(|v| v.to_str().ok()) {
+        let combined = match headers.get("anthropic-beta") {
             Some(client_beta) if !client_beta.is_empty() => {
                 format!("{},{}", client_beta, beta_value)
             }
@@ -50,31 +54,62 @@ pub async fn messages(
         builder = builder.header("anthropic-beta", combined);
     }
 
-    let upstream = match builder.body(body_bytes.to_vec()).send().await {
+    let upstream = match builder.body(body).send().await {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!(error = %e, "upstream request failed");
-            return (StatusCode::BAD_GATEWAY, format!("upstream: {}", e)).into_response();
+            tracing::warn!(error = %e, req_id, "upstream request failed");
+            let _ = send
+                .send(ClientMsg::RespError {
+                    req_id,
+                    message: format!("upstream: {}", e),
+                })
+                .await;
+            return;
         }
     };
 
-    let status = upstream.status();
-    let upstream_headers = upstream.headers().clone();
-    let body_stream = upstream.bytes_stream();
-
-    let mut resp_builder = Response::builder().status(status);
+    let status = upstream.status().as_u16();
+    let mut head_headers = HashMap::new();
     for k in ["content-type", "anthropic-request-id"] {
-        if let Some(v) = upstream_headers.get(k) {
-            resp_builder = resp_builder.header(k, v);
+        if let Some(v) = upstream.headers().get(k).and_then(|v| v.to_str().ok()) {
+            head_headers.insert(k.into(), v.into());
         }
     }
-    resp_builder
-        .body(Body::from_stream(body_stream))
-        .unwrap_or_else(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("resp build: {}", e),
-            )
-                .into_response()
+    if send
+        .send(ClientMsg::RespHead {
+            req_id,
+            status,
+            headers: head_headers,
         })
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    let mut stream = upstream.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(b) => {
+                let data_b64 = base64::engine::general_purpose::STANDARD.encode(&b);
+                if send
+                    .send(ClientMsg::RespChunk { req_id, data_b64 })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(e) => {
+                let _ = send
+                    .send(ClientMsg::RespError {
+                        req_id,
+                        message: format!("stream: {}", e),
+                    })
+                    .await;
+                return;
+            }
+        }
+    }
+    let _ = send.send(ClientMsg::RespEnd { req_id }).await;
 }

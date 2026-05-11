@@ -39,10 +39,7 @@ async fn tick(store: &CredentialsStore, http: &reqwest::Client) -> Result<()> {
         return Ok(()); // still fresh
     }
 
-    tracing::info!(
-        remaining_secs,
-        "access_token nearing expiry; refreshing"
-    );
+    tracing::info!(remaining_secs, "access_token nearing expiry; refreshing");
 
     let refreshed = refresh_once(http, &snap.refresh_token).await?;
     let new_creds = OAuthCredentials {
