@@ -143,7 +143,7 @@ fn init_config(path: &Path) -> anyhow::Result<()> {
 [server]
 # Listen address. Bind behind a TLS-terminating reverse proxy (nginx /
 # caddy) in production. Agents dial wss://<your-host>/v1/agent/ws.
-listen = "0.0.0.0:7000"
+listen = "0.0.0.0:7100"
 audit_log = "./audit.jsonl"
 
 [agents]

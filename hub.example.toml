@@ -7,8 +7,8 @@
 # 启动（守护）：             cloudcode-hub daemon start --config hub.toml
 
 [server]
-# 对外监听地址。生产配在反向代理后（nginx/caddy + TLS），代理转发到 127.0.0.1:7000。
-listen = "0.0.0.0:7000"
+# 对外监听地址。生产配在反向代理后（nginx/caddy + TLS），代理转发到 127.0.0.1:7100。
+listen = "0.0.0.0:7100"
 audit_log = "./audit.jsonl"
 
 [agents]

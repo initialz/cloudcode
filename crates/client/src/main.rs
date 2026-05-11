@@ -125,7 +125,7 @@ fn show_config() -> Result<()> {
             println!("config not found. create with:");
             println!("  mkdir -p {}", path.parent().unwrap().display());
             println!("  cat > {} <<EOF", path.display());
-            println!("  hub_url = \"http://localhost:7000\"");
+            println!("  hub_url = \"http://localhost:7100\"");
             println!("  token = \"cc_xxx\"");
             println!("  EOF");
         }

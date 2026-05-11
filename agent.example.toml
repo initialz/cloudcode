@@ -8,7 +8,7 @@
 # 后台运行：cloudcode-agent daemon start --config agent.toml
 
 [hub]
-# Hub 的 WebSocket 端点。生产用 wss://；本机调试可用 ws://127.0.0.1:7000/v1/agent/ws。
+# Hub 的 WebSocket 端点。生产用 wss://；本机调试可用 ws://127.0.0.1:7100/v1/agent/ws。
 url = "wss://hub.example.com/v1/agent/ws"
 
 [agent]
