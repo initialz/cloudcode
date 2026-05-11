@@ -1,6 +1,7 @@
-# Cloudcode Agent 配置示例。注意：第一次运行 `cloudcode-agent --config agent.toml`
-# 时，如果 agent.toml 不存在，会自动生成一份（含新的 shared_secret），
-# 并打印 [[agents]] 块给 hub 管理员。这份示例仅供参考。
+# Cloudcode Agent 配置示例。
+# 一次性初始化：`cloudcode-agent --init --config agent.toml`
+#   会生成一份新的 agent.toml（含自动生成的 shared_secret），并打印
+#   [[agents]] 块给 hub 管理员。已存在则拒绝覆盖。
 #
 # 前台运行：cloudcode-agent --config agent.toml          （日志打到标准输出）
 # 后台运行：cloudcode-agent daemon start --config agent.toml

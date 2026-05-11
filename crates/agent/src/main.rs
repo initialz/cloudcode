@@ -7,7 +7,7 @@ mod refresh;
 mod tunnel;
 mod ws;
 
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,11 +29,15 @@ pub struct AppState {
 )]
 struct Cli {
     /// Path to agent config. With no subcommand, agent runs in the foreground
-    /// using this config and streams logs to stdout. On first run, if the
-    /// file is missing, a template (with an auto-generated shared_secret)
-    /// is written here and the agent exits so you can edit it.
+    /// using this config and streams logs to stdout.
     #[arg(short, long, default_value = "agent.toml", global = true)]
     config: PathBuf,
+
+    /// One-time setup: write a fresh agent.toml at `--config` with an
+    /// auto-generated shared_secret, and print the matching [[agents]] block
+    /// for the hub admin. Refuses to overwrite if the file already exists.
+    #[arg(long)]
+    init: bool,
 
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -58,6 +62,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if cli.init {
+        if cli.cmd.is_some() {
+            return Err(anyhow!("--init cannot be combined with a subcommand"));
+        }
+        return init_config(&cli.config);
+    }
     match cli.cmd {
         None => serve(cli.config).await,
         Some(Cmd::Daemon { cmd }) => cloudcode_daemon::run("agent", "agent.toml", cmd),
@@ -66,8 +76,11 @@ async fn main() -> anyhow::Result<()> {
 
 async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
     if !config_path.exists() {
-        init_config(&config_path)?;
-        return Ok(());
+        return Err(anyhow!(
+            "{} not found; run `cloudcode-agent --init --config {}` to generate one",
+            config_path.display(),
+            config_path.display()
+        ));
     }
 
     let config =
@@ -103,8 +116,15 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
 
 /// Write a fresh agent.toml with an auto-generated shared_secret, and print
 /// the matching [[agents]] block (containing the argon2id hash) so the user
-/// can hand it to the hub admin.
+/// can hand it to the hub admin. Refuses to overwrite an existing file.
 fn init_config(path: &Path) -> anyhow::Result<()> {
+    if path.exists() {
+        return Err(anyhow!(
+            "{} already exists; refusing to overwrite. Delete it first if you really want to re-init.",
+            path.display()
+        ));
+    }
+
     let secret = auth::generate_secret();
     let hash = auth::hash_secret(&secret)?;
     let agent_name = name::default_agent_name();

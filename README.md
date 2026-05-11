@@ -61,10 +61,10 @@ cloudcode-hub daemon start --config ./hub.toml   # background
 Run the agent as the same OS user that did `claude /login`. The agent will read `~/.claude/.credentials.json` automatically — no file copying or `chmod` required.
 
 ```bash
-# First run: agent.toml does not exist yet. The agent writes a template
-# (with an auto-generated shared_secret) and prints an [[agents]] block
-# to hand to your hub admin, then exits.
-cloudcode-agent --config ./agent.toml
+# One-time: write a fresh agent.toml with an auto-generated shared_secret,
+# and print an [[agents]] block to hand to your hub admin. Refuses to
+# overwrite if agent.toml already exists.
+cloudcode-agent --init --config ./agent.toml
 
 $EDITOR ./agent.toml                     # edit [hub].url
 
