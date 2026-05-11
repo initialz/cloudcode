@@ -47,8 +47,17 @@ struct ClientConfig {
 }
 
 fn config_path() -> Result<PathBuf> {
-    let dir = dirs::config_dir().context("could not find user config dir")?;
-    Ok(dir.join("cloudcode").join("config.toml"))
+    // Cross-platform: use $XDG_CONFIG_HOME if set, else ~/.config/. We
+    // deliberately don't follow `dirs::config_dir()`, which would put
+    // the file under ~/Library/Application Support on macOS — most CLI
+    // tools (rustup, gh, docker…) use ~/.config there too.
+    if let Ok(p) = std::env::var("XDG_CONFIG_HOME") {
+        if !p.is_empty() {
+            return Ok(PathBuf::from(p).join("cloudcode").join("config.toml"));
+        }
+    }
+    let home = dirs::home_dir().context("could not find home dir")?;
+    Ok(home.join(".config").join("cloudcode").join("config.toml"))
 }
 
 fn load_config() -> Result<ClientConfig> {

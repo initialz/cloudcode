@@ -94,7 +94,7 @@ There's a **single global agent registration token**: every agent in the fleet u
 ### Client (developer)
 
 ```toml
-# ~/.config/cloudcode/config.toml  (macOS: ~/Library/Application Support/cloudcode/config.toml)
+# ~/.config/cloudcode/config.toml
 hub_url = "https://your-hub-host"
 token   = "cc_xxx_from_admin"
 ```
