@@ -10,24 +10,25 @@ use std::process::ExitCode;
 #[derive(Parser)]
 #[command(
     name = "cloudcode",
-    about = "Cloudcode client: open an interactive claude session on a remote agent"
+    about = "Cloudcode client: open an interactive claude session on a remote agent",
+    long_about = "Running `cloudcode` with no subcommand opens a TUI chat against \
+                  the remote agent configured in ~/.config/cloudcode/config.toml. \
+                  Use `cloudcode config` to inspect or set up that file."
 )]
 struct Cli {
+    /// Open this workspace immediately.
+    #[arg(long, default_value = "default")]
+    workspace: String,
+    /// Pin the session to a specific agent name.
+    #[arg(long)]
+    agent: Option<String>,
+
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Open a TUI chat against a remote claude.
-    Chat {
-        /// Pin the session to a specific agent name.
-        #[arg(long)]
-        agent: Option<String>,
-        /// Open this workspace immediately (default: "default").
-        #[arg(long, default_value = "default")]
-        workspace: String,
-    },
     /// Show the resolved client config (or print init instructions).
     Config,
 }
@@ -58,8 +59,8 @@ fn load_config() -> Result<ClientConfig> {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.cmd {
-        Cmd::Chat { agent, workspace } => run_chat(agent, workspace).await,
-        Cmd::Config => show_config(),
+        None => run_chat(cli.agent, cli.workspace).await,
+        Some(Cmd::Config) => show_config(),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

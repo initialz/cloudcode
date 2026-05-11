@@ -14,7 +14,7 @@ If you use this software to violate any provider's Terms of Service or applicabl
 
 - **`cloudcode-hub`** — public-facing gateway: account-token auth, ACL, workspace mutex, JSONL audit log. Routes session traffic between clients and agents.
 - **`cloudcode-agent`** — long-running daemon on a host where you've `claude /login`'d. Dials out to the hub over WSS. When the hub pushes a user turn, the agent fork+execs `claude -p --output-format stream-json` in the selected workspace and streams the result back. Multi-turn conversations are stitched together with `--resume <session_id>`.
-- **`cloudcode`** — TUI client on your laptop. `cloudcode chat` opens an interactive session with claude on a remote agent; slash commands manage workspaces on the agent side.
+- **`cloudcode`** — TUI client on your laptop. Run `cloudcode` to open an interactive session with claude on a remote agent; slash commands manage workspaces on the agent side.
 
 ## Architecture
 
@@ -94,12 +94,12 @@ hub_url = "https://your-hub-host"
 token   = "cc_xxx_from_admin"
 ```
 
-Open a chat session — drops you into a TUI:
+Run `cloudcode` — drops you into a TUI:
 
 ```bash
-cloudcode chat                       # uses workspace "default"
-cloudcode chat --workspace projA     # open straight into a named workspace
-cloudcode chat --agent peter-mbp     # pin a specific agent
+cloudcode                            # uses workspace "default"
+cloudcode --workspace projA          # open straight into a named workspace
+cloudcode --agent peter-mbp          # pin a specific agent
 ```
 
 #### TUI keybindings

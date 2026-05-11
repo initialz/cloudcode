@@ -13,7 +13,7 @@
           <mxGeometry x="180" y="36" width="820" height="20" as="geometry"/>
         </mxCell>
 
-        <mxCell id="client" value="&lt;b&gt;Client (TUI)&lt;/b&gt;&#xa;&lt;font color=&quot;#1d4ed8&quot;&gt;cloudcode chat&lt;/font&gt;&#xa;&#xa;multi-line input&#xa;slash commands&#xa;streaming output&#xa;&#xa;&lt;i&gt;Laptop / phone / SSH&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dbeafe;strokeColor=#1d4ed8;align=center;verticalAlign=middle;fontColor=#1e3a8a;fontSize=12;" vertex="1" parent="1">
+        <mxCell id="client" value="&lt;b&gt;Client (TUI)&lt;/b&gt;&#xa;&lt;font color=&quot;#1d4ed8&quot;&gt;cloudcode&lt;/font&gt;&#xa;&#xa;multi-line input&#xa;slash commands&#xa;streaming output&#xa;&#xa;&lt;i&gt;Laptop / phone / SSH&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dbeafe;strokeColor=#1d4ed8;align=center;verticalAlign=middle;fontColor=#1e3a8a;fontSize=12;" vertex="1" parent="1">
           <mxGeometry x="40" y="120" width="190" height="180" as="geometry"/>
         </mxCell>
 
