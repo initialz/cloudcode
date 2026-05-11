@@ -2,6 +2,7 @@ mod input;
 mod menu;
 mod proto;
 mod relay;
+mod splash;
 mod wire;
 
 use anyhow::{anyhow, Context, Result};
@@ -204,16 +205,18 @@ async fn run_chat(agent_flag: Option<String>) -> Result<()> {
     let cfg = load_config()?;
     let mut wire = wire::connect(&cfg.hub_url, &cfg.token).await?;
 
-    match wire.in_text_rx.recv().await {
-        Some(HubToClient::Welcome { .. }) => {}
+    let account_name = match wire.in_text_rx.recv().await {
+        Some(HubToClient::Welcome { account }) => account,
         Some(HubToClient::Rejected { reason }) => {
             return Err(anyhow!("hub rejected: {}", reason));
         }
         other => return Err(anyhow!("expected welcome, got {:?}", other.is_some())),
-    }
+    };
 
     let mut keys = input::spawn_reader();
     let preferred_agent: Option<String> = agent_flag.or_else(read_last_agent);
+
+    splash::show(&mut keys, &account_name).await?;
 
     loop {
         let outcome = menu::run(&mut wire, &mut keys, preferred_agent.as_deref()).await?;
