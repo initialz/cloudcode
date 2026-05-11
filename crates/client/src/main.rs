@@ -1,3 +1,4 @@
+mod input;
 mod menu;
 mod proto;
 mod relay;
@@ -5,10 +6,8 @@ mod wire;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use tokio::sync::mpsc;
 
 use crate::proto::{ClientToHub, HubToClient};
 use crate::wire::OutFrame;
@@ -110,21 +109,21 @@ fn write_text_file(path: &PathBuf, contents: &str) {
     let _ = std::fs::write(path, contents);
 }
 
-fn read_last_agent() -> Option<String> {
+pub fn read_last_agent() -> Option<String> {
     read_text_file(&last_agent_path().ok()?)
 }
 
-fn write_last_agent(name: &str) {
+pub fn write_last_agent(name: &str) {
     if let Ok(p) = last_agent_path() {
         write_text_file(&p, name);
     }
 }
 
-fn read_last_workspace(agent: &str) -> Option<String> {
+pub fn read_last_workspace(agent: &str) -> Option<String> {
     read_text_file(&last_workspace_path(agent).ok()?)
 }
 
-fn write_last_workspace(agent: &str, workspace: &str) {
+pub fn write_last_workspace(agent: &str, workspace: &str) {
     if let Ok(p) = last_workspace_path(agent) {
         write_text_file(&p, workspace);
     }
@@ -213,42 +212,13 @@ async fn run_chat(agent_flag: Option<String>) -> Result<()> {
         other => return Err(anyhow!("expected welcome, got {:?}", other.is_some())),
     }
 
-    let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(64);
-    std::thread::Builder::new()
-        .name("stdin-pump".into())
-        .spawn(move || stdin_pump_loop(stdin_tx))
-        .ok();
-
-    let mut chosen_agent: Option<String> = agent_flag.or_else(read_last_agent);
+    let mut keys = input::spawn_reader();
+    let preferred_agent: Option<String> = agent_flag.or_else(read_last_agent);
 
     loop {
-        wire.out_tx
-            .send(OutFrame::Text(ClientToHub::SelectAgent {
-                agent: chosen_agent.clone(),
-            }))
-            .await
-            .map_err(|_| anyhow!("hub disconnected"))?;
-        let selected = loop {
-            match wire.in_text_rx.recv().await {
-                Some(HubToClient::AgentSelected { agent }) => break agent,
-                Some(HubToClient::SessionError { message }) => {
-                    return Err(anyhow!("select agent: {}", message));
-                }
-                Some(HubToClient::Ping) => {
-                    let _ = wire.out_tx.send(OutFrame::Text(ClientToHub::Pong)).await;
-                }
-                Some(_) => continue,
-                None => return Err(anyhow!("hub closed connection")),
-            }
-        };
-        chosen_agent = Some(selected.clone());
-        write_last_agent(&selected);
-
-        let last_ws = read_last_workspace(&selected);
-        let action = menu::run(&mut wire, &mut stdin_rx, &selected, last_ws.as_deref()).await?;
-
-        match action {
-            menu::MenuAction::Open(workspace) => {
+        let outcome = menu::run(&mut wire, &mut keys, preferred_agent.as_deref()).await?;
+        match outcome {
+            menu::MenuOutcome::OpenWorkspace { agent, workspace } => {
                 let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
                 wire.out_tx
                     .send(OutFrame::Text(ClientToHub::OpenSession {
@@ -258,7 +228,6 @@ async fn run_chat(agent_flag: Option<String>) -> Result<()> {
                     }))
                     .await
                     .map_err(|_| anyhow!("hub disconnected"))?;
-
                 let mut opened = false;
                 loop {
                     match wire.in_text_rx.recv().await {
@@ -280,34 +249,14 @@ async fn run_chat(agent_flag: Option<String>) -> Result<()> {
                 if !opened {
                     continue;
                 }
-
-                write_last_workspace(&selected, &workspace);
-                relay::run(&mut wire, &mut stdin_rx).await.ok();
-                // Back to the menu on the next iteration.
+                write_last_workspace(&agent, &workspace);
+                relay::run(&mut wire, &mut keys).await.ok();
+                // back to menu
             }
-            menu::MenuAction::SwitchAgent(name) => {
-                chosen_agent = name;
-            }
-            menu::MenuAction::Quit => {
+            menu::MenuOutcome::Quit => {
                 let _ = wire.out_tx.send(OutFrame::Text(ClientToHub::Close)).await;
                 return Ok(());
             }
-        }
-    }
-}
-
-fn stdin_pump_loop(tx: mpsc::Sender<Vec<u8>>) {
-    let mut stdin = std::io::stdin().lock();
-    let mut buf = [0u8; 4096];
-    loop {
-        match stdin.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                if tx.blocking_send(buf[..n].to_vec()).is_err() {
-                    break;
-                }
-            }
-            Err(_) => break,
         }
     }
 }

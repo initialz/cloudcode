@@ -110,22 +110,23 @@ cloudcode                            # menu picks last agent + last workspace
 cloudcode --agent peter-mbp          # pin a specific agent
 ```
 
-You land on a small picker:
+You get a small **TUI picker** — first pick an agent, then a workspace, then drop into claude.
 
 ```
-agent: peter-mbp
-workspaces:
-  [1] * default
-  [2]   projA
-  [3]   projB
-
-  c <name>   create workspace       d <num|name>  delete workspace
-  a [name]   list/switch agent      q             quit
-
-choose [1]:
+┌─ Select agent ────────────────┐    ┌─ Select workspace on alpha ────┐
+│ ▶ alpha                       │    │   default                       │
+│   beta                        │    │ ▶ proja                         │
+│                               │    │   projb                         │
+└───────────────────────────────┘    └─────────────────────────────────┘
+ ↑↓ move · Enter pick · Esc/q quit   ↑↓ Enter · c create · d delete · Esc back · q quit
 ```
 
-Type a number / name and press Enter to drop into that workspace's claude session. **Inside claude there's no cloudcode escape mode** — every keystroke goes to claude as-is, claude's own slash commands (`/clear`, `/login`, …) work normally. When claude exits (you type `/exit`, the process dies, etc) you're dropped back at the picker. From the picker, `q` quits cloudcode.
+- **Arrow keys** (or `j` / `k`) to move; **Enter** to pick.
+- `c` opens a small input box for a new workspace name.
+- `d` asks `y/n` to delete the highlighted workspace.
+- `Esc` on the workspace picker goes back to the agent picker; `Esc` (or `q`) on the agent picker quits cloudcode.
+
+Pick a workspace and your terminal becomes the **native claude TUI** (status bar, todo board, diffs, permission prompts, claude's own `/clear` / `/login` / …). When claude exits (`/exit`, the process dies, etc) you're dropped right back at the workspace picker. From there `q` quits cloudcode.
 
 Workspaces are named directories under `<workspace_root>/<account>/` on the agent host (default `~/cloudcode-agent/workspaces/<account>/<workspace>/`). Each workspace maps 1:1 to a tmux session named `cloudcode-<account>-<workspace>`. A workspace can be held by **at most one cloudcode session at a time per account** — the hub enforces this. Closing cloudcode does **not** kill the tmux session; long-running claude tasks (background fixes, agentic loops) keep going, and reopening the same workspace re-attaches to the running claude.
 

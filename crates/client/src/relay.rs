@@ -1,7 +1,10 @@
-//! Raw stdin/stdout PTY relay. Once inside, every keystroke goes straight
-//! to claude on the remote PTY — no escape mode, no slash commands. Returns
-//! when the hub reports the session has ended (claude exited, `/exit`, etc).
+//! Raw PTY relay: KeyEvent → bytes → hub; hub binary → stdout.
+//!
+//! Both directions share `crate::input::spawn_reader`'s KeyEvent stream, so
+//! ownership of stdin never has to be handed back and forth between menu
+//! and relay.
 
+use crate::input::{key_event_to_bytes, KeyRx};
 use crate::proto::{ClientToHub, HubToClient};
 use crate::wire::{OutFrame, Wire};
 use anyhow::Result;
@@ -9,9 +12,9 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::io::Write;
 use tokio::sync::mpsc;
 
-pub async fn run(wire: &mut Wire, stdin_rx: &mut mpsc::Receiver<Vec<u8>>) -> Result<()> {
+pub async fn run(wire: &mut Wire, keys: &mut KeyRx) -> Result<()> {
     enable_raw_mode()?;
-    let result = relay_loop(wire, stdin_rx).await;
+    let result = relay_loop(wire, keys).await;
     disable_raw_mode().ok();
     let mut stdout = std::io::stdout();
     // Best-effort reset of alt-screen / cursor / mouse modes.
@@ -20,34 +23,29 @@ pub async fn run(wire: &mut Wire, stdin_rx: &mut mpsc::Receiver<Vec<u8>>) -> Res
     result
 }
 
-async fn relay_loop(wire: &mut Wire, stdin_rx: &mut mpsc::Receiver<Vec<u8>>) -> Result<()> {
+async fn relay_loop(wire: &mut Wire, keys: &mut KeyRx) -> Result<()> {
     if let Some((cols, rows)) = current_terminal_size() {
         let _ = wire
             .out_tx
             .send(OutFrame::Text(ClientToHub::Resize { cols, rows }))
             .await;
     }
-
-    #[cfg(unix)]
     let mut winch = spawn_winch_signal();
 
     loop {
         tokio::select! {
-            chunk = stdin_rx.recv() => {
-                let Some(chunk) = chunk else { return Ok(()); };
-                if wire.out_tx.send(OutFrame::Binary(chunk)).await.is_err() {
+            k = keys.recv() => {
+                let Some(k) = k else { return Ok(()); };
+                let Some(bytes) = key_event_to_bytes(k) else { continue; };
+                if wire.out_tx.send(OutFrame::Binary(bytes)).await.is_err() {
                     return Ok(());
                 }
             }
             bin = wire.in_bin_rx.recv() => {
                 let Some(bytes) = bin else { return Ok(()); };
                 let mut stdout = std::io::stdout();
-                if stdout.write_all(&bytes).is_err() {
-                    return Ok(());
-                }
-                if stdout.flush().is_err() {
-                    return Ok(());
-                }
+                if stdout.write_all(&bytes).is_err() { return Ok(()); }
+                if stdout.flush().is_err() { return Ok(()); }
             }
             text = wire.in_text_rx.recv() => {
                 let Some(frame) = text else { return Ok(()); };

@@ -20,10 +20,10 @@ futures.workspace = true
 tokio-tungstenite.workspace = true
 rustls.workspace = true
 crossterm.workspace = true
+ratatui.workspace = true
 bytes.workspace = true
-
-[target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["term", "signal"] }
-libc.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

@@ -1,129 +1,405 @@
-//! Cooked-mode workspace selection menu shown before opening a PTY.
+//! Interactive TUI menu shown before opening a PTY.
 //!
-//! Run a workspace list against the currently selected agent, print a
-//! numbered menu, read one line from stdin, and translate it into a
-//! `MenuAction`. The caller (main.rs) drives the menu → relay → menu loop.
+//! Two stages:
+//!   1. Pick an agent (arrow keys + Enter).
+//!   2. Pick a workspace (arrow keys + Enter); `c` creates a new one (text
+//!      input prompt), `d` deletes the highlighted one (confirm prompt),
+//!      `Esc` goes back to the agent picker.
+//!
+//! Esc / `q` at the agent picker quits cloudcode.
 
+use crate::input::KeyRx;
 use crate::proto::{ClientToHub, HubToClient};
 use crate::wire::{OutFrame, Wire};
 use anyhow::{anyhow, Result};
-use tokio::sync::mpsc;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::Terminal;
+use std::io::stdout;
 
-pub enum MenuAction {
-    /// Open a PTY in this workspace.
-    Open(String),
-    /// Switch to a different agent (None = let hub pick) and re-enter menu.
-    SwitchAgent(Option<String>),
-    /// Quit cloudcode.
+pub enum MenuOutcome {
+    OpenWorkspace { agent: String, workspace: String },
     Quit,
 }
 
 pub async fn run(
     wire: &mut Wire,
-    stdin_rx: &mut mpsc::Receiver<Vec<u8>>,
-    current_agent: &str,
-    default_workspace: Option<&str>,
-) -> Result<MenuAction> {
-    loop {
-        let workspaces = list_workspaces(wire).await?;
-        let default_idx = default_workspace.and_then(|w| workspaces.iter().position(|x| x == w));
+    keys: &mut KeyRx,
+    last_agent: Option<&str>,
+) -> Result<MenuOutcome> {
+    enable_raw_mode()?;
+    let mut out = stdout();
+    execute!(out, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(out);
+    let mut term = Terminal::new(backend)?;
+    let result = run_inner(&mut term, wire, keys, last_agent).await;
+    disable_raw_mode().ok();
+    execute!(term.backend_mut(), LeaveAlternateScreen).ok();
+    term.show_cursor().ok();
+    result
+}
 
-        print_menu(current_agent, &workspaces, default_idx);
+async fn run_inner<B: ratatui::backend::Backend>(
+    term: &mut Terminal<B>,
+    wire: &mut Wire,
+    keys: &mut KeyRx,
+    last_agent: Option<&str>,
+) -> Result<MenuOutcome> {
+    'outer: loop {
+        // ---- stage 1: agent picker ----
+        let agents = list_agents(wire).await?;
+        if agents.is_empty() {
+            show_message(term, "no agents online", keys).await?;
+            return Ok(MenuOutcome::Quit);
+        }
+        let mut a_state = ListState::default();
+        let initial = last_agent
+            .and_then(|n| agents.iter().position(|a| a == n))
+            .unwrap_or(0);
+        a_state.select(Some(initial));
 
-        let line = match read_line(stdin_rx).await {
-            Some(s) => s,
-            None => return Ok(MenuAction::Quit),
+        let agent = loop {
+            term.draw(|f| {
+                draw_list(
+                    f,
+                    "Select agent",
+                    &agents,
+                    &mut a_state,
+                    "↑↓ move · Enter pick · Esc/q quit",
+                )
+            })?;
+            let Some(k) = keys.recv().await else {
+                return Ok(MenuOutcome::Quit);
+            };
+            match handle_list_key(k, &mut a_state, agents.len()) {
+                ListAction::Pick => break agents[a_state.selected().unwrap_or(0)].clone(),
+                ListAction::Quit => return Ok(MenuOutcome::Quit),
+                ListAction::Pass => {}
+            }
         };
-        let line = line.trim();
 
-        // Empty → pick default if any
-        if line.is_empty() {
-            if let Some(idx) = default_idx {
-                return Ok(MenuAction::Open(workspaces[idx].clone()));
-            } else {
-                continue;
+        // bind to the selected agent
+        wire.out_tx
+            .send(OutFrame::Text(ClientToHub::SelectAgent {
+                agent: Some(agent.clone()),
+            }))
+            .await
+            .map_err(|_| anyhow!("hub disconnected"))?;
+        match expect_text(wire).await? {
+            HubToClient::AgentSelected { .. } => {}
+            HubToClient::SessionError { message } => {
+                show_message(term, &format!("error: {}", message), keys).await?;
+                continue 'outer;
             }
+            _ => continue 'outer,
         }
+        crate::write_last_agent(&agent);
 
-        let mut parts = line.splitn(2, char::is_whitespace);
-        let head = parts.next().unwrap_or("");
-        let rest = parts.next().map(|s| s.trim()).unwrap_or("");
-
-        match head {
-            "q" | "quit" | "exit" => return Ok(MenuAction::Quit),
-            "c" => {
-                if rest.is_empty() {
-                    eprintln!("usage: c <name>");
-                    continue;
-                }
-                create_workspace(wire, rest).await?;
+        // ---- stage 2: workspace picker (loop until pick or Esc back) ----
+        let last_ws = crate::read_last_workspace(&agent);
+        let mut w_state = ListState::default();
+        loop {
+            let workspaces = list_workspaces(wire).await?;
+            let initial = last_ws
+                .as_deref()
+                .and_then(|n| workspaces.iter().position(|w| w == n))
+                .unwrap_or(0);
+            if w_state.selected().is_none() {
+                w_state.select(Some(initial.min(workspaces.len().saturating_sub(1))));
             }
-            "d" => {
-                if rest.is_empty() {
-                    eprintln!("usage: d <num|name>");
-                    continue;
+            term.draw(|f| {
+                draw_list(
+                    f,
+                    &format!("Select workspace on {}", agent),
+                    &workspaces,
+                    &mut w_state,
+                    "↑↓ move · Enter pick · c create · d delete · Esc back · q quit",
+                )
+            })?;
+            let Some(k) = keys.recv().await else {
+                return Ok(MenuOutcome::Quit);
+            };
+            match k.code {
+                KeyCode::Esc => continue 'outer,
+                KeyCode::Char('q') if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Ok(MenuOutcome::Quit);
                 }
-                let name = resolve(&workspaces, rest);
-                let Some(name) = name else {
-                    eprintln!("not found: {}", rest);
-                    continue;
-                };
-                delete_workspace(wire, &name).await?;
-            }
-            "a" => {
-                if rest.is_empty() {
-                    list_agents(wire, current_agent).await?;
-                } else {
-                    return Ok(MenuAction::SwitchAgent(Some(rest.into())));
+                KeyCode::Char('c') => {
+                    if let Some(name) = prompt_input(term, keys, "create workspace", "").await? {
+                        let name = name.trim().to_string();
+                        if !name.is_empty() {
+                            create_workspace(wire, &name).await?;
+                            w_state.select(None);
+                        }
+                    }
                 }
-            }
-            _ => {
-                // try as number or name
-                if let Some(name) = resolve(&workspaces, line) {
-                    return Ok(MenuAction::Open(name));
-                } else {
-                    eprintln!("not found: {}", line);
+                KeyCode::Char('d') => {
+                    if let Some(sel) = w_state.selected() {
+                        if let Some(ws) = workspaces.get(sel) {
+                            let confirmed =
+                                prompt_confirm(term, keys, &format!("delete workspace '{}'?", ws))
+                                    .await?;
+                            if confirmed {
+                                delete_workspace(wire, ws).await?;
+                                w_state.select(None);
+                            }
+                        }
+                    }
                 }
+                _ => match handle_list_key(k, &mut w_state, workspaces.len()) {
+                    ListAction::Pick => {
+                        if let Some(sel) = w_state.selected() {
+                            if let Some(ws) = workspaces.get(sel) {
+                                return Ok(MenuOutcome::OpenWorkspace {
+                                    agent,
+                                    workspace: ws.clone(),
+                                });
+                            }
+                        }
+                    }
+                    ListAction::Quit => return Ok(MenuOutcome::Quit),
+                    ListAction::Pass => {}
+                },
             }
         }
     }
 }
 
-fn print_menu(agent: &str, workspaces: &[String], default_idx: Option<usize>) {
-    println!();
-    println!("agent: {}", agent);
-    if workspaces.is_empty() {
-        println!("workspaces: (none — `c <name>` to create one)");
+// ---------------------------------------------------------------------------
+
+enum ListAction {
+    Pick,
+    Quit,
+    Pass,
+}
+
+fn handle_list_key(k: KeyEvent, state: &mut ListState, len: usize) -> ListAction {
+    if len == 0 {
+        if matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) {
+            return ListAction::Quit;
+        }
+        return ListAction::Pass;
+    }
+    let cur = state.selected().unwrap_or(0);
+    match k.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.select(Some(if cur == 0 { len - 1 } else { cur - 1 }));
+            ListAction::Pass
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            state.select(Some((cur + 1) % len));
+            ListAction::Pass
+        }
+        KeyCode::Home | KeyCode::Char('g') => {
+            state.select(Some(0));
+            ListAction::Pass
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            state.select(Some(len - 1));
+            ListAction::Pass
+        }
+        KeyCode::Enter => ListAction::Pick,
+        KeyCode::Esc => ListAction::Quit,
+        KeyCode::Char('q') if !k.modifiers.contains(KeyModifiers::CONTROL) => ListAction::Quit,
+        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => ListAction::Quit,
+        _ => ListAction::Pass,
+    }
+}
+
+fn draw_list(
+    f: &mut ratatui::Frame,
+    title: &str,
+    items: &[String],
+    state: &mut ListState,
+    hint: &str,
+) {
+    let area = f.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .split(area);
+
+    let list_items: Vec<ListItem> = if items.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            "  (empty — press `c` to create)",
+            Style::default().fg(Color::DarkGray),
+        )))]
     } else {
-        println!("workspaces:");
-        for (i, w) in workspaces.iter().enumerate() {
-            let star = if Some(i) == default_idx { " *" } else { "  " };
-            println!("  [{}]{}{}", i + 1, star, w);
-        }
-    }
-    println!();
-    println!("  c <name>   create workspace        d <num|name>   delete workspace");
-    println!("  a [name]   list/switch agent         q              quit");
-    let prompt = match default_idx {
-        Some(i) => format!("choose [{}]: ", i + 1),
-        None => "choose: ".to_string(),
+        items
+            .iter()
+            .map(|s| ListItem::new(Line::from(Span::raw(s.clone()))))
+            .collect()
     };
-    print!("{}", prompt);
-    use std::io::Write;
-    let _ = std::io::stdout().flush();
+
+    let list = List::new(list_items)
+        .block(Block::default().title(title).borders(Borders::ALL))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+
+    f.render_stateful_widget(list, chunks[0], state);
+
+    let hint = Paragraph::new(Span::styled(
+        format!(" {} ", hint),
+        Style::default().fg(Color::DarkGray),
+    ));
+    f.render_widget(hint, chunks[1]);
 }
 
-fn resolve(workspaces: &[String], input: &str) -> Option<String> {
-    if let Ok(n) = input.parse::<usize>() {
-        if n >= 1 && n <= workspaces.len() {
-            return Some(workspaces[n - 1].clone());
+async fn show_message<B: ratatui::backend::Backend>(
+    term: &mut Terminal<B>,
+    msg: &str,
+    keys: &mut KeyRx,
+) -> Result<()> {
+    term.draw(|f| {
+        let area = f.area();
+        let block = Block::default().title(" cloudcode ").borders(Borders::ALL);
+        let p = Paragraph::new(Line::from(Span::raw(msg))).block(block);
+        f.render_widget(p, centered_rect(area, 50, 5));
+    })?;
+    let _ = keys.recv().await;
+    Ok(())
+}
+
+async fn prompt_input<B: ratatui::backend::Backend>(
+    term: &mut Terminal<B>,
+    keys: &mut KeyRx,
+    title: &str,
+    initial: &str,
+) -> Result<Option<String>> {
+    let mut buf = initial.to_string();
+    loop {
+        let title_owned = title.to_string();
+        let buf_view = buf.clone();
+        term.draw(move |f| {
+            let area = f.area();
+            let rect = centered_rect(area, 60, 5);
+            f.render_widget(Clear, rect);
+            let block = Block::default()
+                .title(format!(" {} ", title_owned))
+                .borders(Borders::ALL);
+            let inner = block.inner(rect);
+            f.render_widget(block, rect);
+            let para = Paragraph::new(Line::from(vec![
+                Span::styled("> ", Style::default().fg(Color::Cyan)),
+                Span::raw(buf_view.clone()),
+                Span::styled("█", Style::default().fg(Color::Cyan)),
+            ]));
+            let hint = Paragraph::new(Span::styled(
+                " Enter accept · Esc cancel ",
+                Style::default().fg(Color::DarkGray),
+            ));
+            let inner_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Length(1)])
+                .split(inner);
+            f.render_widget(para, inner_chunks[0]);
+            f.render_widget(hint, inner_chunks[1]);
+        })?;
+        let Some(k) = keys.recv().await else {
+            return Ok(None);
+        };
+        match k.code {
+            KeyCode::Esc => return Ok(None),
+            KeyCode::Enter => return Ok(Some(buf)),
+            KeyCode::Backspace => {
+                buf.pop();
+            }
+            KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+                buf.push(c);
+            }
+            _ => {}
         }
-        return None;
     }
-    if workspaces.iter().any(|w| w == input) {
-        return Some(input.to_string());
+}
+
+async fn prompt_confirm<B: ratatui::backend::Backend>(
+    term: &mut Terminal<B>,
+    keys: &mut KeyRx,
+    msg: &str,
+) -> Result<bool> {
+    loop {
+        let msg_owned = msg.to_string();
+        term.draw(move |f| {
+            let area = f.area();
+            let rect = centered_rect(area, 50, 5);
+            f.render_widget(Clear, rect);
+            let block = Block::default().title(" confirm ").borders(Borders::ALL);
+            let inner = block.inner(rect);
+            f.render_widget(block, rect);
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Length(1)])
+                .split(inner);
+            f.render_widget(Paragraph::new(Line::from(Span::raw(msg_owned))), chunks[0]);
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    " y yes · n/Esc no ",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                chunks[1],
+            );
+        })?;
+        let Some(k) = keys.recv().await else {
+            return Ok(false);
+        };
+        match k.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => return Ok(true),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => return Ok(false),
+            _ => {}
+        }
     }
-    None
+}
+
+fn centered_rect(area: Rect, width_pct: u16, height: u16) -> Rect {
+    let h = height.min(area.height);
+    let w = (area.width * width_pct / 100).clamp(20, area.width);
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hub queries (text-only; menu doesn't expect binary frames)
+// ---------------------------------------------------------------------------
+
+async fn list_agents(wire: &mut Wire) -> Result<Vec<String>> {
+    wire.out_tx
+        .send(OutFrame::Text(ClientToHub::ListAgents))
+        .await
+        .map_err(|_| anyhow!("hub disconnected"))?;
+    loop {
+        let m = expect_text(wire).await?;
+        match m {
+            HubToClient::AgentList { items } => {
+                return Ok(items.into_iter().map(|a| a.name).collect())
+            }
+            HubToClient::SessionError { message } => {
+                return Err(anyhow!("list agents: {}", message))
+            }
+            HubToClient::Ping => {
+                let _ = wire.out_tx.send(OutFrame::Text(ClientToHub::Pong)).await;
+            }
+            _ => continue,
+        }
+    }
 }
 
 async fn list_workspaces(wire: &mut Wire) -> Result<Vec<String>> {
@@ -132,17 +408,10 @@ async fn list_workspaces(wire: &mut Wire) -> Result<Vec<String>> {
         .await
         .map_err(|_| anyhow!("hub disconnected"))?;
     loop {
-        let m = wire
-            .in_text_rx
-            .recv()
-            .await
-            .ok_or_else(|| anyhow!("hub disconnected"))?;
+        let m = expect_text(wire).await?;
         match m {
             HubToClient::WorkspaceList { items } => return Ok(items),
-            HubToClient::SessionError { message } => {
-                eprintln!("[cc] {}", message);
-                return Ok(Vec::new());
-            }
+            HubToClient::SessionError { .. } => return Ok(Vec::new()),
             HubToClient::Ping => {
                 let _ = wire.out_tx.send(OutFrame::Text(ClientToHub::Pong)).await;
             }
@@ -159,20 +428,10 @@ async fn create_workspace(wire: &mut Wire, name: &str) -> Result<()> {
         .await
         .map_err(|_| anyhow!("hub disconnected"))?;
     loop {
-        let m = wire
-            .in_text_rx
-            .recv()
-            .await
-            .ok_or_else(|| anyhow!("hub disconnected"))?;
+        let m = expect_text(wire).await?;
         match m {
-            HubToClient::WorkspaceCreated { name } => {
-                println!("[cc] workspace '{}' created", name);
-                return Ok(());
-            }
-            HubToClient::SessionError { message } => {
-                eprintln!("[cc] {}", message);
-                return Ok(());
-            }
+            HubToClient::WorkspaceCreated { .. } => return Ok(()),
+            HubToClient::SessionError { .. } => return Ok(()),
             HubToClient::Ping => {
                 let _ = wire.out_tx.send(OutFrame::Text(ClientToHub::Pong)).await;
             }
@@ -189,20 +448,10 @@ async fn delete_workspace(wire: &mut Wire, name: &str) -> Result<()> {
         .await
         .map_err(|_| anyhow!("hub disconnected"))?;
     loop {
-        let m = wire
-            .in_text_rx
-            .recv()
-            .await
-            .ok_or_else(|| anyhow!("hub disconnected"))?;
+        let m = expect_text(wire).await?;
         match m {
-            HubToClient::WorkspaceDeleted { name } => {
-                println!("[cc] workspace '{}' deleted", name);
-                return Ok(());
-            }
-            HubToClient::SessionError { message } => {
-                eprintln!("[cc] {}", message);
-                return Ok(());
-            }
+            HubToClient::WorkspaceDeleted { .. } => return Ok(()),
+            HubToClient::SessionError { .. } => return Ok(()),
             HubToClient::Ping => {
                 let _ = wire.out_tx.send(OutFrame::Text(ClientToHub::Pong)).await;
             }
@@ -211,54 +460,9 @@ async fn delete_workspace(wire: &mut Wire, name: &str) -> Result<()> {
     }
 }
 
-async fn list_agents(wire: &mut Wire, current_agent: &str) -> Result<()> {
-    wire.out_tx
-        .send(OutFrame::Text(ClientToHub::ListAgents))
+async fn expect_text(wire: &mut Wire) -> Result<HubToClient> {
+    wire.in_text_rx
+        .recv()
         .await
-        .map_err(|_| anyhow!("hub disconnected"))?;
-    loop {
-        let m = wire
-            .in_text_rx
-            .recv()
-            .await
-            .ok_or_else(|| anyhow!("hub disconnected"))?;
-        match m {
-            HubToClient::AgentList { items } => {
-                if items.is_empty() {
-                    println!("[cc] no agents online");
-                } else {
-                    println!("[cc] agents:");
-                    for it in &items {
-                        let star = if it.name == current_agent { " *" } else { "  " };
-                        println!("    {}{}", star, it.name);
-                    }
-                    println!("[cc] (use `a <name>` to switch)");
-                }
-                return Ok(());
-            }
-            HubToClient::SessionError { message } => {
-                eprintln!("[cc] {}", message);
-                return Ok(());
-            }
-            HubToClient::Ping => {
-                let _ = wire.out_tx.send(OutFrame::Text(ClientToHub::Pong)).await;
-            }
-            _ => continue,
-        }
-    }
-}
-
-/// Read one line from the shared stdin pump. cooked mode delivers one line
-/// (terminated by '\n') per recv, so this is usually a single iteration.
-async fn read_line(stdin_rx: &mut mpsc::Receiver<Vec<u8>>) -> Option<String> {
-    let mut buf = Vec::new();
-    loop {
-        let chunk = stdin_rx.recv().await?;
-        buf.extend_from_slice(&chunk);
-        if buf.contains(&b'\n') {
-            break;
-        }
-    }
-    let s = String::from_utf8_lossy(&buf).into_owned();
-    Some(s.trim_end_matches(['\r', '\n']).to_string())
+        .ok_or_else(|| anyhow!("hub disconnected"))
 }
