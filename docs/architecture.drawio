@@ -6,22 +6,22 @@
         <mxCell id="0"/>
         <mxCell id="1" parent="0"/>
 
-        <mxCell id="title" value="cloudcode 架构" style="text;html=1;align=center;fontSize=16;fontStyle=1;fontColor=#111827;" vertex="1" parent="1">
+        <mxCell id="title" value="cloudcode architecture" style="text;html=1;align=center;fontSize=16;fontStyle=1;fontColor=#111827;" vertex="1" parent="1">
           <mxGeometry x="240" y="10" width="600" height="26" as="geometry"/>
         </mxCell>
-        <mxCell id="subtitle" value="凭据永不出 agent，hub 仅做鉴权 / 路由 / 审计" style="text;html=1;align=center;fontSize=12;fontColor=#4b5563;" vertex="1" parent="1">
+        <mxCell id="subtitle" value="Credentials never leave the agent; hub only does auth / routing / audit" style="text;html=1;align=center;fontSize=12;fontColor=#4b5563;" vertex="1" parent="1">
           <mxGeometry x="240" y="36" width="600" height="20" as="geometry"/>
         </mxCell>
 
-        <mxCell id="client" value="&lt;b&gt;Client&lt;/b&gt;&#xa;&lt;font color=&quot;#1d4ed8&quot;&gt;cloudcode + claude&lt;/font&gt;&#xa;&#xa;&lt;tt&gt;cd ~/myproj&lt;/tt&gt;&#xa;&lt;tt&gt;cloudcode run claude&lt;/tt&gt;&#xa;&#xa;&lt;i&gt;开发者本机&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dbeafe;strokeColor=#1d4ed8;align=center;verticalAlign=middle;fontColor=#1e3a8a;fontSize=12;" vertex="1" parent="1">
+        <mxCell id="client" value="&lt;b&gt;Client&lt;/b&gt;&#xa;&lt;font color=&quot;#1d4ed8&quot;&gt;cloudcode + claude&lt;/font&gt;&#xa;&#xa;&lt;tt&gt;cd ~/myproj&lt;/tt&gt;&#xa;&lt;tt&gt;cloudcode run claude&lt;/tt&gt;&#xa;&#xa;&lt;i&gt;Developer machine&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dbeafe;strokeColor=#1d4ed8;align=center;verticalAlign=middle;fontColor=#1e3a8a;fontSize=12;" vertex="1" parent="1">
           <mxGeometry x="40" y="110" width="180" height="160" as="geometry"/>
         </mxCell>
 
-        <mxCell id="hub" value="&lt;b&gt;Hub&lt;/b&gt;&#xa;&lt;font color=&quot;#047857&quot;&gt;cloudcode-hub&lt;/font&gt;&#xa;&#xa;- 账号 token 鉴权&#xa;- ACL / 路由&#xa;- JSONL 审计&#xa;&#xa;&lt;i&gt;公网可达&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d1fae5;strokeColor=#047857;align=center;verticalAlign=middle;fontColor=#065f46;fontSize=12;" vertex="1" parent="1">
+        <mxCell id="hub" value="&lt;b&gt;Hub&lt;/b&gt;&#xa;&lt;font color=&quot;#047857&quot;&gt;cloudcode-hub&lt;/font&gt;&#xa;&#xa;- account token auth&#xa;- ACL / routing&#xa;- JSONL audit log&#xa;&#xa;&lt;i&gt;Public-facing host&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d1fae5;strokeColor=#047857;align=center;verticalAlign=middle;fontColor=#065f46;fontSize=12;" vertex="1" parent="1">
           <mxGeometry x="280" y="110" width="220" height="160" as="geometry"/>
         </mxCell>
 
-        <mxCell id="agent" value="&lt;b&gt;Agent&lt;/b&gt;&#xa;&lt;font color=&quot;#9a3412&quot;&gt;cloudcode-agent&lt;/font&gt;&#xa;&#xa;读 ~/.claude/.credentials.json&#xa;OAuth Bearer + 自动 refresh&#xa;出站 WSS 连接 hub&#xa;&#xa;&lt;i&gt;已 claude /login 的机器（NAT 后亦可）&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffedd5;strokeColor=#c2410c;align=center;verticalAlign=middle;fontColor=#7c2d12;fontSize=12;" vertex="1" parent="1">
+        <mxCell id="agent" value="&lt;b&gt;Agent&lt;/b&gt;&#xa;&lt;font color=&quot;#9a3412&quot;&gt;cloudcode-agent&lt;/font&gt;&#xa;&#xa;reads ~/.claude/.credentials.json&#xa;OAuth Bearer + auto-refresh&#xa;dials hub over WSS (outbound)&#xa;&#xa;&lt;i&gt;host with `claude /login` (NAT OK)&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffedd5;strokeColor=#c2410c;align=center;verticalAlign=middle;fontColor=#7c2d12;fontSize=12;" vertex="1" parent="1">
           <mxGeometry x="560" y="110" width="240" height="160" as="geometry"/>
         </mxCell>
 
@@ -29,14 +29,14 @@
           <mxGeometry x="860" y="110" width="180" height="160" as="geometry"/>
         </mxCell>
 
-        <mxCell id="audit" value="&lt;tt&gt;audit.jsonl&lt;/tt&gt;&#xa;&lt;font color=&quot;#6b7280&quot; size=&quot;1&quot;&gt;每请求一行&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f3f4f6;strokeColor=#6b7280;dashed=1;align=center;verticalAlign=middle;fontColor=#374151;fontSize=11;" vertex="1" parent="1">
+        <mxCell id="audit" value="&lt;tt&gt;audit.jsonl&lt;/tt&gt;&#xa;&lt;font color=&quot;#6b7280&quot; size=&quot;1&quot;&gt;one line per request&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f3f4f6;strokeColor=#6b7280;dashed=1;align=center;verticalAlign=middle;fontColor=#374151;fontSize=11;" vertex="1" parent="1">
           <mxGeometry x="320" y="350" width="140" height="50" as="geometry"/>
         </mxCell>
 
         <mxCell id="e1" value="HTTPS&#xa;Bearer cc_*" style="endArrow=classic;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;fontSize=10;" edge="1" parent="1" source="client" target="hub">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
-        <mxCell id="e2" value="WSS 隧道&#xa;(agent 出站)" style="startArrow=classic;endArrow=classic;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;fontSize=10;strokeWidth=2;" edge="1" parent="1" source="hub" target="agent">
+        <mxCell id="e2" value="WSS tunnel&#xa;(agent dials)" style="startArrow=classic;endArrow=classic;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;fontSize=10;strokeWidth=2;" edge="1" parent="1" source="hub" target="agent">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
         <mxCell id="e3" value="HTTPS&#xa;Bearer oauth" style="endArrow=classic;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;fontSize=10;" edge="1" parent="1" source="agent" target="anthropic">
