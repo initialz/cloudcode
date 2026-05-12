@@ -328,6 +328,91 @@ impl Db {
         }
     }
 
+    pub async fn list_sessions(
+        &self,
+        f: &SessionsFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<SessionRow>> {
+        use sqlx::QueryBuilder;
+        let mut qb = QueryBuilder::new(
+            "SELECT session_id, account, agent, workspace, started_at, ended_at, ended_reason
+               FROM sessions WHERE 1=1",
+        );
+        if let Some(v) = &f.account {
+            qb.push(" AND account = ").push_bind(v.clone());
+        }
+        if let Some(v) = &f.agent {
+            qb.push(" AND agent = ").push_bind(v.clone());
+        }
+        if let Some(v) = &f.workspace {
+            qb.push(" AND workspace = ").push_bind(v.clone());
+        }
+        if f.active_only {
+            qb.push(" AND ended_at IS NULL");
+        }
+        if let Some(v) = f.since {
+            qb.push(" AND started_at >= ").push_bind(v);
+        }
+        qb.push(" ORDER BY started_at DESC LIMIT ")
+            .push_bind(limit)
+            .push(" OFFSET ")
+            .push_bind(offset);
+        let rows = qb.build().fetch_all(&self.pool).await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| SessionRow {
+                session_id: r.get("session_id"),
+                account: r.get("account"),
+                agent: r.get("agent"),
+                workspace: r.get("workspace"),
+                started_at: r.get("started_at"),
+                ended_at: r.get("ended_at"),
+                ended_reason: r.get("ended_reason"),
+            })
+            .collect())
+    }
+
+    pub async fn count_sessions(&self, f: &SessionsFilter) -> Result<i64> {
+        use sqlx::QueryBuilder;
+        let mut qb = QueryBuilder::new("SELECT COUNT(*) AS n FROM sessions WHERE 1=1");
+        if let Some(v) = &f.account {
+            qb.push(" AND account = ").push_bind(v.clone());
+        }
+        if let Some(v) = &f.agent {
+            qb.push(" AND agent = ").push_bind(v.clone());
+        }
+        if let Some(v) = &f.workspace {
+            qb.push(" AND workspace = ").push_bind(v.clone());
+        }
+        if f.active_only {
+            qb.push(" AND ended_at IS NULL");
+        }
+        if let Some(v) = f.since {
+            qb.push(" AND started_at >= ").push_bind(v);
+        }
+        let row = qb.build().fetch_one(&self.pool).await?;
+        Ok(row.get::<i64, _>("n"))
+    }
+
+    /// Currently-active sessions (no end recorded). Quick stats card.
+    pub async fn count_active_sessions(&self) -> Result<i64> {
+        let row = sqlx::query("SELECT COUNT(*) AS n FROM sessions WHERE ended_at IS NULL")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get::<i64, _>("n"))
+    }
+
+    /// Number of sessions started within the last `seconds` seconds.
+    pub async fn count_sessions_since(&self, seconds: i64) -> Result<i64> {
+        let cutoff = chrono::Utc::now().timestamp() - seconds;
+        let row = sqlx::query("SELECT COUNT(*) AS n FROM sessions WHERE started_at >= ?1")
+            .bind(cutoff)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get::<i64, _>("n"))
+    }
+
     pub async fn end_session(&self, session_id: &str, reason: Option<&str>) {
         let res = sqlx::query(
             "UPDATE sessions
@@ -366,6 +451,26 @@ pub struct AuditDisplayRow {
     pub session_id: Option<String>,
     pub workspace: Option<String>,
     pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionRow {
+    pub session_id: String,
+    pub account: String,
+    pub agent: String,
+    pub workspace: String,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub ended_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SessionsFilter {
+    pub account: Option<String>,
+    pub agent: Option<String>,
+    pub workspace: Option<String>,
+    pub active_only: bool,
+    pub since: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default)]

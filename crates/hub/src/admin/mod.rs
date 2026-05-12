@@ -123,7 +123,11 @@ pub fn router(state: AdminState) -> Router {
         )
         .route(
             "/admin/audit",
-            get(handlers::audit_list).route_layer(gate),
+            get(handlers::audit_list).route_layer(gate.clone()),
+        )
+        .route(
+            "/admin/sessions",
+            get(handlers::sessions_list).route_layer(gate),
         )
         .with_state(state)
 }

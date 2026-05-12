@@ -4,7 +4,7 @@
 
 use super::{AdminState, SESSION_COOKIE};
 use crate::auth;
-use crate::db::AuditFilter;
+use crate::db::{AuditFilter, SessionsFilter};
 use axum::{
     extract::{Form, Path, Query, State},
     http::{header::SET_COOKIE, HeaderMap, StatusCode},
@@ -112,8 +112,27 @@ pub async fn logout(State(state): State<AdminState>, headers: HeaderMap) -> Resp
 // ---------------------------------------------------------------------
 
 pub async fn dashboard(State(state): State<AdminState>) -> Response {
-    let n = state.app.db.account_count().await.unwrap_or(0);
-    let html = DASHBOARD_HTML.replace("<!--ACCOUNTS-->", &n.to_string());
+    let accounts = state.app.db.account_count().await.unwrap_or(0);
+    let active = state.app.db.count_active_sessions().await.unwrap_or(0);
+    let last_24h = state.app.db.count_sessions_since(86400).await.unwrap_or(0);
+    let online_agents = state.app.registry.list_active();
+    let agent_list_html = if online_agents.is_empty() {
+        r#"<span style="opacity:0.5">(none)</span>"#.to_string()
+    } else {
+        online_agents
+            .iter()
+            .map(|n| format!("<code>{}</code>", html_escape(n)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let html = DASHBOARD_HTML
+        .replace("<!--HEAD-->", SHELL_HEAD)
+        .replace("<!--FOOT-->", SHELL_FOOT)
+        .replace("<!--ACCOUNTS-->", &accounts.to_string())
+        .replace("<!--ACTIVE-->", &active.to_string())
+        .replace("<!--24H-->", &last_24h.to_string())
+        .replace("<!--AGENTS_N-->", &online_agents.len().to_string())
+        .replace("<!--AGENTS_LIST-->", &agent_list_html);
     Html(html).into_response()
 }
 
@@ -455,6 +474,165 @@ pub async fn audit_list(
     Html(html).into_response()
 }
 
+// ---------------------------------------------------------------------
+// /admin/sessions  (protected)
+// ---------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+pub struct SessionsQuery {
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub active: Option<String>,
+    #[serde(default)]
+    pub page: Option<i64>,
+}
+
+const SESSIONS_PAGE_SIZE: i64 = 100;
+
+pub async fn sessions_list(
+    State(state): State<AdminState>,
+    Query(q): Query<SessionsQuery>,
+) -> Response {
+    fn norm(v: &Option<String>) -> Option<String> {
+        v.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    }
+    let acct = norm(&q.account);
+    let agent = norm(&q.agent);
+    let ws = norm(&q.workspace);
+    let active_only = matches!(q.active.as_deref(), Some("1") | Some("on") | Some("true"));
+    let filter = SessionsFilter {
+        account: acct.clone(),
+        agent: agent.clone(),
+        workspace: ws.clone(),
+        active_only,
+        since: None,
+    };
+    let page = q.page.unwrap_or(1).max(1);
+    let offset = (page - 1) * SESSIONS_PAGE_SIZE;
+    let rows = match state
+        .app
+        .db
+        .list_sessions(&filter, SESSIONS_PAGE_SIZE, offset)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return Html(error_page(&format!("sessions: {}", e))).into_response(),
+    };
+    let total = state
+        .app
+        .db
+        .count_sessions(&filter)
+        .await
+        .unwrap_or(rows.len() as i64);
+
+    let mut body = String::new();
+    if rows.is_empty() {
+        body.push_str(
+            r#"<tr><td colspan="7" style="opacity:0.6">no sessions match these filters.</td></tr>"#,
+        );
+    } else {
+        for r in &rows {
+            let duration = match r.ended_at {
+                Some(end) => format_duration(end - r.started_at),
+                None => r#"<span style="color:#0a0">● live</span>"#.to_string(),
+            };
+            let sid_short = r.session_id.chars().take(8).collect::<String>();
+            body.push_str(&format!(
+                r##"<tr>
+  <td><time>{started}</time></td>
+  <td>{duration}</td>
+  <td><code>{acct}</code></td>
+  <td><code>{agt}</code></td>
+  <td><code>{ws}</code></td>
+  <td><code style="opacity:0.6">{sid}</code></td>
+  <td>{reason}</td>
+</tr>
+"##,
+                started = unix_to_iso(r.started_at),
+                duration = duration,
+                acct = html_escape(&r.account),
+                agt = html_escape(&r.agent),
+                ws = html_escape(&r.workspace),
+                sid = html_escape(&sid_short),
+                reason = html_escape(r.ended_reason.as_deref().unwrap_or("")),
+            ));
+        }
+    }
+
+    let last_page = ((total - 1).max(0) / SESSIONS_PAGE_SIZE) + 1;
+    let mk_url = |p: i64| sessions_url(&acct, &agent, &ws, active_only, p);
+    let prev_link = if page > 1 {
+        format!(r#"<a href="{}">← Prev</a>"#, mk_url(page - 1))
+    } else {
+        r#"<span style="opacity:0.4">← Prev</span>"#.into()
+    };
+    let next_link = if page < last_page {
+        format!(r#"<a href="{}">Next →</a>"#, mk_url(page + 1))
+    } else {
+        r#"<span style="opacity:0.4">Next →</span>"#.into()
+    };
+
+    let active_checked = if active_only { " checked" } else { "" };
+    let html = SESSIONS_HTML
+        .replace("<!--HEAD-->", SHELL_HEAD)
+        .replace("<!--FOOT-->", SHELL_FOOT)
+        .replace("<!--ROWS-->", &body)
+        .replace("<!--ACCT_VAL-->", &html_escape(acct.as_deref().unwrap_or("")))
+        .replace("<!--AGENT_VAL-->", &html_escape(agent.as_deref().unwrap_or("")))
+        .replace("<!--WS_VAL-->", &html_escape(ws.as_deref().unwrap_or("")))
+        .replace("<!--ACTIVE_CHECKED-->", active_checked)
+        .replace("<!--TOTAL-->", &total.to_string())
+        .replace("<!--PREV-->", &prev_link)
+        .replace("<!--NEXT-->", &next_link)
+        .replace("<!--PAGE_INFO-->", &format!("page {} of {}", page, last_page));
+    Html(html).into_response()
+}
+
+fn sessions_url(
+    account: &Option<String>,
+    agent: &Option<String>,
+    workspace: &Option<String>,
+    active: bool,
+    page: i64,
+) -> String {
+    let mut parts: Vec<String> = vec![format!("page={}", page)];
+    let mut push = |k: &str, v: &Option<String>| {
+        if let Some(s) = v {
+            if !s.is_empty() {
+                parts.push(format!("{}={}", k, urlencoding(s)));
+            }
+        }
+    };
+    push("account", account);
+    push("agent", agent);
+    push("workspace", workspace);
+    if active {
+        parts.push("active=1".to_string());
+    }
+    format!("/admin/sessions?{}", parts.join("&"))
+}
+
+fn format_duration(seconds: i64) -> String {
+    if seconds < 0 {
+        return "—".into();
+    }
+    let h = seconds / 3600;
+    let m = (seconds % 3600) / 60;
+    let s = seconds % 60;
+    if h > 0 {
+        format!("{}h{}m", h, m)
+    } else if m > 0 {
+        format!("{}m{}s", m, s)
+    } else {
+        format!("{}s", s)
+    }
+}
+
 fn audit_url(
     account: &Option<String>,
     agent: &Option<String>,
@@ -570,8 +748,8 @@ form.create input { padding: 0.4rem 0.6rem; border: 1px solid #888; border-radiu
 <nav>
   <a href="/admin/">Dashboard</a>
   <a href="/admin/accounts">Accounts</a>
+  <a href="/admin/sessions">Sessions</a>
   <a href="/admin/audit">Audit</a>
-  <span style="opacity:0.4">sessions (coming)</span>
 </nav>
 "##;
 
@@ -579,41 +757,57 @@ const SHELL_FOOT: &str = r##"
 </body>
 </html>"##;
 
-const DASHBOARD_HTML: &str = r##"<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>cloudcode admin</title>
-<style>
-:root { color-scheme: light dark; }
-body { font-family: system-ui, sans-serif; max-width: 60rem; margin: 2rem auto; padding: 0 1rem; }
-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 1.5rem; }
-h1 { font-size: 1.5rem; margin: 0; }
-nav a { margin-right: 1rem; }
-.card { padding: 1rem; border: 1px solid #888; border-radius: 4px; }
-.stat { font-size: 2rem; font-weight: 600; }
-.label { opacity: 0.6; font-size: 0.9rem; }
-</style>
-</head>
-<body>
-<header>
-  <h1>cloudcode admin</h1>
-  <form method="POST" action="/admin/logout" style="margin:0;">
-    <button type="submit">Sign out</button>
-  </form>
-</header>
-<nav>
-  <a href="/admin/">Dashboard</a>
-  <a href="/admin/accounts">Accounts</a>
-  <a href="/admin/audit">Audit</a>
-  <span style="opacity:0.4">sessions (coming)</span>
-</nav>
-<section class="card" style="margin-top: 1.5rem; max-width: 14rem;">
-  <div class="label">Accounts</div>
-  <div class="stat"><!--ACCOUNTS--></div>
-</section>
-</body>
-</html>"##;
+const DASHBOARD_HTML: &str = r##"<!--HEAD-->
+<div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); gap: 1rem; margin-bottom: 1.5rem;">
+  <section class="card">
+    <div class="label">Accounts</div>
+    <div class="stat"><!--ACCOUNTS--></div>
+    <div style="font-size:0.8rem; opacity:0.6;"><a href="/admin/accounts">manage →</a></div>
+  </section>
+  <section class="card">
+    <div class="label">Active sessions</div>
+    <div class="stat"><!--ACTIVE--></div>
+    <div style="font-size:0.8rem; opacity:0.6;"><a href="/admin/sessions?active=1">view →</a></div>
+  </section>
+  <section class="card">
+    <div class="label">Sessions (24h)</div>
+    <div class="stat"><!--24H--></div>
+    <div style="font-size:0.8rem; opacity:0.6;"><a href="/admin/sessions">view →</a></div>
+  </section>
+  <section class="card">
+    <div class="label">Online agents</div>
+    <div class="stat"><!--AGENTS_N--></div>
+    <div style="font-size:0.8rem; margin-top:0.4rem; overflow:hidden; text-overflow:ellipsis;"><!--AGENTS_LIST--></div>
+  </section>
+</div>
+<!--FOOT-->"##;
+
+const SESSIONS_HTML: &str = r##"<!--HEAD-->
+<form method="GET" action="/admin/sessions" style="display:flex; gap:0.6rem; align-items:flex-end; flex-wrap:wrap; margin-bottom:1rem;">
+  <label>account <input name="account" value="<!--ACCT_VAL-->" placeholder="alice"></label>
+  <label>agent <input name="agent" value="<!--AGENT_VAL-->" placeholder="petez-mbp"></label>
+  <label>workspace <input name="workspace" value="<!--WS_VAL-->" placeholder="proja"></label>
+  <label style="display:flex; align-items:center; gap:0.3rem;">
+    <input type="checkbox" name="active" value="1"<!--ACTIVE_CHECKED-->> active only
+  </label>
+  <button type="submit">Filter</button>
+  <a href="/admin/sessions" style="margin-left:0.5rem;">reset</a>
+</form>
+<div style="opacity:0.6; margin-bottom:0.5rem;"><!--TOTAL--> sessions match</div>
+<table>
+  <thead>
+    <tr><th>Started (UTC)</th><th>Duration</th><th>Account</th><th>Agent</th><th>Workspace</th><th>Session</th><th>Closed reason</th></tr>
+  </thead>
+  <tbody>
+    <!--ROWS-->
+  </tbody>
+</table>
+<div style="display:flex; justify-content:space-between; margin-top:1rem; align-items:center;">
+  <!--PREV-->
+  <span style="opacity:0.6;"><!--PAGE_INFO--></span>
+  <!--NEXT-->
+</div>
+<!--FOOT-->"##;
 
 const AUDIT_HTML: &str = r##"<!--HEAD-->
 <form method="GET" action="/admin/audit" style="display:flex; gap:0.6rem; align-items:flex-end; flex-wrap:wrap; margin-bottom:1rem;">
