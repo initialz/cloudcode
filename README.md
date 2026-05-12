@@ -16,6 +16,17 @@ If you use this software to violate any provider's Terms of Service or applicabl
 - **`cloudcode-agent`** — long-running daemon on a host where you've `claude /login`'d. Requires `tmux`. Dials out to the hub over WSS. When the hub asks for a session, the agent spawns `tmux new -A -s cloudcode-<workspace> -c <cwd> claude` and pipes the PTY master to/from the hub. tmux session **persists across reconnects** — close `cloudcode` and reopen later, you're back where you left off.
 - **`cloudcode`** — relay client on your laptop. First shows a small workspace picker for your agent; once you pick one, your terminal becomes the **native claude TUI** (status bar, todo board, diffs, permission prompts, claude's own `/clear`/`/login`/etc — everything). When claude exits you're dropped back at the picker.
 
+## Features
+
+- **Native `claude` TUI, not a web rewrap.** Your terminal becomes the real claude binary's interface — status bar, todo board, diffs, permission prompts, slash commands, all of it. Byte-perfect PTY passthrough, so DA1/DA2, mouse, and arbitrary escape sequences reach the remote process unchanged.
+- **Workspace state survives the client.** Close cloudcode (or shut your laptop's lid) and the agent's tmux + claude keep running on the host. Reconnect later and you're back at the same prompt, same todo board, same in-progress agentic loop. Long-running tasks finish whether you're watching or not.
+- **Hop between terminals freely.** Opening a workspace already attached from another machine evicts the old client back to its menu and the new one takes over the live tmux session — claude state preserved. No "workspace busy" deadlock.
+- **macOS Seatbelt workspace sandbox (opt-in).** Each spawned `claude` is wrapped in a kernel-enforced sandbox: writes scoped to the active workspace, cross-user and cross-workspace reads denied, secrets (`~/.ssh`, `~/.aws`, `~/.gnupg`, TCC database) hidden, persistence vectors (shell init files, `~/Library/LaunchAgents`, `.git/hooks/`) blocked, camera + microphone explicitly denied. Network stays open. Linux support is on the roadmap.
+- **Pass any `claude` argument straight through.** `cloudcode -- --continue`, `cloudcode -- --model opus`, `cloudcode -- "fix this bug"` — everything after `--` is forwarded verbatim to the spawned claude.
+- **NAT-friendly architecture.** Agents dial out to the hub over WSS; no inbound ports required on the agent host. Park an agent on your home box behind a router and drive it from a hotel laptop.
+- **One hub, many agents, many accounts.** A single hub routes multiple agents (one per host) and multiple users (one account-token per developer). Workspaces are namespaced per-account; the sandbox enforces it.
+- **Audit-friendly.** Every session's PTY output is captured as an asciinema cast on the agent. Replay with `asciinema play <file>`. Keystrokes are deliberately not recorded to avoid pasted-token leakage.
+
 ## Architecture
 
 ![cloudcode architecture](docs/architecture.svg)
