@@ -302,15 +302,16 @@ fn paint_desktop(f: &mut ratatui::Frame) {
 }
 
 /// Centered dialog rect, plus a 2-col / 1-row drop shadow drawn behind it.
-/// When `pressed` is true, the dialog falls onto its shadow (same +1
-/// / +1 offset as the shadow itself) and the shadow is hidden, giving
-/// an "Enter held down" look. The next frame redrawn with
-/// `pressed = false` produces the spring-back.
+/// The shadow stays at base + (2, 1). When `pressed` is true the
+/// dialog moves *halfway* — base + (1, 1) — so the shadow is still
+/// partly visible behind it (one extra column on the right and the
+/// usual row below). Looks like the dialog is mid-press, not bottomed
+/// out. Redrawing with `pressed = false` springs it back to base.
 fn paint_dialog_frame(f: &mut ratatui::Frame, want_w: u16, want_h: u16, pressed: bool) -> Rect {
     let area = f.area();
-    let w = want_w.min(area.width.saturating_sub(2));
+    let w = want_w.min(area.width.saturating_sub(4));
     let h = want_h.min(area.height.saturating_sub(2));
-    let base_x = area.x + (area.width.saturating_sub(w + 1)) / 2;
+    let base_x = area.x + (area.width.saturating_sub(w + 2)) / 2;
     let base_y = area.y + (area.height.saturating_sub(h + 1)) / 2;
     let dialog = if pressed {
         Rect {
@@ -327,18 +328,18 @@ fn paint_dialog_frame(f: &mut ratatui::Frame, want_w: u16, want_h: u16, pressed:
             height: h,
         }
     };
-    if !pressed {
-        let shadow = Rect {
-            x: dialog.x + 1,
-            y: dialog.y + 1,
-            width: dialog.width,
-            height: dialog.height,
-        };
-        f.render_widget(
-            Block::default().style(Style::default().bg(SHADOW_BG)),
-            shadow,
-        );
-    }
+    // Shadow is anchored to base, not to the (possibly pressed) dialog —
+    // that way pressing only moves the top layer, the shadow stays put.
+    let shadow = Rect {
+        x: base_x + 2,
+        y: base_y + 1,
+        width: w,
+        height: h,
+    };
+    f.render_widget(
+        Block::default().style(Style::default().bg(SHADOW_BG)),
+        shadow,
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .style(Style::default().bg(DIALOG_BG).fg(DIALOG_FG));
