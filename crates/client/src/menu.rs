@@ -305,9 +305,10 @@ fn paint_desktop(f: &mut ratatui::Frame) {
 /// The shadow stays at base + (2, 1). Terminal cells are roughly
 /// twice as tall as they are wide, so +2 col / +1 row is the offset
 /// that *looks* equal on screen. When `pressed` is true the dialog
-/// moves +1 col on the x-axis (half the shadow's horizontal travel);
-/// y stays put because 1 row is already the minimum vertical step we
-/// can take. Springs back when `pressed = false`.
+/// moves +1 col / +1 row — half the shadow's horizontal travel and
+/// the minimum representable vertical step. y overlaps the shadow's
+/// own y but the shadow still shows on the right; the press reads as
+/// a real two-axis tap. Springs back when `pressed = false`.
 fn paint_dialog_frame(f: &mut ratatui::Frame, want_w: u16, want_h: u16, pressed: bool) -> Rect {
     let area = f.area();
     let w = want_w.min(area.width.saturating_sub(4));
@@ -317,7 +318,7 @@ fn paint_dialog_frame(f: &mut ratatui::Frame, want_w: u16, want_h: u16, pressed:
     let dialog = if pressed {
         Rect {
             x: base_x + 1,
-            y: base_y,
+            y: base_y + 1,
             width: w,
             height: h,
         }
