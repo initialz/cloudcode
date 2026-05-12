@@ -149,9 +149,14 @@ async fn run_inner<B: ratatui::backend::Backend>(
         // ---- stage 2: workspace picker (loop until pick or Esc back) ----
         let last_ws = crate::read_last_workspace(&agent);
         let mut w_state = ListState::default();
+        // After a successful `c`reate, prefer the just-created workspace
+        // for the next selection — even over the previously-saved
+        // last-used one.
+        let mut pending_select: Option<String> = None;
         loop {
             let workspaces = list_workspaces(wire).await?;
-            let initial = last_ws
+            let preferred = pending_select.take().or_else(|| last_ws.clone());
+            let initial = preferred
                 .as_deref()
                 .and_then(|n| workspaces.iter().position(|w| w == n))
                 .unwrap_or(0);
@@ -182,6 +187,7 @@ async fn run_inner<B: ratatui::backend::Backend>(
                         let name = name.trim().to_string();
                         if !name.is_empty() {
                             create_workspace(wire, &name).await?;
+                            pending_select = Some(name);
                             w_state.select(None);
                         }
                     }
