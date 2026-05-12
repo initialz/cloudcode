@@ -309,10 +309,14 @@ fn paint_desktop(f: &mut ratatui::Frame) {
 /// `pressed = false` springs it back to base.
 fn paint_dialog_frame(f: &mut ratatui::Frame, want_w: u16, want_h: u16, pressed: bool) -> Rect {
     let area = f.area();
+    // Cap size so dialog + shadow + a little margin all fit. The dialog
+    // itself is centered in the available area; the shadow is allowed to
+    // bleed into the bottom-right margin space rather than skewing the
+    // dialog's apparent position.
     let w = want_w.min(area.width.saturating_sub(4));
-    let h = want_h.min(area.height.saturating_sub(3));
-    let base_x = area.x + (area.width.saturating_sub(w + 2)) / 2;
-    let base_y = area.y + (area.height.saturating_sub(h + 2)) / 2;
+    let h = want_h.min(area.height.saturating_sub(4));
+    let base_x = area.x + (area.width.saturating_sub(w)) / 2;
+    let base_y = area.y + (area.height.saturating_sub(h)) / 2;
     let dialog = if pressed {
         Rect {
             x: base_x + 1,
