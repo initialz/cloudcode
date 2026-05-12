@@ -227,10 +227,13 @@ impl PtyManager {
         let session_name = format!("cloudcode-{}-{}", account, workspace);
         let mut cmd = if let Some(self_exe) = &self.self_exe {
             let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+            let ws_root = self.workspace_root();
             let mut c = CommandBuilder::new(self_exe);
             c.arg("sandbox-exec");
             c.arg("--workspace");
             c.arg(&cwd);
+            c.arg("--workspace-root");
+            c.arg(&ws_root);
             c.arg("--home");
             c.arg(&home);
             c.arg("--");

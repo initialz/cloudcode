@@ -37,17 +37,32 @@ extern "C" {
 pub fn apply(params: &SandboxParams) -> Result<()> {
     let profile = CString::new(PROFILE).map_err(|_| anyhow!("sandbox profile contains NUL"))?;
 
+    // SBPL doesn't canonicalize subpath arguments — `/tmp/foo` won't match
+    // accesses the kernel reports as `/private/tmp/foo`. Resolve symlinks
+    // up front so the profile rules apply to the real path the kernel
+    // actually sees on every syscall.
+    let workspace_path =
+        std::fs::canonicalize(&params.workspace).unwrap_or_else(|_| params.workspace.clone());
+    let workspace_root_path = std::fs::canonicalize(&params.workspace_root)
+        .unwrap_or_else(|_| params.workspace_root.clone());
+    let home_path = std::fs::canonicalize(&params.home).unwrap_or_else(|_| params.home.clone());
+
     // Parameter pairs: (key, value), NULL-terminated.
-    let workspace = CString::new(params.workspace.as_os_str().as_bytes())
+    let workspace = CString::new(workspace_path.as_os_str().as_bytes())
         .map_err(|_| anyhow!("workspace path contains NUL"))?;
-    let home = CString::new(params.home.as_os_str().as_bytes())
+    let workspace_root = CString::new(workspace_root_path.as_os_str().as_bytes())
+        .map_err(|_| anyhow!("workspace_root path contains NUL"))?;
+    let home = CString::new(home_path.as_os_str().as_bytes())
         .map_err(|_| anyhow!("home path contains NUL"))?;
     let key_ws = CString::new("WORKSPACE").unwrap();
+    let key_ws_root = CString::new("WORKSPACE_ROOT").unwrap();
     let key_home = CString::new("HOME_DIR").unwrap();
 
     let raw: Vec<*const libc::c_char> = vec![
         key_ws.as_ptr(),
         workspace.as_ptr(),
+        key_ws_root.as_ptr(),
+        workspace_root.as_ptr(),
         key_home.as_ptr(),
         home.as_ptr(),
         ptr::null(),

@@ -56,6 +56,8 @@ enum Cmd {
         #[arg(long)]
         workspace: PathBuf,
         #[arg(long)]
+        workspace_root: PathBuf,
+        #[arg(long)]
         home: PathBuf,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<String>,
@@ -87,21 +89,28 @@ async fn main() -> anyhow::Result<()> {
         Some(Cmd::Daemon { cmd }) => cloudcode_daemon::run("agent", "agent.toml", cmd),
         Some(Cmd::SandboxExec {
             workspace,
+            workspace_root,
             home,
             argv,
-        }) => run_sandbox_exec(workspace, home, argv),
+        }) => run_sandbox_exec(workspace, workspace_root, home, argv),
     }
 }
 
 /// Apply the workspace sandbox and exec the target command. This function
 /// never returns on success — it replaces the current process image via
 /// `execvp(3)`. On error it writes to stderr and exits with status 127.
-fn run_sandbox_exec(workspace: PathBuf, home: PathBuf, argv: Vec<String>) -> anyhow::Result<()> {
+fn run_sandbox_exec(
+    workspace: PathBuf,
+    workspace_root: PathBuf,
+    home: PathBuf,
+    argv: Vec<String>,
+) -> anyhow::Result<()> {
     if argv.is_empty() {
         return Err(anyhow!("sandbox-exec: missing target command after `--`"));
     }
     sandbox::apply(&sandbox::SandboxParams {
         workspace,
+        workspace_root,
         home,
     })
     .context("applying workspace sandbox")?;

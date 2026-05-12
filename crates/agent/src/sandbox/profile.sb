@@ -63,6 +63,21 @@
     (subpath (string-append (param "HOME_DIR") "/Library/Application Support/com.apple.TCC")))
 
 ;; ---------------------------------------------------------------------
+;; cross-workspace / cross-account isolation
+;;
+;; The whole `<workspace_root>` subtree (which holds every account's
+;; workspaces on this agent) is denied for reads — overriding the broad
+;; allow above. The current session's own WORKSPACE is then explicitly
+;; re-allowed for both read and write. Net effect: a session can see
+;; its own workspace but not its neighbours, and can't see anything
+;; under other accounts either.
+;; ---------------------------------------------------------------------
+(deny file-read*
+    (subpath (param "WORKSPACE_ROOT")))
+(allow file-read*
+    (subpath (param "WORKSPACE")))
+
+;; ---------------------------------------------------------------------
 ;; write access — the active workspace
 ;; ---------------------------------------------------------------------
 (allow file-write*

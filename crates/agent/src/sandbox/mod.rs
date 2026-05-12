@@ -25,6 +25,11 @@ pub struct SandboxParams {
     /// The workspace directory `claude` will be working in. Read + write
     /// access is granted on this subtree.
     pub workspace: PathBuf,
+    /// Root that holds every account's workspaces on this agent. We deny
+    /// reads on the whole subtree so a session can't peek into other
+    /// workspaces or other accounts — then explicitly re-allow reads on
+    /// `workspace` above.
+    pub workspace_root: PathBuf,
     /// The user's home dir. The sandbox grants RW only to `~/.claude`
     /// (OAuth) and read-only access elsewhere.
     pub home: PathBuf,
