@@ -96,8 +96,15 @@
     (subpath (string-append (param "HOME_DIR") "/.npm"))
     (subpath (string-append (param "HOME_DIR") "/.cargo/registry"))
     (subpath (string-append (param "HOME_DIR") "/.config"))
+    (subpath (string-append (param "HOME_DIR") "/.local"))
     (subpath (string-append (param "HOME_DIR") "/Library/Caches"))
     (subpath (string-append (param "HOME_DIR") "/Library/Application Support")))
+
+;; ~/.claude.json* — claude stores its global config in a sibling file
+;; of ~/.claude/, not under it. The .lock and .tmp.<pid>.<rand> variants
+;; are atomic-write helpers.
+(allow file-read* file-write*
+    (regex (string-append "^" (param "HOME_DIR") "/\\.claude\\.json")))
 
 ;; ---------------------------------------------------------------------
 ;; write access — scratch and the controlling TTY
@@ -121,6 +128,11 @@
     (literal "/dev/ptmx")
     (regex #"^/dev/ttys[0-9]+$")
     (regex #"^/dev/pty[a-z0-9]+$"))
+
+;; Allocating a new pty pair (grantpt / ptsname / unlockpt) is a
+;; distinct SBPL verb on macOS, independent of file-* on /dev/ptmx.
+;; tmux needs this every time it opens a new window.
+(allow pseudo-tty)
 
 ;; ---------------------------------------------------------------------
 ;; persistence defense — even within otherwise-writable paths, the
