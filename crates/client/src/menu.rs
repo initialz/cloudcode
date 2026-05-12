@@ -95,7 +95,7 @@ async fn run_inner<B: ratatui::backend::Backend>(
                     &agents,
                     &mut a_state,
                     "↑↓ move · Enter pick · Esc/q quit",
-                    false,
+                    None,
                 )
             })?;
             let Some(k) = keys.next(bytes).await else {
@@ -103,7 +103,8 @@ async fn run_inner<B: ratatui::backend::Backend>(
             };
             match handle_list_key(k, &mut a_state, agents.len()) {
                 ListAction::Pick => {
-                    let picked = agents[a_state.selected().unwrap_or(0)].clone();
+                    let sel = a_state.selected().unwrap_or(0);
+                    let picked = agents[sel].clone();
                     term.draw(|f| {
                         draw_layout(
                             f,
@@ -112,7 +113,7 @@ async fn run_inner<B: ratatui::backend::Backend>(
                             &agents,
                             &mut a_state,
                             "↑↓ move · Enter pick · Esc/q quit",
-                            true,
+                            Some(sel),
                         )
                     })?;
                     tokio::time::sleep(std::time::Duration::from_millis(120)).await;
@@ -160,7 +161,7 @@ async fn run_inner<B: ratatui::backend::Backend>(
                     &workspaces,
                     &mut w_state,
                     "↑↓ move · Enter pick · c create · d delete · Esc back · q quit",
-                    false,
+                    None,
                 )
             })?;
             let Some(k) = keys.next(bytes).await else {
@@ -209,7 +210,7 @@ async fn run_inner<B: ratatui::backend::Backend>(
                                         &workspaces,
                                         &mut w_state,
                                         "↑↓ move · Enter pick · c create · d delete · Esc back · q quit",
-                                        true,
+                                        Some(sel),
                                     )
                                 })?;
                                 tokio::time::sleep(std::time::Duration::from_millis(120)).await;
@@ -342,6 +343,36 @@ fn ok_button(label: &str, pressed: bool) -> Span<'static> {
     }
 }
 
+const LOGO: &[&str] = &[
+    "   ____ _                 _  ____          _      ",
+    "  / ___| | ___  _   _  __| |/ ___|___   __| | ___ ",
+    " | |   | |/ _ \\| | | |/ _` | |   / _ \\ / _` |/ _ \\",
+    " | |___| | (_) | |_| | (_| | |__| (_) | (_| |  __/",
+    "  \\____|_|\\___/ \\__,_|\\__,_|\\____\\___/ \\__,_|\\___|",
+];
+const LOGO_W: u16 = 51;
+const LOGO_H: u16 = 5;
+
+fn render_logo(f: &mut ratatui::Frame, area: Rect) {
+    let lines: Vec<Line<'static>> = LOGO
+        .iter()
+        .map(|row| {
+            Line::from(Span::styled(
+                row.to_string(),
+                Style::default()
+                    .bg(DIALOG_BG)
+                    .fg(HILITE_BG)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .alignment(Alignment::Center)
+        })
+        .collect();
+    f.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(DIALOG_BG)),
+        area,
+    );
+}
+
 fn hint_bar(f: &mut ratatui::Frame, hint: &str) {
     let area = f.area();
     if area.height == 0 {
@@ -369,31 +400,46 @@ fn draw_layout(
     items: &[String],
     state: &mut ListState,
     hint: &str,
-    pressed_ok: bool,
+    pressed_index: Option<usize>,
 ) {
     paint_desktop(f);
 
     let label_w = items.iter().map(|s| s.chars().count()).max().unwrap_or(0);
-    let want_w = ((label_w + 16).max(title.chars().count() + account.len() + 12).max(50)) as u16;
-    let want_h = (items.len().max(4) as u16 + 7).max(12);
+    let want_w = ((label_w + 18)
+        .max(title.chars().count() + account.len() + 12)
+        .max((LOGO_W + 6) as usize)) as u16;
+    let want_h = (items.len() as u16 + LOGO_H + 6).max(LOGO_H + 8);
 
     let inner = paint_dialog_frame(f, want_w, want_h);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // title
-            Constraint::Length(1), // rule
-            Constraint::Min(3),    // list
-            Constraint::Length(1), // rule
-            Constraint::Length(1), // buttons
+            Constraint::Length(LOGO_H), // logo
+            Constraint::Length(1),      // rule
+            Constraint::Length(1),      // title
+            Constraint::Length(1),      // rule
+            Constraint::Min(3),         // list
         ])
         .split(inner);
+
+    render_logo(f, chunks[0]);
+
+    let rule_w = chunks[1].width as usize;
+    let rule_style = Style::default().bg(DIALOG_BG).fg(DIALOG_FG);
+    f.render_widget(
+        Paragraph::new(Span::styled("─".repeat(rule_w), rule_style)),
+        chunks[1],
+    );
+    f.render_widget(
+        Paragraph::new(Span::styled("─".repeat(rule_w), rule_style)),
+        chunks[3],
+    );
 
     // title row: " Title:                          [account] "
     let acct_label = format!("[{}]", account);
     let title_text = format!(" {}:", title);
-    let pad = (chunks[0].width as usize)
+    let pad = (chunks[2].width as usize)
         .saturating_sub(title_text.chars().count() + acct_label.chars().count() + 1);
     f.render_widget(
         Paragraph::new(Line::from(vec![
@@ -408,29 +454,12 @@ fn draw_layout(
             Span::raw(" "),
         ]))
         .style(Style::default().bg(DIALOG_BG)),
-        chunks[0],
+        chunks[2],
     );
 
-    // separator rules.
-    let rule_w = chunks[1].width as usize;
-    let rule = "─".repeat(rule_w);
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            rule.clone(),
-            Style::default().bg(DIALOG_BG).fg(DIALOG_FG),
-        )),
-        chunks[1],
-    );
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            rule,
-            Style::default().bg(DIALOG_BG).fg(DIALOG_FG),
-        )),
-        chunks[3],
-    );
-
-    // list with red numbers.
-    let list_w = chunks[2].width as usize;
+    // list with red numbers + press-down animation for the picked row.
+    let list_w = chunks[4].width as usize;
+    let selected = state.selected();
     let list_items: Vec<ListItem> = if items.is_empty() {
         let txt = "  (empty — press `c` to create)";
         let pad = list_w.saturating_sub(txt.chars().count());
@@ -442,46 +471,83 @@ fn draw_layout(
         items
             .iter()
             .enumerate()
-            .map(|(i, s)| {
-                let prefix = format!("  {:>2}  ", i + 1);
-                let used = prefix.chars().count() + s.chars().count();
-                let pad = list_w.saturating_sub(used);
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        prefix,
-                        Style::default()
-                            .fg(NUM_FG)
-                            .bg(DIALOG_BG)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(s.clone(), Style::default().fg(DIALOG_FG).bg(DIALOG_BG)),
-                    Span::raw(" ".repeat(pad)),
-                ]))
-            })
+            .map(|(i, s)| build_row(i, s, list_w, selected, pressed_index))
             .collect()
     };
+    // We bake the highlight (and the pressed flash) directly into the items,
+    // so the List widget should not apply any extra highlight_style — it
+    // would just paint over what we already drew.
     let list = List::new(list_items)
         .style(Style::default().bg(DIALOG_BG))
-        .highlight_style(
-            Style::default()
-                .bg(HILITE_BG)
-                .fg(HILITE_FG)
-                .add_modifier(Modifier::BOLD),
-        )
         .highlight_symbol("");
-    f.render_stateful_widget(list, chunks[2], state);
-
-    let ok = ok_button("OK", pressed_ok);
-    let cancel = Span::styled("  <Cancel>  ", Style::default().bg(DIALOG_BG).fg(DIALOG_FG));
-    f.render_widget(
-        Paragraph::new(
-            Line::from(vec![ok, Span::raw("    "), cancel]).alignment(Alignment::Center),
-        )
-        .style(Style::default().bg(DIALOG_BG).fg(DIALOG_FG)),
-        chunks[4],
-    );
+    let mut blank_state = ListState::default();
+    f.render_stateful_widget(list, chunks[4], &mut blank_state);
 
     hint_bar(f, hint);
+}
+
+/// Build one list row. We bake highlight and the "press-down" effect into
+/// the line directly: when row `i` is the pressed one, it is rendered as
+/// a depressed shadow shifted right by 2 cells and dimmed; when it is the
+/// merely-selected row, it gets the usual blue/white highlight.
+fn build_row(
+    i: usize,
+    name: &str,
+    list_w: usize,
+    selected: Option<usize>,
+    pressed: Option<usize>,
+) -> ListItem<'static> {
+    let prefix = format!("  {:>2}  ", i + 1);
+    let used = prefix.chars().count() + name.chars().count();
+    let pad = list_w.saturating_sub(used);
+    let raw = format!("{}{}{}", prefix, name, " ".repeat(pad));
+
+    if pressed == Some(i) {
+        // Pressed row: shift content right by 2 cells, dim colour palette.
+        let shifted = format!("  {}", raw);
+        let body = shifted.chars().take(list_w).collect::<String>();
+        return ListItem::new(Line::from(Span::styled(
+            body,
+            Style::default()
+                .bg(Color::DarkGray)
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+
+    if selected == Some(i) {
+        // Highlighted row: blue/white bar across full row width. We split
+        // the number prefix so it stays bold red, but bg becomes blue.
+        let num_style = Style::default()
+            .bg(HILITE_BG)
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+        let body_style = Style::default()
+            .bg(HILITE_BG)
+            .fg(HILITE_FG)
+            .add_modifier(Modifier::BOLD);
+        return ListItem::new(Line::from(vec![
+            Span::styled(prefix, num_style),
+            Span::styled(name.to_string(), body_style),
+            Span::styled(" ".repeat(pad), body_style),
+        ]));
+    }
+
+    // Normal row.
+    ListItem::new(Line::from(vec![
+        Span::styled(
+            prefix,
+            Style::default()
+                .bg(DIALOG_BG)
+                .fg(NUM_FG)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            name.to_string(),
+            Style::default().bg(DIALOG_BG).fg(DIALOG_FG),
+        ),
+        Span::styled(" ".repeat(pad), Style::default().bg(DIALOG_BG)),
+    ]))
 }
 
 fn draw_titled_dialog(
