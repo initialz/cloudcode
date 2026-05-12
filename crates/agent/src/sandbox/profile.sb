@@ -69,19 +69,31 @@
     (subpath (string-append (param "HOME_DIR") "/Library/Application Support/com.apple.TCC")))
 
 ;; ---------------------------------------------------------------------
-;; cross-workspace / cross-account isolation
-;;
-;; Deny content reads (file-read-data, file-read-xattr) on anything
-;; under WORKSPACE_ROOT *except* the current session's own WORKSPACE.
-;; The SBPL idiom for "set subtraction" is require-all + require-not.
-;;
-;; file-read-metadata is intentionally left allowed by the broad
-;; (allow file-read*) above, so that `stat` / path traversal works on
-;; sibling dirs (without this, `tmux`, `chdir`, and tools walking the
-;; parents would fail). Net effect: a session can see and modify its
-;; own workspace, can `stat` (but not list or read) sibling dirs,
-;; and is completely shut out of other accounts' contents.
+;; user / workspace isolation — two layers
 ;; ---------------------------------------------------------------------
+;;
+;; Layer 1: cross-user. /Users/<somebody-else> is denied content reads,
+;; only the running user's own HOME_DIR survives. On a shared macOS
+;; box this stops a session from peeking into other accounts' homes.
+;; /Users/Shared (the public drop dir) is also denied — claude has no
+;; reason to read it.
+;;
+;; Layer 2: cross-workspace within own home. The cloudcode WORKSPACE_ROOT
+;; subtree is denied content reads except for the current session's own
+;; WORKSPACE — so sibling workspaces and workspaces under other
+;; cloudcode accounts stay invisible.
+;;
+;; Both denials only touch file-read-data + file-read-xattr.
+;; file-read-metadata is left allowed by the broad (allow file-read*)
+;; above so `stat` / path traversal still works through these dirs —
+;; without that, `tmux`, `chdir`, and any tool walking parents would
+;; fail.
+;; ---------------------------------------------------------------------
+(deny file-read-data file-read-xattr
+    (require-all
+        (subpath "/Users")
+        (require-not (subpath (param "HOME_DIR")))))
+
 (deny file-read-data file-read-xattr
     (require-all
         (subpath (param "WORKSPACE_ROOT"))
@@ -174,6 +186,16 @@
 ;; ---------------------------------------------------------------------
 (allow network*)
 (allow system-socket)
+
+;; ---------------------------------------------------------------------
+;; hardware — block camera + microphone. Screen capture isn't listed
+;; because it routes through TCC, and a sandboxed process has no TCC
+;; grant. These are also implicitly denied by `(deny default)` above —
+;; they're written out explicitly to document intent and to keep this
+;; bar from being lowered by accident in some future edit.
+;; ---------------------------------------------------------------------
+(deny device-camera)
+(deny device-microphone)
 
 ;; ---------------------------------------------------------------------
 ;; macOS plumbing — coarse for v1. Required for launchd-spawned helpers,
