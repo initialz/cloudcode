@@ -219,12 +219,19 @@ impl PtyManager {
         };
 
         // Build the tmux command. `-A` means "attach to session if it exists,
-        // else create"; the workspace becomes a persistent slot.
+        // else create"; the workspace becomes a persistent slot. `-L <label>`
+        // gives cloudcode its OWN tmux server, distinct from any global tmux
+        // the user has running. Without this, our `tmux new-session` would
+        // attach as a client to the user's existing server (which is not in
+        // our sandbox), so claude would be spawned from a non-sandboxed
+        // server and inherit nothing. A per-workspace label also keeps each
+        // workspace's tmux server in its own sandbox state.
         // When the workspace sandbox is enabled we don't exec tmux directly:
         // we exec `cloudcode-agent sandbox-exec --workspace=… --home=… --
         // tmux …`, and that thin shim applies the sandbox to itself before
         // execing tmux (so tmux + claude inherit the sandbox state).
         let session_name = format!("cloudcode-{}-{}", account, workspace);
+        let tmux_label = format!("cc-{}-{}", account, workspace);
         let mut cmd = if let Some(self_exe) = &self.self_exe {
             let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
             let ws_root = self.workspace_root();
@@ -242,6 +249,8 @@ impl PtyManager {
         } else {
             CommandBuilder::new(&self.tmux.executable)
         };
+        cmd.arg("-L");
+        cmd.arg(&tmux_label);
         cmd.arg("new-session");
         cmd.arg("-A");
         cmd.arg("-s");
@@ -453,12 +462,10 @@ impl PtyManager {
                 if !dir.exists() {
                     Some(format!("workspace '{}' does not exist", name))
                 } else {
+                    // Tear down the per-workspace tmux server we spawned
+                    // for this slot, if it's still around.
                     let _ = std::process::Command::new(&self.tmux.executable)
-                        .args([
-                            "kill-session",
-                            "-t",
-                            &format!("cloudcode-{}-{}", account, name),
-                        ])
+                        .args(["-L", &format!("cc-{}-{}", account, name), "kill-server"])
                         .output();
                     std::fs::remove_dir_all(&dir)
                         .err()

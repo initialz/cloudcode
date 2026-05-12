@@ -65,17 +65,21 @@
 ;; ---------------------------------------------------------------------
 ;; cross-workspace / cross-account isolation
 ;;
-;; The whole `<workspace_root>` subtree (which holds every account's
-;; workspaces on this agent) is denied for reads — overriding the broad
-;; allow above. The current session's own WORKSPACE is then explicitly
-;; re-allowed for both read and write. Net effect: a session can see
-;; its own workspace but not its neighbours, and can't see anything
-;; under other accounts either.
+;; Deny content reads (file-read-data, file-read-xattr) on anything
+;; under WORKSPACE_ROOT *except* the current session's own WORKSPACE.
+;; The SBPL idiom for "set subtraction" is require-all + require-not.
+;;
+;; file-read-metadata is intentionally left allowed by the broad
+;; (allow file-read*) above, so that `stat` / path traversal works on
+;; sibling dirs (without this, `tmux`, `chdir`, and tools walking the
+;; parents would fail). Net effect: a session can see and modify its
+;; own workspace, can `stat` (but not list or read) sibling dirs,
+;; and is completely shut out of other accounts' contents.
 ;; ---------------------------------------------------------------------
-(deny file-read*
-    (subpath (param "WORKSPACE_ROOT")))
-(allow file-read*
-    (subpath (param "WORKSPACE")))
+(deny file-read-data file-read-xattr
+    (require-all
+        (subpath (param "WORKSPACE_ROOT"))
+        (require-not (subpath (param "WORKSPACE")))))
 
 ;; ---------------------------------------------------------------------
 ;; write access — the active workspace
@@ -105,7 +109,18 @@
     (literal "/dev/null")
     (literal "/dev/dtracehelper")
     (literal "/dev/tty")
-    (regex #"^/dev/ttys[0-9]+$"))
+    (literal "/dev/ptmx")
+    (regex #"^/dev/ttys[0-9]+$")
+    (regex #"^/dev/pty[a-z0-9]+$"))
+
+;; PTY allocation + dtrace probes + tty winsize ioctls all need
+;; file-ioctl on these nodes, which is a separate verb from file-write*.
+(allow file-ioctl
+    (literal "/dev/dtracehelper")
+    (literal "/dev/tty")
+    (literal "/dev/ptmx")
+    (regex #"^/dev/ttys[0-9]+$")
+    (regex #"^/dev/pty[a-z0-9]+$"))
 
 ;; ---------------------------------------------------------------------
 ;; persistence defense — even within otherwise-writable paths, the
