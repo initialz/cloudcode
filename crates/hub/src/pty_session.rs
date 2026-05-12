@@ -429,6 +429,7 @@ where
             workspace,
             cols,
             rows,
+            claude_args,
         } => {
             if ctx.active.is_some() {
                 let _ = send_client(
@@ -485,6 +486,7 @@ where
                     workspace: workspace.clone(),
                     cols,
                     rows,
+                    claude_args,
                 })
                 .await
                 .is_err()

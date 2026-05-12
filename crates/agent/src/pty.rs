@@ -93,8 +93,9 @@ impl PtyManager {
                 workspace,
                 cols,
                 rows,
+                claude_args,
             } => {
-                self.open_session(session_id, account, workspace, cols, rows, tx)
+                self.open_session(session_id, account, workspace, cols, rows, claude_args, tx)
                     .await;
             }
             ServerMsg::PtyResize {
@@ -155,6 +156,7 @@ impl PtyManager {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn open_session(
         self: &Arc<Self>,
         session_id: Uuid,
@@ -162,6 +164,7 @@ impl PtyManager {
         workspace: String,
         cols: u16,
         rows: u16,
+        claude_args: Vec<String>,
         tx: mpsc::Sender<OutFrame>,
     ) {
         if let Err(e) = validate_name(&account, "account") {
@@ -265,6 +268,11 @@ impl PtyManager {
         // state claude was in.
         cmd.arg(&self.claude.executable);
         for arg in &self.claude.extra_args {
+            cmd.arg(arg);
+        }
+        // Per-session args forwarded from the client (everything after `--`
+        // on the cloudcode CLI). tmux ignores all of this on re-attach.
+        for arg in &claude_args {
             cmd.arg(arg);
         }
         // Strip CLAUDECODE* / CLAUDE_CODE_* (matches the multica precedent and

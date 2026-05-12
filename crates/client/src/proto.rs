@@ -30,10 +30,15 @@ pub enum ClientToHub {
         name: String,
     },
     /// Open a PTY session in the given workspace on the selected agent.
+    /// `claude_args` is forwarded verbatim to `claude`'s argv when the
+    /// session is first created (tmux ignores it on re-attach, so it
+    /// only affects the very first spawn for this workspace).
     OpenSession {
         workspace: String,
         cols: u16,
         rows: u16,
+        #[serde(default)]
+        claude_args: Vec<String>,
     },
     /// In-session: terminal-size change (SIGWINCH).
     Resize {

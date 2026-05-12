@@ -18,9 +18,11 @@ use crate::wire::OutFrame;
     about = "Cloudcode client: open an interactive claude session on a remote agent",
     long_about = "Running `cloudcode` with no subcommand opens a workspace \
                   picker for the configured remote agent, then drops into \
-                  claude inside that workspace. When claude exits you're \
-                  back at the picker. Use `cloudcode config` to inspect or \
-                  set up the client config."
+                  claude inside that workspace. Everything after `--` is \
+                  forwarded verbatim to the remote `claude` process — e.g. \
+                  `cloudcode -- --continue` or `cloudcode -- --model opus`. \
+                  When claude exits you're back at the picker. Use \
+                  `cloudcode config` to inspect or set up the client config."
 )]
 struct Cli {
     /// Pin to a specific agent. Without this, cloudcode prefers the last
@@ -33,6 +35,12 @@ struct Cli {
     /// config dir. Refuses to overwrite if the file already exists.
     #[arg(long)]
     init: bool,
+
+    /// Everything after `--` is passed through to the remote `claude`
+    /// binary's argv on session creation. Reattach to an existing
+    /// workspace ignores these (tmux only spawns claude on first open).
+    #[arg(last = true, allow_hyphen_values = true)]
+    claude_args: Vec<String>,
 
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -142,7 +150,7 @@ async fn main() -> ExitCode {
         }
     } else {
         match cli.cmd {
-            None => run_chat(cli.agent).await,
+            None => run_chat(cli.agent, cli.claude_args).await,
             Some(Cmd::Config) => show_config(),
         }
     };
@@ -200,7 +208,7 @@ token   = "cc_PASTE_TOKEN_HERE"
     Ok(())
 }
 
-async fn run_chat(agent_flag: Option<String>) -> Result<()> {
+async fn run_chat(agent_flag: Option<String>, claude_args: Vec<String>) -> Result<()> {
     let cfg = load_config()?;
     let mut wire = wire::connect(&cfg.hub_url, &cfg.token).await?;
 
@@ -231,6 +239,7 @@ async fn run_chat(agent_flag: Option<String>) -> Result<()> {
                         workspace: workspace.clone(),
                         cols,
                         rows,
+                        claude_args: claude_args.clone(),
                     }))
                     .await
                     .map_err(|_| anyhow!("hub disconnected"))?;

@@ -108,6 +108,8 @@ pub enum ServerMsg {
         workspace: String,
         cols: u16,
         rows: u16,
+        #[serde(default)]
+        claude_args: Vec<String>,
     },
     PtyResize {
         session_id: Uuid,
