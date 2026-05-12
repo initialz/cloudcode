@@ -1,0 +1,142 @@
+;; cloudcode workspace sandbox profile (macOS Seatbelt / SBPL).
+;;
+;; Strategy
+;; --------
+;; - default deny;
+;; - read access is broad (so node, git, brew binaries, mise / asdf,
+;;   etc. find the lib / config / dyld cache they expect to be there);
+;; - explicit *deny* on directories that hold secrets (~/.ssh, ~/.aws,
+;;   ~/.gnupg, Keychains, …) — overrides the broad read allow above
+;;   because SBPL is last-rule-wins;
+;; - write access is restricted to the active workspace, ~/.claude,
+;;   a small whitelist of cache dirs, and the usual scratch dirs;
+;; - even where writes are otherwise allowed, persistence vectors a
+;;   compromised / hallucinating AI run might hit on its way past you
+;;   (shell init files, LaunchAgents, .git/hooks) are denied;
+;; - network is left fully open (claude needs Anthropic API, GitHub,
+;;   package registries — an IP-level allowlist isn't workable against
+;;   global CDNs);
+;; - signals to own children only — can't poke same-uid host processes.
+;;
+;; Parameters supplied via sandbox_init_with_parameters:
+;;   WORKSPACE  — abs path of the current workspace dir (rw allowed)
+;;   HOME_DIR   — abs path of the user's home dir
+;;
+;; Notes
+;; -----
+;; The shell-init / git-hooks / secrets hardening pattern is a well-
+;; known Unix isolation idiom (it shows up in macOS man pages, Chromium
+;; sandbox docs, and many seatbelt profiles in the wild). The
+;; implementation here is original — see Acknowledgements in the
+;; project README.
+
+(version 1)
+(deny default)
+
+;; ---------------------------------------------------------------------
+;; process / sandbox visibility
+;; ---------------------------------------------------------------------
+(allow process-fork)
+(allow process-exec)
+;; Only see processes inside this same sandbox. Can't `ps` into host
+;; processes (whose cmdlines / env may leak tokens or absolute paths).
+(allow process-info* (target same-sandbox))
+;; Signals: own children only.
+(allow signal (target self))
+(allow signal (target children))
+
+;; ---------------------------------------------------------------------
+;; read access
+;; ---------------------------------------------------------------------
+(allow file-read*)
+
+;; ---------------------------------------------------------------------
+;; secrets — deny both read and write, overriding the broad read above
+;; ---------------------------------------------------------------------
+(deny file-read* file-write*
+    (subpath (string-append (param "HOME_DIR") "/.ssh"))
+    (subpath (string-append (param "HOME_DIR") "/.gnupg"))
+    (subpath (string-append (param "HOME_DIR") "/.aws"))
+    (subpath (string-append (param "HOME_DIR") "/.config/gcloud"))
+    (subpath (string-append (param "HOME_DIR") "/Library/Keychains"))
+    (subpath (string-append (param "HOME_DIR") "/Library/Cookies"))
+    (subpath (string-append (param "HOME_DIR") "/Library/Application Support/com.apple.TCC")))
+
+;; ---------------------------------------------------------------------
+;; write access — the active workspace
+;; ---------------------------------------------------------------------
+(allow file-write*
+    (subpath (param "WORKSPACE")))
+
+;; ---------------------------------------------------------------------
+;; write access — claude state and the caches tooling needs
+;; ---------------------------------------------------------------------
+(allow file-write*
+    (subpath (string-append (param "HOME_DIR") "/.claude"))
+    (subpath (string-append (param "HOME_DIR") "/.cache"))
+    (subpath (string-append (param "HOME_DIR") "/.npm"))
+    (subpath (string-append (param "HOME_DIR") "/.cargo/registry"))
+    (subpath (string-append (param "HOME_DIR") "/.config"))
+    (subpath (string-append (param "HOME_DIR") "/Library/Caches"))
+    (subpath (string-append (param "HOME_DIR") "/Library/Application Support")))
+
+;; ---------------------------------------------------------------------
+;; write access — scratch and the controlling TTY
+;; ---------------------------------------------------------------------
+(allow file-write*
+    (subpath "/private/tmp")
+    (subpath "/private/var/tmp")
+    (subpath "/private/var/folders")
+    (literal "/dev/null")
+    (literal "/dev/dtracehelper")
+    (literal "/dev/tty")
+    (regex #"^/dev/ttys[0-9]+$"))
+
+;; ---------------------------------------------------------------------
+;; persistence defense — even within otherwise-writable paths, the
+;; following are off-limits because they're how a bad / careless run
+;; would survive the session:
+;;
+;;   shell init      — `~/.bashrc`, `~/.zshrc`, etc.
+;;   launch agents   — `~/Library/LaunchAgents` (plist persistence)
+;;   git hooks       — `.git/hooks/pre-commit`, `post-receive`, …
+;; ---------------------------------------------------------------------
+(deny file-write*
+    (literal (string-append (param "HOME_DIR") "/.bashrc"))
+    (literal (string-append (param "HOME_DIR") "/.bash_profile"))
+    (literal (string-append (param "HOME_DIR") "/.bash_login"))
+    (literal (string-append (param "HOME_DIR") "/.bash_logout"))
+    (literal (string-append (param "HOME_DIR") "/.zshrc"))
+    (literal (string-append (param "HOME_DIR") "/.zprofile"))
+    (literal (string-append (param "HOME_DIR") "/.zlogin"))
+    (literal (string-append (param "HOME_DIR") "/.zlogout"))
+    (literal (string-append (param "HOME_DIR") "/.zshenv"))
+    (literal (string-append (param "HOME_DIR") "/.profile"))
+    (literal (string-append (param "HOME_DIR") "/.cshrc"))
+    (literal (string-append (param "HOME_DIR") "/.tcshrc"))
+    (subpath (string-append (param "HOME_DIR") "/.config/fish"))
+    (subpath (string-append (param "HOME_DIR") "/Library/LaunchAgents"))
+    (subpath (string-append (param "HOME_DIR") "/Library/LaunchDaemons")))
+
+(deny file-write*
+    (regex #".*/\.git/hooks/.*"))
+
+;; ---------------------------------------------------------------------
+;; network — fully open
+;; ---------------------------------------------------------------------
+(allow network*)
+(allow system-socket)
+
+;; ---------------------------------------------------------------------
+;; macOS plumbing — coarse for v1. Required for launchd-spawned helpers,
+;; dyld shared cache, font / audio subsystems, etc. Narrowing these
+;; safely requires per-OS-version testing; will iterate once we have
+;; telemetry on what claude's toolchain actually touches.
+;; ---------------------------------------------------------------------
+(allow mach-lookup)
+(allow mach-priv-host-port)
+(allow ipc-posix-shm)
+(allow ipc-posix-sem)
+(allow ipc-sysv-shm)
+(allow iokit-open)
+(allow sysctl-read)

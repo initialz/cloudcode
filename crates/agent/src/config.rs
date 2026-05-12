@@ -13,6 +13,8 @@ pub struct Config {
     pub tmux: TmuxConfig,
     #[serde(default)]
     pub recording: RecordingConfig,
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,6 +53,16 @@ pub struct TmuxConfig {
     /// `tmux` binary to invoke. Defaults to PATH lookup.
     #[serde(default = "default_tmux_executable")]
     pub executable: PathBuf,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct SandboxConfig {
+    /// Wrap each spawned `claude` (and the tmux session it lives in) in a
+    /// per-workspace OS-level sandbox. macOS only at the moment — Linux
+    /// support is coming. Off by default; opt in once you trust the
+    /// profile fits your tooling.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]

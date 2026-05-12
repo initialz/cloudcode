@@ -1,11 +1,13 @@
 mod config;
 mod name;
 mod pty;
+mod sandbox;
 mod tunnel;
 mod ws;
 
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
+use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -47,6 +49,17 @@ enum Cmd {
         #[command(subcommand)]
         cmd: cloudcode_daemon::DaemonCmd,
     },
+    /// Internal: wrap the following command in the workspace sandbox and
+    /// exec it. Used by the agent's PTY spawn path; not meant for users.
+    #[command(hide = true)]
+    SandboxExec {
+        #[arg(long)]
+        workspace: PathBuf,
+        #[arg(long)]
+        home: PathBuf,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        argv: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -72,7 +85,48 @@ async fn main() -> anyhow::Result<()> {
     match cli.cmd {
         None => serve(cli.config).await,
         Some(Cmd::Daemon { cmd }) => cloudcode_daemon::run("agent", "agent.toml", cmd),
+        Some(Cmd::SandboxExec {
+            workspace,
+            home,
+            argv,
+        }) => run_sandbox_exec(workspace, home, argv),
     }
+}
+
+/// Apply the workspace sandbox and exec the target command. This function
+/// never returns on success — it replaces the current process image via
+/// `execvp(3)`. On error it writes to stderr and exits with status 127.
+fn run_sandbox_exec(workspace: PathBuf, home: PathBuf, argv: Vec<String>) -> anyhow::Result<()> {
+    if argv.is_empty() {
+        return Err(anyhow!("sandbox-exec: missing target command after `--`"));
+    }
+    sandbox::apply(&sandbox::SandboxParams {
+        workspace,
+        home,
+    })
+    .context("applying workspace sandbox")?;
+
+    let program = CString::new(argv[0].as_bytes())
+        .map_err(|_| anyhow!("sandbox-exec: target program path contains NUL"))?;
+    let c_argv: Vec<CString> = argv
+        .iter()
+        .map(|s| {
+            CString::new(s.as_bytes())
+                .map_err(|_| anyhow!("sandbox-exec: argv element contains NUL"))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let mut raw: Vec<*const libc::c_char> = c_argv.iter().map(|s| s.as_ptr()).collect();
+    raw.push(std::ptr::null());
+
+    unsafe {
+        libc::execvp(program.as_ptr(), raw.as_ptr());
+    }
+    let errno = std::io::Error::last_os_error();
+    Err(anyhow!(
+        "sandbox-exec: execvp `{}` failed: {}",
+        argv[0],
+        errno
+    ))
 }
 
 async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
@@ -98,6 +152,7 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         config.claude.clone(),
         config.tmux.clone(),
         config.recording.clone(),
+        config.sandbox.clone(),
     )?);
 
     let state = Arc::new(AppState {
@@ -142,6 +197,15 @@ registration_token = "ag_PASTE_TOKEN_HERE"
 # executable     = "claude"                            # PATH lookup by default
 # workspace_root = "~/cloudcode-agent/workspaces"      # one dir per workspace
 # extra_args     = []                                  # appended to claude args
+
+# [sandbox] wraps each spawned claude (and its tmux session) in an OS-level
+# sandbox so it can only touch the active workspace dir + ~/.claude + scratch
+# space. Off by default — opt in once you've confirmed the profile fits the
+# tools your projects use. macOS only at the moment (Seatbelt); Linux is
+# coming. With it enabled, escaping the workspace is a kernel-enforced EPERM
+# rather than a "please don't".
+# [sandbox]
+# enabled = false
 "#
     );
 

@@ -1,4 +1,4 @@
-use crate::config::{ClaudeConfig, RecordingConfig, TmuxConfig};
+use crate::config::{ClaudeConfig, RecordingConfig, SandboxConfig, TmuxConfig};
 use crate::tunnel::{pack_pty_frame, ClientMsg, ServerMsg, TAG_PTY_OUTPUT};
 use anyhow::{Context, Result};
 use chrono::SecondsFormat;
@@ -22,6 +22,11 @@ pub struct PtyManager {
     claude: ClaudeConfig,
     tmux: TmuxConfig,
     recording: RecordingConfig,
+    /// When the workspace sandbox is enabled at startup, this holds the
+    /// path to the running cloudcode-agent binary so the PTY spawn path
+    /// can re-invoke us with the `sandbox-exec` subcommand. `None` means
+    /// "sandbox disabled, exec tmux directly".
+    self_exe: Option<PathBuf>,
     sessions: Arc<DashMap<Uuid, Arc<PtyHandle>>>,
 }
 
@@ -31,7 +36,12 @@ struct PtyHandle {
 }
 
 impl PtyManager {
-    pub fn new(claude: ClaudeConfig, tmux: TmuxConfig, recording: RecordingConfig) -> Result<Self> {
+    pub fn new(
+        claude: ClaudeConfig,
+        tmux: TmuxConfig,
+        recording: RecordingConfig,
+        sandbox: SandboxConfig,
+    ) -> Result<Self> {
         // Fail fast if tmux is not installed.
         let tmux_path = which::which(&tmux.executable).with_context(|| {
             format!(
@@ -47,12 +57,30 @@ impl PtyManager {
             tracing::warn!(error = %e, dir = %recording.dir.display(), "could not create recording dir");
         }
 
+        let self_exe = if sandbox.enabled {
+            if !crate::sandbox::is_supported() {
+                return Err(anyhow::anyhow!(
+                    "[sandbox] enabled = true in agent.toml, but the workspace sandbox \
+                     is not implemented for this platform yet (macOS only at the moment). \
+                     Set [sandbox] enabled = false to start the agent."
+                ));
+            }
+            let p = std::env::current_exe().context(
+                "locating the running cloudcode-agent binary for the sandbox wrapper",
+            )?;
+            tracing::info!(wrapper = %p.display(), "workspace sandbox enabled");
+            Some(p)
+        } else {
+            None
+        };
+
         Ok(Self {
             claude,
             tmux: TmuxConfig {
                 executable: tmux_path,
             },
             recording,
+            self_exe,
             sessions: Arc::new(DashMap::new()),
         })
     }
@@ -192,8 +220,25 @@ impl PtyManager {
 
         // Build the tmux command. `-A` means "attach to session if it exists,
         // else create"; the workspace becomes a persistent slot.
+        // When the workspace sandbox is enabled we don't exec tmux directly:
+        // we exec `cloudcode-agent sandbox-exec --workspace=… --home=… --
+        // tmux …`, and that thin shim applies the sandbox to itself before
+        // execing tmux (so tmux + claude inherit the sandbox state).
         let session_name = format!("cloudcode-{}-{}", account, workspace);
-        let mut cmd = CommandBuilder::new(&self.tmux.executable);
+        let mut cmd = if let Some(self_exe) = &self.self_exe {
+            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+            let mut c = CommandBuilder::new(self_exe);
+            c.arg("sandbox-exec");
+            c.arg("--workspace");
+            c.arg(&cwd);
+            c.arg("--home");
+            c.arg(&home);
+            c.arg("--");
+            c.arg(&self.tmux.executable);
+            c
+        } else {
+            CommandBuilder::new(&self.tmux.executable)
+        };
         cmd.arg("new-session");
         cmd.arg("-A");
         cmd.arg("-s");

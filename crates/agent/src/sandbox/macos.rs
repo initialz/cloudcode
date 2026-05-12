@@ -1,0 +1,74 @@
+//! macOS Seatbelt binding.
+//!
+//! `sandbox_init_with_parameters` is the parameterised variant of the
+//! Seatbelt entry point. It ships in `libSystem.B.dylib` and has been
+//! stable enough that Chromium, Firefox, and Electron all link against
+//! it the same way. The C signature (from public uses in those projects)
+//! is:
+//!
+//! ```c
+//! int sandbox_init_with_parameters(
+//!     const char *profile,
+//!     uint64_t flags,
+//!     const char *const parameters[],   // NULL-terminated K, V, K, V, ...
+//!     char **errorbuf);
+//! void sandbox_free_error(char *errorbuf);
+//! ```
+
+use crate::sandbox::SandboxParams;
+use anyhow::{anyhow, Result};
+use std::ffi::{CStr, CString};
+use std::os::unix::ffi::OsStrExt;
+use std::ptr;
+
+const PROFILE: &str = include_str!("profile.sb");
+
+extern "C" {
+    fn sandbox_init_with_parameters(
+        profile: *const libc::c_char,
+        flags: u64,
+        parameters: *const *const libc::c_char,
+        errorbuf: *mut *mut libc::c_char,
+    ) -> libc::c_int;
+
+    fn sandbox_free_error(errorbuf: *mut libc::c_char);
+}
+
+pub fn apply(params: &SandboxParams) -> Result<()> {
+    let profile = CString::new(PROFILE).map_err(|_| anyhow!("sandbox profile contains NUL"))?;
+
+    // Parameter pairs: (key, value), NULL-terminated.
+    let workspace = CString::new(params.workspace.as_os_str().as_bytes())
+        .map_err(|_| anyhow!("workspace path contains NUL"))?;
+    let home = CString::new(params.home.as_os_str().as_bytes())
+        .map_err(|_| anyhow!("home path contains NUL"))?;
+    let key_ws = CString::new("WORKSPACE").unwrap();
+    let key_home = CString::new("HOME_DIR").unwrap();
+
+    let raw: Vec<*const libc::c_char> = vec![
+        key_ws.as_ptr(),
+        workspace.as_ptr(),
+        key_home.as_ptr(),
+        home.as_ptr(),
+        ptr::null(),
+    ];
+
+    let mut errbuf: *mut libc::c_char = ptr::null_mut();
+    let rc = unsafe {
+        sandbox_init_with_parameters(profile.as_ptr(), 0, raw.as_ptr(), &mut errbuf as *mut _)
+    };
+
+    if rc != 0 {
+        let msg = if errbuf.is_null() {
+            "sandbox_init_with_parameters returned a non-zero status with no error buffer".into()
+        } else {
+            let s = unsafe { CStr::from_ptr(errbuf) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { sandbox_free_error(errbuf) };
+            s
+        };
+        return Err(anyhow!("apply Seatbelt: {}", msg));
+    }
+    Ok(())
+}

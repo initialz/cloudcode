@@ -144,6 +144,16 @@ Every session is recorded to an asciinema cast file on the agent at `~/.local/st
 
 [`hub.example.toml`](hub.example.toml) · [`agent.example.toml`](agent.example.toml)
 
+## Workspace sandbox (experimental)
+
+Setting `[sandbox] enabled = true` in `agent.toml` wraps every `claude` (and its tmux session) in a per-workspace OS sandbox. On macOS this is Seatbelt — the same kernel-enforced isolation behind Apple's app containment — with a profile that allows broad reads but only writes inside the active workspace, `~/.claude`, and a small set of cache / scratch dirs. Persistence vectors a careless or compromised AI run might reach for (`~/.bashrc`, `.git/hooks/`, `~/Library/LaunchAgents`, the secrets dirs `~/.ssh`, `~/.gnupg`, `~/.aws`, Keychain) are denied even where the surrounding path is writable. Network stays open so claude can reach the Anthropic API / package registries / git remotes. Linux support is on the roadmap.
+
+Off by default — opt in once you've confirmed the profile fits your projects' tooling.
+
+## Acknowledgements
+
+The macOS workspace sandbox design was inspired by [boxsh](https://github.com/xicilion/boxsh)'s approach to running AI coding agents inside OS-enforced isolation. The cloudcode implementation in `crates/agent/src/sandbox/` is independently authored — no boxsh code is used here. boxsh is GPL v3.
+
 ## License
 
 MIT. The software is provided "as is", without warranty of any kind. The authors are not liable for any use that violates third-party terms of service.
