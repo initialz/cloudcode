@@ -97,11 +97,29 @@ async fn require_admin(State(state): State<AdminState>, req: Request, next: Next
 pub fn router(state: AdminState) -> Router {
     let gate = middleware::from_fn_with_state(state.clone(), require_admin);
     Router::new()
-        .route("/admin/login", get(handlers::login_page).post(handlers::login_submit))
-        .route("/admin/logout", post(handlers::logout))
         .route(
-            "/admin/",
-            get(handlers::dashboard).route_layer(gate),
+            "/admin/login",
+            get(handlers::login_page).post(handlers::login_submit),
+        )
+        .route("/admin/logout", post(handlers::logout))
+        .route("/admin/", get(handlers::dashboard).route_layer(gate.clone()))
+        .route(
+            "/admin/accounts",
+            get(handlers::accounts_list)
+                .post(handlers::accounts_create)
+                .route_layer(gate.clone()),
+        )
+        .route(
+            "/admin/accounts/:name/rotate",
+            post(handlers::accounts_rotate).route_layer(gate.clone()),
+        )
+        .route(
+            "/admin/accounts/:name/toggle",
+            post(handlers::accounts_toggle).route_layer(gate.clone()),
+        )
+        .route(
+            "/admin/accounts/:name/delete",
+            post(handlers::accounts_delete).route_layer(gate),
         )
         .with_state(state)
 }

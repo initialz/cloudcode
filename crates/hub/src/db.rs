@@ -146,6 +146,60 @@ impl Db {
         Ok(())
     }
 
+    pub async fn account_exists(&self, name: &str) -> Result<bool> {
+        let row = sqlx::query("SELECT 1 AS one FROM accounts WHERE name = ?1")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some())
+    }
+
+    pub async fn update_account_token(
+        &self,
+        name: &str,
+        token_hash: &str,
+        token_prefix: &str,
+    ) -> Result<()> {
+        let rows = sqlx::query(
+            "UPDATE accounts SET token_hash = ?1, token_prefix = ?2 WHERE name = ?3",
+        )
+        .bind(token_hash)
+        .bind(token_prefix)
+        .bind(name)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if rows == 0 {
+            anyhow::bail!("account '{}' not found", name);
+        }
+        Ok(())
+    }
+
+    pub async fn set_account_disabled(&self, name: &str, disabled: bool) -> Result<()> {
+        let rows = sqlx::query("UPDATE accounts SET disabled = ?1 WHERE name = ?2")
+            .bind(if disabled { 1_i64 } else { 0_i64 })
+            .bind(name)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if rows == 0 {
+            anyhow::bail!("account '{}' not found", name);
+        }
+        Ok(())
+    }
+
+    pub async fn delete_account(&self, name: &str) -> Result<()> {
+        let rows = sqlx::query("DELETE FROM accounts WHERE name = ?1")
+            .bind(name)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if rows == 0 {
+            anyhow::bail!("account '{}' not found", name);
+        }
+        Ok(())
+    }
+
     // ---- audit ---------------------------------------------------------
 
     /// Best-effort insert; logs at debug on failure so a flaky disk
