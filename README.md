@@ -1,178 +1,135 @@
 # cloudcode
 
-> Remote-control your own `claude` from anywhere. A TUI chat client talks to a hub, which forwards every prompt to an agent on a machine that has already done `claude /login`.
+> Drive your own `claude` from any terminal, anywhere.
 
-## Intended use & disclaimer
+You've run `claude /login` once on some machine — your workstation, a home server, a cloud VM. cloudcode lets you talk to that claude from a laptop, a phone, or any SSH terminal, without copying credentials around.
 
-**This project is only for remotely controlling _your own_ coding CLI.** Typical setup: you `claude /login`'d on a workstation / server / home box, and you want to drive `claude` from a laptop, a phone, or an SSH terminal that doesn't have your subscription credentials.
+**Solo use only.** Subscription plans (Claude Max / Pro) are per-individual under Anthropic's Terms of Service. Sharing one across multiple users violates those terms; the account may get banned. Recommended topology: **one user → one subscription → one agent**.
 
-**Do not share a subscription account across multiple people.** Subscription plans (Claude Max / Pro) are issued per individual under the provider's Terms of Service. Routing many humans' prompts onto one subscription violates those terms. The recommended topology is **one user → one subscription → one agent**.
+## Quick start
 
-If you use this software to violate any provider's Terms of Service or applicable laws, **you are solely responsible for the consequences**. The authors and contributors provide this software as-is, with no warranty, and accept no liability for your usage.
+Three pieces. Install the one you need.
 
-## Components
+### As an admin (run the hub)
 
-- **`cloudcode-hub`** — public-facing gateway: account-token auth, workspace mutex, JSONL audit log. Relays PTY traffic between clients and agents.
-- **`cloudcode-agent`** — long-running daemon on a host where you've `claude /login`'d. Requires `tmux`. Dials out to the hub over WSS. When the hub asks for a session, the agent spawns `tmux new -A -s cloudcode-<workspace> -c <cwd> claude` and pipes the PTY master to/from the hub. tmux session **persists across reconnects** — close `cloudcode` and reopen later, you're back where you left off.
-- **`cloudcode`** — relay client on your laptop. First shows a small workspace picker for your agent; once you pick one, your terminal becomes the **native claude TUI** (status bar, todo board, diffs, permission prompts, claude's own `/clear`/`/login`/etc — everything). When claude exits you're dropped back at the picker.
-
-## Features
-
-- **Native `claude` TUI, not a web rewrap.** Your terminal becomes the real claude binary's interface — status bar, todo board, diffs, permission prompts, slash commands, all of it. Byte-perfect PTY passthrough, so DA1/DA2, mouse, and arbitrary escape sequences reach the remote process unchanged.
-- **Workspace state survives the client.** Close cloudcode (or shut your laptop's lid) and the agent's tmux + claude keep running on the host. Reconnect later and you're back at the same prompt, same todo board, same in-progress agentic loop. Long-running tasks finish whether you're watching or not.
-- **Hop between terminals freely.** Opening a workspace already attached from another machine evicts the old client back to its menu and the new one takes over the live tmux session — claude state preserved. No "workspace busy" deadlock.
-- **macOS Seatbelt workspace sandbox (opt-in).** Each spawned `claude` is wrapped in a kernel-enforced sandbox: writes scoped to the active workspace, cross-user and cross-workspace reads denied, secrets (`~/.ssh`, `~/.aws`, `~/.gnupg`, TCC database) hidden, persistence vectors (shell init files, `~/Library/LaunchAgents`, `.git/hooks/`) blocked, camera + microphone explicitly denied. Network stays open. Linux support is on the roadmap.
-- **Pass any `claude` argument straight through.** `cloudcode -- --continue`, `cloudcode -- --model opus`, `cloudcode -- "fix this bug"` — everything after `--` is forwarded verbatim to the spawned claude.
-- **NAT-friendly architecture.** Agents dial out to the hub over WSS; no inbound ports required on the agent host. Park an agent on your home box behind a router and drive it from a hotel laptop.
-- **One hub, many agents, many accounts.** A single hub routes multiple agents (one per host) and multiple users (one account-token per developer). Workspaces are namespaced per-account; the sandbox enforces it.
-- **Audit-friendly.** Every session's PTY output is captured as an asciinema cast on the agent. Replay with `asciinema play <file>`. Keystrokes are deliberately not recorded to avoid pasted-token leakage.
-
-## Architecture
-
-![cloudcode architecture](docs/architecture.svg)
-
-Source: [`docs/architecture.drawio`](docs/architecture.drawio) (open with [diagrams.net](https://app.diagrams.net)).
-
-## Install
-
-### Option A — Prebuilt binary
-
-Hub (public host):
+The hub lives on a host with a public address.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/initialz/cloudcode/main/install.sh | sh -s -- hub
+cloudcode-hub --init                              # writes hub.toml + prints agent registration token
+cloudcode-hub gen-token alice                     # one token per developer
+cloudcode-hub daemon start --config ./hub.toml
 ```
 
-Agent (any host where you've run `claude /login`; behind NAT is fine):
+Hand out:
+- the **agent registration token** to people running agents
+- one **account token** per developer (printed by `gen-token`)
+
+### As an agent operator (run claude on this host)
+
+The agent runs on the box where `claude /login` worked. Needs `tmux` and a working `claude` binary, both as the same OS user.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/initialz/cloudcode/main/install.sh | sh -s -- agent
+cloudcode-agent --init                            # writes agent.toml template
+$EDITOR ./agent.toml                              # set [hub].url and [auth].registration_token
+cloudcode-agent daemon start --config ./agent.toml
 ```
 
-Client (laptop):
+### As a client (the laptop)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/initialz/cloudcode/main/install.sh | sh -s -- client
+cloudcode --init                                  # writes ~/.config/cloudcode/config.toml
+$EDITOR ~/.config/cloudcode/config.toml           # set hub_url + token (your account token)
+cloudcode
 ```
 
-Supported: Linux x86_64 / aarch64, macOS aarch64.
+That last command opens the picker. Choose an agent → choose a workspace → drop into claude.
 
-### Option B — Build from source
+Supported binaries: Linux x86_64 / aarch64, macOS aarch64. Build from source: `cargo build --release --workspace`.
+
+## Using cloudcode
 
 ```bash
-git clone https://github.com/initialz/cloudcode.git
-cd cloudcode
-cargo build --release --workspace
-
-sudo install -m 0755 target/release/cloudcode-hub   /usr/local/bin/
-sudo install -m 0755 target/release/cloudcode-agent /usr/local/bin/
-sudo install -m 0755 target/release/cloudcode       /usr/local/bin/
+cloudcode                                         # last agent + workspace picker
+cloudcode --agent peter-mbp                       # pin a specific agent
+cloudcode -- --continue                           # forward any arg to remote claude
+cloudcode -- --model opus
+cloudcode -- "fix the failing test"
 ```
 
-## Usage
+Everything after `--` is passed straight through to the spawned `claude`.
 
-### Hub (administrator)
-
-```bash
-cloudcode-hub --init                     # writes ./hub.toml AND prints the
-                                         # one-time agent registration token
-                                         # — save it, you'll give it to every
-                                         # agent operator
-cloudcode-hub gen-token alice            # one token per user
-$EDITOR ./hub.toml                       # paste the [[accounts]] block
-cloudcode-hub --config ./hub.toml        # foreground; logs to stdout
-# or
-cloudcode-hub daemon start --config ./hub.toml   # background
-```
-
-### Agent (one-time setup)
-
-**Prerequisites on the agent host:**
-- `tmux` installed (`brew install tmux` / `apt install tmux`)
-- `claude` installed and `claude /login` done as the same OS user that will run the agent
-
-The agent itself never reads OAuth credentials; it just runs `tmux ... claude` under the same user, and claude finds its own credentials (keychain on macOS, `~/.claude/.credentials.json` on Linux).
-
-```bash
-cloudcode-agent --init                   # writes ./agent.toml template
-$EDITOR ./agent.toml                     # paste [auth].registration_token
-                                         # (the token your hub admin printed)
-                                         # and set [hub].url
-
-cloudcode-agent --config ./agent.toml    # foreground; logs to stdout
-# or
-cloudcode-agent daemon start --config ./agent.toml   # background
-```
-
-There's a **single global agent registration token**: every agent in the fleet uses the same one, and agent names are auto-generated (`<hostname>-<user>`) — there's no pre-registration list on the hub.
-
-### Client (developer)
-
-```toml
-# ~/.config/cloudcode/config.toml
-hub_url = "https://your-hub-host"
-token   = "cc_xxx_from_admin"
-```
-
-Run `cloudcode`:
-
-```bash
-cloudcode                            # menu picks last agent + last workspace
-cloudcode --agent peter-mbp          # pin a specific agent
-```
-
-You get a small **TUI picker** — first pick an agent, then a workspace, then drop into claude.
+### The picker
 
 ```
-┌─ Select agent ────────────────┐    ┌─ Select workspace on alpha ────┐
-│ ▶ alpha                       │    │   default                       │
-│   beta                        │    │ ▶ proja                         │
-│                               │    │   projb                         │
-└───────────────────────────────┘    └─────────────────────────────────┘
- ↑↓ move · Enter pick · Esc/q quit   ↑↓ Enter · c create · d delete · Esc back · q quit
+   ____ _                 _  ____          _
+  / ___| | ___  _   _  __| |/ ___|___   __| | ___
+ | |   | |/ _ \| | | |/ _` | |   / _ \ / _` |/ _ \
+ | |___| | (_) | |_| | (_| | |__| (_) | (_| |  __/
+  \____|_|\___/ \__,_|\__,_|\____\___/ \__,_|\___|
+
+   Select workspace on alpha:
+     1  default
+     2  proja
+   ▶ 3  projb
+     4  scratch
 ```
 
-- **Arrow keys** (or `j` / `k`) to move; **Enter** to pick.
-- `c` opens a small input box for a new workspace name.
-- `d` asks `y/n` to delete the highlighted workspace.
-- `Esc` on the workspace picker goes back to the agent picker; `Esc` (or `q`) on the agent picker quits cloudcode.
+- ↑↓ (or `j` / `k`) — move
+- Enter — open
+- `c` — create new workspace
+- `d` — delete the highlighted one
+- Esc — back / quit
+- `q` — quit
 
-Pick a workspace and your terminal becomes the **native claude TUI** (status bar, todo board, diffs, permission prompts, claude's own `/clear` / `/login` / …). When claude exits (`/exit`, the process dies, etc) you're dropped right back at the workspace picker. From there `q` quits cloudcode.
+Inside, your terminal **is** the claude TUI: status bar, slash commands, todo board, diffs, permission prompts.
 
-Workspaces are named directories under `<workspace_root>/<account>/` on the agent host (default `~/cloudcode-agent/workspaces/<account>/<workspace>/`). Each workspace maps 1:1 to a tmux session named `cloudcode-<account>-<workspace>`. A workspace can be held by **at most one cloudcode session at a time per account** — the hub enforces this. Closing cloudcode does **not** kill the tmux session; long-running claude tasks (background fixes, agentic loops) keep going, and reopening the same workspace re-attaches to the running claude.
+## Things to know
 
-State persisted in `$XDG_STATE_HOME/cloudcode/`:
-- `last_agent` — the most recent agent name
-- `last_workspace/<agent>.txt` — most recent workspace per agent (used as the picker default)
+- **To leave without losing state: just close your terminal** (cmd-W / shut the laptop / disconnect SSH). Claude and tmux keep running on the agent. Reconnect whenever — you're back at the same prompt, todo, in-progress work.
+- **`/exit` inside claude ends the session.** Next time you open the workspace it'll be a fresh claude with no memory. Use this only when you really want to reset.
+- **Hop terminals freely.** Open a workspace from a different machine — the old client is bumped back to its menu and the new one takes over the same live tmux session. claude state is preserved.
+- **Long tasks survive disconnects.** "Go fix this bug, run the tests" → close cloudcode → come back later, it's done (or still running).
+- **OAuth stays on the agent host.** The laptop only sees PTY bytes. Credentials never leave where you ran `claude /login`.
+- **Don't `tmux kill-server` on the agent.** That nukes all running sessions for every workspace. Daemon restarts (`cloudcode-agent daemon restart`) are safe.
 
-#### Recording
+## Workspace sandbox (macOS, opt-in)
 
-Every session is recorded to an asciinema cast file on the agent at `~/.local/state/cloudcode/agent/recordings/<account>/<workspace>/<session_id>.cast`. Replay with `asciinema play <file>` for audit / debugging. Output only; keystrokes are not recorded (avoids leaking pasted tokens).
+`[sandbox] enabled = true` in `agent.toml` wraps each spawned claude in a Seatbelt sandbox:
 
-> Daemon-mode logs: `~/.local/state/cloudcode/{hub,agent}.log`. Lifecycle: `cloudcode-{hub,agent} daemon {status,stop,restart}`.
+- writes only inside the active workspace plus a few cache dirs
+- secrets (`~/.ssh`, `~/.aws`, `~/.gnupg`, Keychain), shell init files, `.git/hooks/`, `~/Library/LaunchAgents`, camera, microphone all denied
+- cross-user and cross-workspace reads denied
+- network stays open
+
+Off by default. Opt in once you've confirmed your project's tooling runs under it. Linux support is coming.
+
+## Recording
+
+Every session is recorded as an asciinema cast on the agent:
+
+```
+~/.local/state/cloudcode/agent/recordings/<account>/<workspace>/<session>.cast
+```
+
+Replay with `asciinema play <file>`. Only output is captured — keystrokes aren't, so pasted tokens stay out of the archive.
 
 ## Configuration reference
 
 [`hub.example.toml`](hub.example.toml) · [`agent.example.toml`](agent.example.toml)
 
-## Workspace sandbox (experimental)
+Daemon logs: `~/.local/state/cloudcode/{hub,agent}.log`. Lifecycle: `cloudcode-{hub,agent} daemon {status,stop,restart}`.
 
-Setting `[sandbox] enabled = true` in `agent.toml` wraps every `claude` (and its tmux session) in a per-workspace OS sandbox. On macOS this is Seatbelt — the same kernel-enforced isolation behind Apple's app containment — with a profile that:
+## Architecture
 
-- allows broad reads across the system so tooling (node, git, brew binaries, mise / asdf, …) keeps working;
-- restricts writes to the active workspace, `~/.claude`, and a small set of cache / scratch dirs;
-- isolates the workspace from neighbouring workspaces and other accounts — a session can only read its own workspace under `<workspace_root>`, everything else under that root is denied;
-- denies persistence vectors a careless or compromised AI run might reach for (`~/.bashrc`, `.git/hooks/`, `~/Library/LaunchAgents`) and secrets (`~/.ssh`, `~/.gnupg`, `~/.aws`, Keychain) even where the surrounding path would otherwise be writable;
-- leaves the network open so claude can reach the Anthropic API / package registries / git remotes.
-
-Linux support is on the roadmap.
-
-Off by default — opt in once you've confirmed the profile fits your projects' tooling.
+[`docs/architecture.svg`](docs/architecture.svg) for the network diagram. tl;dr: agent dials out to the hub over WSS (NAT-friendly), hub relays PTY traffic between client and agent.
 
 ## Acknowledgements
 
-The macOS workspace sandbox design was inspired by [boxsh](https://github.com/xicilion/boxsh)'s approach to running AI coding agents inside OS-enforced isolation. The cloudcode implementation in `crates/agent/src/sandbox/` is independently authored — no boxsh code is used here. boxsh is GPL v3.
+The macOS Seatbelt sandbox design was inspired by [boxsh](https://github.com/xicilion/boxsh)'s approach to running AI coding agents inside OS-enforced isolation. Implementation is original; no boxsh code is included (boxsh is GPL v3).
 
 ## License
 
-MIT. The software is provided "as is", without warranty of any kind. The authors are not liable for any use that violates third-party terms of service.
+MIT. Provided as is, without warranty. The authors are not liable for any use that violates third-party Terms of Service.
