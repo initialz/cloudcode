@@ -439,6 +439,21 @@ impl Db {
         }))
     }
 
+    /// On hub startup any session row still flagged "live" (ended_at
+    /// IS NULL) is an orphan from the previous hub process — nothing
+    /// is actually attached to it any more. Close them all out so the
+    /// admin dashboard tells the truth.
+    pub async fn close_orphan_sessions(&self, reason: &str) -> Result<u64> {
+        let r = sqlx::query(
+            "UPDATE sessions SET ended_at = ?1, ended_reason = ?2 WHERE ended_at IS NULL",
+        )
+        .bind(chrono::Utc::now().timestamp())
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
     /// Currently-active sessions (no end recorded). Quick stats card.
     pub async fn count_active_sessions(&self) -> Result<i64> {
         let row = sqlx::query("SELECT COUNT(*) AS n FROM sessions WHERE ended_at IS NULL")

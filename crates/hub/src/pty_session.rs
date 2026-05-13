@@ -138,6 +138,25 @@ impl ConnCtx {
                 ),
                 |_, sid| *sid == active.session_id,
             );
+            // Mark the row in `sessions` as ended. Without this the
+            // admin UI would keep showing the session as "live" even
+            // after the client has gone, because the agent's reply
+            // PtyClosed event never gets routed back here (we already
+            // unregistered the channel above).
+            let db = self.state.db.clone();
+            let sid = active.session_id.to_string();
+            tokio::spawn(async move {
+                db.end_session(&sid, Some("client disconnect")).await;
+            });
+            self.state.audit.write(AuditEvent {
+                account: Some(self.account_name.clone()),
+                agent: Some(conn.name.clone()),
+                session_id: Some(active.session_id.to_string()),
+                workspace: Some(active.workspace),
+                status: Some(200),
+                reason: Some("client disconnect".into()),
+                ..AuditEvent::new("session_closed")
+            });
         }
     }
 }

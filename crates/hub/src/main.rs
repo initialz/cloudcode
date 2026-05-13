@@ -95,6 +95,13 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("opening admin db at {}", config.admin.db_path.display()))?;
     migrate_accounts_from_toml(&db, &config).await?;
+    match db.close_orphan_sessions("hub restart").await {
+        Ok(n) if n > 0 => {
+            tracing::info!(n, "closed orphan sessions left over from previous hub run");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "orphan session cleanup failed"),
+    }
     let audit = AuditLog::open(&config.server.audit_log, db.clone())?;
     let listen = config.server.listen.clone();
 
