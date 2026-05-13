@@ -43,7 +43,20 @@ curl -fsSL https://raw.githubusercontent.com/initialz/cloudcode/main/install.sh 
 cloudcode --init && $EDITOR ~/.config/cloudcode/config.toml && cloudcode
 ```
 
-Open the admin UI at `http://<hub>:7101/admin/`, paste the admin token, grant your account access to the agent, and you're done. Build from source: `cargo build --release --workspace`.
+Open the admin UI at `http://<hub>:7101/admin/`, paste the admin token, grant your account access to the agent, and you're done.
+
+## From source
+
+Needs Rust ≥ 1.74, Node ≥ 20 with `pnpm`, and `tmux` on the agent host.
+
+```bash
+git clone https://github.com/initialz/cloudcode.git
+cd cloudcode
+(cd admin-ui && pnpm install && pnpm build)   # bundles the SPA into the hub binary
+cargo build --release --workspace
+```
+
+Then use the binaries under `target/release/` (`cloudcode-hub`, `cloudcode-agent`, `cloudcode`) exactly as you would the curl-installed ones — `--init`, `daemon start`, the same `hub.toml` / `agent.toml`.
 
 ## Architecture
 
