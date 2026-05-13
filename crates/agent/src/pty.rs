@@ -658,21 +658,34 @@ fn expand_path(p: &Path) -> PathBuf {
 /// it died and left a stale socket behind.
 fn tmux_session_alive(account: &str, workspace: &str) -> bool {
     let label = format!("cc-{}-{}", account, workspace);
-    let Some(path) = tmux_socket_path(&label) else {
-        return false;
-    };
-    std::os::unix::net::UnixStream::connect(&path).is_ok()
+    for path in tmux_socket_candidates(&label) {
+        if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
-fn tmux_socket_path(label: &str) -> Option<PathBuf> {
-    // tmux puts sockets at $TMUX_TMPDIR/tmux-<uid>/<label>, falling back
-    // to $TMPDIR or /tmp. macOS gives every process a private TMPDIR
-    // under /var/folders/, so honour that first.
-    let base = std::env::var_os("TMUX_TMPDIR")
-        .or_else(|| std::env::var_os("TMPDIR"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
+fn tmux_socket_candidates(label: &str) -> Vec<PathBuf> {
+    // tmux uses $TMUX_TMPDIR if set, else /tmp — it deliberately does
+    // not look at $TMPDIR (which on macOS is the per-process private
+    // /var/folders/ path, no tmux server lives there). We probe the
+    // realpath /private/tmp too because /tmp is a symlink on macOS.
     // SAFETY: getuid is always safe.
     let uid = unsafe { libc::getuid() };
-    Some(base.join(format!("tmux-{}", uid)).join(label))
+    let mut out = Vec::new();
+    if let Some(td) = std::env::var_os("TMUX_TMPDIR") {
+        out.push(PathBuf::from(td).join(format!("tmux-{}", uid)).join(label));
+    }
+    out.push(
+        PathBuf::from("/tmp")
+            .join(format!("tmux-{}", uid))
+            .join(label),
+    );
+    out.push(
+        PathBuf::from("/private/tmp")
+            .join(format!("tmux-{}", uid))
+            .join(label),
+    );
+    out
 }
