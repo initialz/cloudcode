@@ -528,6 +528,16 @@ done
                     let _ = std::process::Command::new(&self.tmux.executable)
                         .args(["-L", &format!("cc-{}-{}", account, name), "kill-server"])
                         .output();
+                    // Wipe claude's per-project conversation history so
+                    // a recreated workspace with the same name doesn't
+                    // silently `--continue` into the old chat. The
+                    // workspace cwd encodes deterministically into a
+                    // dir name under ~/.claude/projects/.
+                    if let Some(home) = dirs::home_dir() {
+                        let claude_proj =
+                            crate::jsonl::project_dir(&home, &dir);
+                        let _ = std::fs::remove_dir_all(&claude_proj);
+                    }
                     std::fs::remove_dir_all(&dir)
                         .err()
                         .map(|e| format!("remove: {}", e))
