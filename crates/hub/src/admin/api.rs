@@ -537,6 +537,34 @@ pub async fn agent_allowed_accounts_set(
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// Retire an agent name: drop every ACL row mentioning it. Refused
+/// for currently-online agents so the admin can't accidentally cut
+/// off everyone using a live agent. Sessions/audit history is left
+/// untouched (it still references the old name as part of the
+/// record of what happened).
+pub async fn agent_delete(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+) -> Response {
+    if !valid_agent_name(&name) {
+        return err(StatusCode::BAD_REQUEST, "invalid_input", "invalid agent name");
+    }
+    if state.app.registry.list_active().iter().any(|n| n == &name) {
+        return err(
+            StatusCode::CONFLICT,
+            "agent_online",
+            format!(
+                "agent '{}' is online — disconnect it before deleting (rename / retire on the agent host)",
+                name
+            ),
+        );
+    }
+    if let Err(e) = state.app.db.delete_agent_acl(&name).await {
+        return internal(e);
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
 // ---------------------------------------------------------------------
 // Workspaces inventory
 // ---------------------------------------------------------------------

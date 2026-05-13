@@ -232,14 +232,25 @@ impl Db {
     }
 
     pub async fn delete_account(&self, name: &str) -> Result<()> {
+        // No SQLite foreign keys here, so we walk the dependent
+        // tables ourselves. Drop the ACL rows first so a partial
+        // failure still leaves the world in a consistent state
+        // (orphan ACL rows are worse than orphan audit rows —
+        // sessions history is meant to outlive the account).
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM account_allowed_agents WHERE account = ?1")
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
         let rows = sqlx::query("DELETE FROM accounts WHERE name = ?1")
             .bind(name)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if rows == 0 {
             anyhow::bail!("account '{}' not found", name);
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -291,20 +302,30 @@ impl Db {
         Ok(())
     }
 
-    /// Union of every agent name we've ever seen — historical sessions
-    /// plus current allowlist entries. Used by the admin UI to render
-    /// the "known agents" multi-select even when an agent is offline.
+    /// Distinct agent names that still appear in the ACL table. The
+    /// admin layer unions this with `registry.list_active()` to build
+    /// the "known agents" picker. Sessions history is intentionally
+    /// NOT included — once an admin has cleared an old agent from
+    /// the ACL it should stop showing up, even though sessions rows
+    /// (audit history) still reference its old name.
     pub async fn distinct_known_agents(&self) -> Result<Vec<String>> {
         let rows = sqlx::query(
-            "SELECT DISTINCT agent FROM (
-                SELECT agent FROM sessions
-                UNION
-                SELECT agent FROM account_allowed_agents
-            ) ORDER BY agent",
+            "SELECT DISTINCT agent FROM account_allowed_agents ORDER BY agent",
         )
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|r| r.get("agent")).collect())
+    }
+
+    /// Wipe every ACL row that names this agent. Used by the admin
+    /// UI's "delete agent" action when an agent name is retired
+    /// (renamed, decommissioned, etc).
+    pub async fn delete_agent_acl(&self, agent: &str) -> Result<u64> {
+        let r = sqlx::query("DELETE FROM account_allowed_agents WHERE agent = ?1")
+            .bind(agent)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
     }
 
     pub async fn list_allowed_accounts_for_agent(&self, agent: &str) -> Result<Vec<String>> {

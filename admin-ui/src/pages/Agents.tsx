@@ -15,6 +15,8 @@ export function Agents() {
   const [agents, setAgents] = useState<AgentRowDto[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [accountsModal, setAccountsModal] = useState<AccountsModalState | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   async function reload() {
     try {
@@ -67,6 +69,19 @@ export function Agents() {
     });
   }
 
+  async function onDeleteAgent(name: string) {
+    setDeleting(true);
+    try {
+      await apiClient.agents.delete(name);
+      setConfirmDelete(null);
+      await reload();
+    } catch (e: any) {
+      setErr(e?.message ?? 'delete failed');
+    } finally {
+      setDeleting(false);
+    }
+  }
+
   async function saveAllowedAccounts() {
     if (!accountsModal) return;
     setAccountsModal({ ...accountsModal, saving: true, err: null });
@@ -112,12 +127,13 @@ export function Agents() {
                 <th className="px-3 py-2 text-left">Name</th>
                 <th className="px-3 py-2 text-left">Status</th>
                 <th className="px-3 py-2 text-left">Accounts</th>
+                <th className="px-3 py-2 text-right">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-zinc-200 dark:divide-zinc-800 bg-white dark:bg-zinc-900">
               {agents.length === 0 ? (
                 <tr>
-                  <td colSpan={3} className="px-3 py-6 text-center text-zinc-500">
+                  <td colSpan={4} className="px-3 py-6 text-center text-zinc-500">
                     No agents have ever connected to this hub yet.
                   </td>
                 </tr>
@@ -151,6 +167,23 @@ export function Agents() {
                           </>
                         )}
                       </button>
+                    </td>
+                    <td className="px-3 py-2 text-right whitespace-nowrap">
+                      {a.online ? (
+                        <span
+                          className="text-xs text-zinc-400"
+                          title="Online agents can't be deleted — disconnect on the agent host first"
+                        >
+                          —
+                        </span>
+                      ) : (
+                        <button
+                          onClick={() => setConfirmDelete(a.name)}
+                          className="px-2 py-1 text-xs rounded border border-red-300 dark:border-red-700/50 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/20"
+                        >
+                          Delete
+                        </button>
+                      )}
                     </td>
                   </tr>
                 ))
@@ -222,6 +255,37 @@ export function Agents() {
             })}
           </div>
         ) : null}
+      </Modal>
+
+      <Modal
+        open={confirmDelete !== null}
+        onClose={() => !deleting && setConfirmDelete(null)}
+        title={`Delete agent ${confirmDelete ?? ''}?`}
+        footer={
+          <>
+            <button
+              disabled={deleting}
+              onClick={() => setConfirmDelete(null)}
+              className="px-3 py-1.5 text-sm rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              disabled={deleting}
+              onClick={() => confirmDelete && onDeleteAgent(confirmDelete)}
+              className="px-3 py-1.5 text-sm rounded bg-red-600 text-white hover:bg-red-700 disabled:opacity-50"
+            >
+              {deleting ? 'Deleting…' : 'Delete'}
+            </button>
+          </>
+        }
+      >
+        <p className="text-sm text-zinc-600 dark:text-zinc-400">
+          Drops every ACL row that mentions this agent. If the same
+          name comes back online later it will start with an empty
+          allowlist. Session / audit history that already references
+          this name is left untouched.
+        </p>
       </Modal>
     </div>
   );

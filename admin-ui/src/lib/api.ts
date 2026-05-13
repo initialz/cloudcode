@@ -126,6 +126,8 @@ export const apiClient = {
         method: 'PUT',
         body: JSON.stringify({ accounts }),
       }),
+    delete: (name: string) =>
+      api<void>(`/agents/${encodeURIComponent(name)}`, { method: 'DELETE' }),
   },
   workspaces: {
     list: () => api<WorkspaceRowDto[]>('/workspaces'),
