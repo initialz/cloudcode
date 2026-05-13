@@ -287,16 +287,19 @@ async fn run_chat(
     };
 
     let mut bytes = input::spawn_byte_reader();
-    let preferred_agent: Option<String> = agent_flag.or_else(read_last_agent);
+    // First-launch entry: if --agent or a remembered last_agent
+    // exists, jump straight to that agent's workspace picker. The
+    // menu falls back to the agent picker on any miss (agent offline
+    // / no ACL / hub rejects).
+    let mut next_start: menu::MenuStart = match agent_flag.or_else(read_last_agent) {
+        Some(agent) => menu::MenuStart::WorkspacePicker { agent },
+        None => menu::MenuStart::AgentPicker,
+    };
 
     loop {
-        let outcome = menu::run(
-            &mut wire,
-            &mut bytes,
-            &account_name,
-            preferred_agent.as_deref(),
-        )
-        .await?;
+        let outcome = menu::run(&mut wire, &mut bytes, &account_name, next_start).await?;
+        // Default for the next iteration; overridden after a successful PTY.
+        next_start = menu::MenuStart::AgentPicker;
         match outcome {
             menu::MenuOutcome::OpenWorkspace { agent, workspace } => {
                 let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -332,7 +335,9 @@ async fn run_chat(
                 }
                 write_last_workspace(&agent, &workspace);
                 relay::run(&mut wire, &mut bytes).await.ok();
-                // back to menu
+                // Back to menu — land on the same agent's workspace
+                // picker, not the top-level agent picker.
+                next_start = menu::MenuStart::WorkspacePicker { agent };
             }
             menu::MenuOutcome::Quit => {
                 let _ = wire.out_tx.send(OutFrame::Text(ClientToHub::Close)).await;

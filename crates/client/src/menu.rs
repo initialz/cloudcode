@@ -29,11 +29,21 @@ pub enum MenuOutcome {
     Quit,
 }
 
+/// How the menu should enter. After claude exits the caller passes
+/// `WorkspacePicker { agent }` so the user lands back where they were
+/// (the workspace picker for that agent) instead of starting from
+/// the agent picker. Falls back to AgentPicker on any mismatch
+/// (agent offline, no longer in the ACL, hub rejects).
+pub enum MenuStart {
+    AgentPicker,
+    WorkspacePicker { agent: String },
+}
+
 pub async fn run(
     wire: &mut Wire,
     bytes: &mut ByteRx,
     account: &str,
-    last_agent: Option<&str>,
+    start: MenuStart,
 ) -> Result<MenuOutcome> {
     enable_raw_mode()?;
     let mut out = stdout();
@@ -41,7 +51,7 @@ pub async fn run(
     let backend = CrosstermBackend::new(out);
     let mut term = Terminal::new(backend)?;
     let mut keys = MenuKeyQueue::default();
-    let result = run_inner(&mut term, wire, bytes, &mut keys, account, last_agent).await;
+    let result = run_inner(&mut term, wire, bytes, &mut keys, account, start).await;
     disable_raw_mode().ok();
     execute!(term.backend_mut(), LeaveAlternateScreen).ok();
     term.show_cursor().ok();
@@ -71,87 +81,33 @@ async fn run_inner<B: ratatui::backend::Backend>(
     bytes: &mut ByteRx,
     keys: &mut MenuKeyQueue,
     account: &str,
-    last_agent: Option<&str>,
+    start: MenuStart,
 ) -> Result<MenuOutcome> {
-    'outer: loop {
-        // ---- stage 1: agent picker ----
-        let agents = list_agents(wire).await?;
-        if agents.is_empty() {
-            show_message(term, "no agents online", bytes, keys).await?;
-            return Ok(MenuOutcome::Quit);
-        }
-        let mut a_state = ListState::default();
-        let initial = last_agent
-            .and_then(|n| agents.iter().position(|a| a == n))
-            .unwrap_or(0);
-        a_state.select(Some(initial));
+    // Pending fast-path target. Consumed on the next outer iteration
+    // so that an Esc back from stage 2 doesn't keep re-entering it.
+    let mut pending_fast_agent: Option<String> = match start {
+        MenuStart::WorkspacePicker { agent } => Some(agent),
+        MenuStart::AgentPicker => None,
+    };
 
-        let agent_rows: Vec<PickerRow> = agents
-            .iter()
-            .map(|n| PickerRow {
-                name: n.clone(),
-                badge: None,
-            })
-            .collect();
-        let agent = loop {
-            term.draw(|f| {
-                draw_layout(
-                    f,
-                    account,
-                    "Select agent",
-                    &agent_rows,
-                    &mut a_state,
-                    "↑↓ move · Enter pick · Esc/q quit",
-                    false,
-                )
-            })?;
-            let Some(k) = keys.next(bytes).await else {
-                return Ok(MenuOutcome::Quit);
-            };
-            match handle_list_key(k, &mut a_state, agents.len()) {
-                ListAction::Pick => {
-                    let picked = agents[a_state.selected().unwrap_or(0)].clone();
-                    let mut redraw = |pressed: bool| -> Result<()> {
-                        term.draw(|f| {
-                            draw_layout(
-                                f,
-                                account,
-                                "Select agent",
-                                &agent_rows,
-                                &mut a_state,
-                                "↑↓ move · Enter pick · Esc/q quit",
-                                pressed,
-                            )
-                        })?;
-                        Ok(())
-                    };
-                    redraw(true)?;
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    redraw(false)?;
-                    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-                    break picked;
-                }
-                ListAction::Quit => return Ok(MenuOutcome::Quit),
-                ListAction::Pass => {}
+    'outer: loop {
+        // ---- stage 1 (with optional fast-path skip) ----
+        // Try fast-path first; on miss, fall through to the normal
+        // agent picker.
+        let mut bound: Option<String> = if let Some(target) = pending_fast_agent.take() {
+            fast_bind(wire, &target).await
+        } else {
+            None
+        };
+        let agent = if let Some(a) = bound.take() {
+            crate::write_last_agent(&a);
+            a
+        } else {
+            match pick_agent_stage(term, wire, bytes, keys, account).await? {
+                Some(a) => a,
+                None => return Ok(MenuOutcome::Quit),
             }
         };
-
-        // bind to the selected agent
-        wire.out_tx
-            .send(OutFrame::Text(ClientToHub::SelectAgent {
-                agent: Some(agent.clone()),
-            }))
-            .await
-            .map_err(|_| anyhow!("hub disconnected"))?;
-        match expect_text(wire).await? {
-            HubToClient::AgentSelected { .. } => {}
-            HubToClient::SessionError { message } => {
-                show_message(term, &format!("error: {}", message), bytes, keys).await?;
-                continue 'outer;
-            }
-            _ => continue 'outer,
-        }
-        crate::write_last_agent(&agent);
 
         // ---- stage 2: workspace picker (loop until pick or Esc back) ----
         let last_ws = crate::read_last_workspace(&agent);
@@ -852,6 +808,129 @@ async fn prompt_confirm<B: ratatui::backend::Backend>(
 // ---------------------------------------------------------------------------
 // Hub queries (text-only; menu doesn't expect binary frames)
 // ---------------------------------------------------------------------------
+
+/// Render the agent picker and return the chosen agent's name. Reads
+/// `crate::read_last_agent()` lazily so an Esc-back from stage 2
+/// highlights the agent the user just stepped away from, even within
+/// the same `menu::run` invocation.
+async fn pick_agent_stage<B: ratatui::backend::Backend>(
+    term: &mut Terminal<B>,
+    wire: &mut Wire,
+    bytes: &mut ByteRx,
+    keys: &mut MenuKeyQueue,
+    account: &str,
+) -> Result<Option<String>> {
+    loop {
+        let agents = list_agents(wire).await?;
+        if agents.is_empty() {
+            show_message(term, "no agents online", bytes, keys).await?;
+            return Ok(None);
+        }
+        let mut a_state = ListState::default();
+        // Read the last-used agent now (not when menu::run started)
+        // so the highlight tracks the most recent selection.
+        let initial = crate::read_last_agent()
+            .as_deref()
+            .and_then(|n| agents.iter().position(|a| a == n))
+            .unwrap_or(0);
+        a_state.select(Some(initial));
+
+        let agent_rows: Vec<PickerRow> = agents
+            .iter()
+            .map(|n| PickerRow {
+                name: n.clone(),
+                badge: None,
+            })
+            .collect();
+        let picked = loop {
+            term.draw(|f| {
+                draw_layout(
+                    f,
+                    account,
+                    "Select agent",
+                    &agent_rows,
+                    &mut a_state,
+                    "↑↓ move · Enter pick · Esc/q quit",
+                    false,
+                )
+            })?;
+            let Some(k) = keys.next(bytes).await else {
+                return Ok(None);
+            };
+            match handle_list_key(k, &mut a_state, agents.len()) {
+                ListAction::Pick => {
+                    let p = agents[a_state.selected().unwrap_or(0)].clone();
+                    let mut redraw = |pressed: bool| -> Result<()> {
+                        term.draw(|f| {
+                            draw_layout(
+                                f,
+                                account,
+                                "Select agent",
+                                &agent_rows,
+                                &mut a_state,
+                                "↑↓ move · Enter pick · Esc/q quit",
+                                pressed,
+                            )
+                        })?;
+                        Ok(())
+                    };
+                    redraw(true)?;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    redraw(false)?;
+                    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                    break p;
+                }
+                ListAction::Quit => return Ok(None),
+                ListAction::Pass => {}
+            }
+        };
+        // bind to the chosen agent
+        wire.out_tx
+            .send(OutFrame::Text(ClientToHub::SelectAgent {
+                agent: Some(picked.clone()),
+            }))
+            .await
+            .map_err(|_| anyhow!("hub disconnected"))?;
+        match expect_text(wire).await? {
+            HubToClient::AgentSelected { .. } => {
+                crate::write_last_agent(&picked);
+                return Ok(Some(picked));
+            }
+            HubToClient::SessionError { message } => {
+                show_message(term, &format!("error: {}", message), bytes, keys).await?;
+                // retry the picker (agent may have just gone offline)
+                continue;
+            }
+            _ => continue,
+        }
+    }
+}
+
+/// Fast-path bind: ask the hub to select `target` directly, no UI.
+/// Returns Some(target) on success, None on any miss so the caller
+/// can fall back to the normal agent picker. Used after claude exits
+/// to land the user back in the workspace picker for the agent they
+/// were using.
+async fn fast_bind(wire: &mut Wire, target: &str) -> Option<String> {
+    // Sanity-check against the hub's view first: if the agent isn't
+    // in the allow-listed online set, don't even attempt the bind
+    // (otherwise we'd spam a SessionError that the caller would
+    // immediately have to swallow).
+    let agents = list_agents(wire).await.ok()?;
+    if !agents.iter().any(|a| a == target) {
+        return None;
+    }
+    wire.out_tx
+        .send(OutFrame::Text(ClientToHub::SelectAgent {
+            agent: Some(target.to_string()),
+        }))
+        .await
+        .ok()?;
+    match expect_text(wire).await.ok()? {
+        HubToClient::AgentSelected { .. } => Some(target.to_string()),
+        _ => None,
+    }
+}
 
 async fn list_agents(wire: &mut Wire) -> Result<Vec<String>> {
     wire.out_tx
