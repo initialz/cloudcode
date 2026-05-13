@@ -301,7 +301,14 @@ while :; do
         "$@"
         first=0
     else
-        claude --continue
+        # Try to resume the previous conversation. If claude has no
+        # saved session to continue (fresh workspace, just-reset, or
+        # the first run was so short no jsonl got written) `--continue`
+        # bails with "No conversation found to continue" and a non-zero
+        # exit. Fall back to the original command + args so the user
+        # at least gets a working claude on reattach instead of a
+        # tight error loop.
+        claude --continue || "$@"
     fi
     # Disconnect every client attached to THIS session. We pass -s
     # explicitly because `detach-client -a` from a non-attached
