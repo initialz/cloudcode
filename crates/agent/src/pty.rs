@@ -269,6 +269,29 @@ impl PtyManager {
         // The command to run on first create. tmux ignores this when attaching
         // an existing session, so a reconnect just gets back to whatever
         // state claude was in.
+        //
+        // We don't exec claude directly — we wrap it in a tiny bash script
+        // so that when claude exits (/exit, Ctrl+C, crash, whatever) the
+        // tmux window stays alive in a shell instead of tearing the session
+        // down. Reconnecting then shows a shell prompt where the user can
+        // `claude --continue` to resume, run other commands, or type
+        // `exit` to actually close the workspace and pop back to the menu.
+        // Explicit workspace deletion still goes through `d` in the picker.
+        const WRAPPER: &str = r#"
+"$@"
+status=$?
+echo
+echo "[cloudcode] claude exited (status $status)."
+echo "  - 'claude --continue' to resume the previous conversation"
+echo "  - 'exit' to close this workspace and return to the menu"
+echo
+exec bash
+"#;
+        cmd.arg("bash");
+        cmd.arg("-c");
+        cmd.arg(WRAPPER);
+        // bash's $0 placeholder (label, ignored by the script).
+        cmd.arg("cloudcode-claude");
         cmd.arg(&self.claude.executable);
         for arg in &self.claude.extra_args {
             cmd.arg(arg);
