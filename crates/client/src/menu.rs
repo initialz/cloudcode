@@ -585,18 +585,19 @@ impl Badge {
 /// Build one list row, baking highlight + optional badge directly
 /// into the line so we don't have to rely on ratatui's
 /// `highlight_style` (which would clobber the badge colour).
+///
+/// Right margin: we reserve 1 cell of trailing padding so the badge's
+/// right edge lines up with the `[account]` label one row up in the
+/// title bar (that one also has a trailing space).
 fn build_row(i: usize, row: &PickerRow, list_w: usize, selected: Option<usize>) -> ListItem<'static> {
     let prefix = format!("  {:>2}  ", i + 1);
     let badge_w = row.badge.map(|b| b.width()).unwrap_or(0);
-    // Reserve one column of gutter between name and badge.
     let gutter = if row.badge.is_some() { 1 } else { 0 };
-    let used = prefix.chars().count() + row.name.chars().count() + gutter + badge_w;
+    let right_margin = 1usize;
+    let used = prefix.chars().count() + row.name.chars().count() + gutter + badge_w + right_margin;
     let pad = list_w.saturating_sub(used);
 
     if selected == Some(i) {
-        // Highlighted row: blue background, but the badge keeps its
-        // colour for the glyph (otherwise users can't tell at a glance
-        // that the row they're hovering is active vs saved).
         let num_style = Style::default()
             .bg(HILITE_BG)
             .fg(Color::Yellow)
@@ -623,6 +624,7 @@ fn build_row(i: usize, row: &PickerRow, list_w: usize, selected: Option<usize>) 
                 Style::default().bg(HILITE_BG).fg(HILITE_FG),
             ));
         }
+        spans.push(Span::styled(" ", body_style));
         return ListItem::new(Line::from(spans));
     }
 
@@ -650,11 +652,10 @@ fn build_row(i: usize, row: &PickerRow, list_w: usize, selected: Option<usize>) 
         ));
         spans.push(Span::styled(
             b.label,
-            Style::default()
-                .bg(DIALOG_BG)
-                .fg(Color::DarkGray),
+            Style::default().bg(DIALOG_BG).fg(Color::DarkGray),
         ));
     }
+    spans.push(Span::styled(" ", Style::default().bg(DIALOG_BG)));
     ListItem::new(Line::from(spans))
 }
 
