@@ -134,5 +134,18 @@ export const apiClient = {
         page_size: number;
       }>(`/sessions?${params.toString()}`);
     },
+    detail: (id: string) =>
+      api<SessionDetailDto>(`/sessions/${encodeURIComponent(id)}`),
+    messages: (id: string, limit = 500) =>
+      api<MessageDto[]>(`/sessions/${encodeURIComponent(id)}/messages?limit=${limit}`),
   },
+};
+
+export type SessionDetailDto = SessionDto & { message_count: number };
+
+export type MessageDto = {
+  id: number;
+  ts: number;
+  kind: string;
+  body: any;
 };

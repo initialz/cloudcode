@@ -461,6 +461,92 @@ struct SessionsPage {
     page_size: i64,
 }
 
+// ---------------------------------------------------------------------
+// Session detail + messages
+// ---------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct SessionDetailDto {
+    session_id: String,
+    account: String,
+    agent: String,
+    workspace: String,
+    started_at: i64,
+    ended_at: Option<i64>,
+    ended_reason: Option<String>,
+    message_count: i64,
+}
+
+pub async fn session_detail(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+) -> Response {
+    match state.app.db.get_session(&session_id).await {
+        Ok(Some(s)) => {
+            let count = state
+                .app
+                .db
+                .count_messages_for_session(&session_id)
+                .await
+                .unwrap_or(0);
+            Json(SessionDetailDto {
+                session_id: s.session_id,
+                account: s.account,
+                agent: s.agent,
+                workspace: s.workspace,
+                started_at: s.started_at,
+                ended_at: s.ended_at,
+                ended_reason: s.ended_reason,
+                message_count: count,
+            })
+            .into_response()
+        }
+        Ok(None) => err(StatusCode::NOT_FOUND, "not_found", "session not found"),
+        Err(e) => internal(e),
+    }
+}
+
+#[derive(Serialize)]
+struct MessageDto {
+    id: i64,
+    ts: i64,
+    kind: String,
+    body: serde_json::Value,
+}
+
+#[derive(Deserialize, Default)]
+pub struct MessagesQuery {
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+pub async fn session_messages(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+    Query(q): Query<MessagesQuery>,
+) -> Response {
+    let limit = q.limit.unwrap_or(500).clamp(1, 5000);
+    let rows = match state
+        .app
+        .db
+        .list_messages_for_session(&session_id, limit)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return internal(e),
+    };
+    let dto: Vec<MessageDto> = rows
+        .into_iter()
+        .map(|r| MessageDto {
+            id: r.id,
+            ts: r.ts,
+            kind: r.kind,
+            body: serde_json::from_str(&r.body).unwrap_or(serde_json::Value::Null),
+        })
+        .collect();
+    Json(dto).into_response()
+}
+
 pub async fn sessions_list(
     State(state): State<AdminState>,
     Query(q): Query<SessionsQuery>,

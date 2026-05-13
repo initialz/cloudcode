@@ -5,6 +5,7 @@ import { Dashboard } from '@/pages/Dashboard';
 import { Accounts } from '@/pages/Accounts';
 import { Audit } from '@/pages/Audit';
 import { Sessions } from '@/pages/Sessions';
+import { SessionDetail } from '@/pages/SessionDetail';
 import { AuthProvider, RequireAuth } from '@/lib/auth';
 
 export default function App() {
@@ -23,6 +24,7 @@ export default function App() {
           <Route index element={<Dashboard />} />
           <Route path="accounts" element={<Accounts />} />
           <Route path="sessions" element={<Sessions />} />
+          <Route path="sessions/:id" element={<SessionDetail />} />
           <Route path="audit" element={<Audit />} />
         </Route>
       </Routes>

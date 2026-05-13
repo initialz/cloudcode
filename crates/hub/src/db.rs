@@ -420,6 +420,25 @@ impl Db {
         Ok(row.get::<i64, _>("n"))
     }
 
+    pub async fn get_session(&self, session_id: &str) -> Result<Option<SessionRow>> {
+        let row = sqlx::query(
+            "SELECT session_id, account, agent, workspace, started_at, ended_at, ended_reason
+               FROM sessions WHERE session_id = ?1",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| SessionRow {
+            session_id: r.get("session_id"),
+            account: r.get("account"),
+            agent: r.get("agent"),
+            workspace: r.get("workspace"),
+            started_at: r.get("started_at"),
+            ended_at: r.get("ended_at"),
+            ended_reason: r.get("ended_reason"),
+        }))
+    }
+
     /// Currently-active sessions (no end recorded). Quick stats card.
     pub async fn count_active_sessions(&self) -> Result<i64> {
         let row = sqlx::query("SELECT COUNT(*) AS n FROM sessions WHERE ended_at IS NULL")

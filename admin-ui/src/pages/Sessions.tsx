@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent, type ReactNode } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { apiClient, type SessionDto } from '@/lib/api';
 
 export function Sessions() {
@@ -182,8 +182,13 @@ export function Sessions() {
                   <td className="px-3 py-2 font-mono text-xs">{s.account}</td>
                   <td className="px-3 py-2 font-mono text-xs">{s.agent}</td>
                   <td className="px-3 py-2 font-mono text-xs">{s.workspace}</td>
-                  <td className="px-3 py-2 font-mono text-xs text-zinc-500">
-                    {s.session_id.slice(0, 8)}
+                  <td className="px-3 py-2 font-mono text-xs">
+                    <Link
+                      to={`/sessions/${s.session_id}`}
+                      className="text-zinc-700 dark:text-zinc-300 hover:underline"
+                    >
+                      {s.session_id.slice(0, 8)}
+                    </Link>
                   </td>
                   <td className="px-3 py-2 text-xs text-zinc-500">
                     {s.ended_reason ?? <Dim>—</Dim>}
