@@ -3,6 +3,7 @@ import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { apiClient } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { SettingsModal } from './SettingsModal';
+import { Logo } from './Logo';
 
 export function Layout() {
   const { setOut } = useAuth();
@@ -32,6 +33,7 @@ export function Layout() {
       <header className="border-b border-zinc-200 dark:border-zinc-800 px-6 py-3 flex items-center justify-between">
         <div className="flex items-center gap-6">
           <h1 className="font-semibold text-lg flex items-center gap-2">
+            <Logo className="h-6 w-6 text-zinc-900 dark:text-zinc-100" />
             <span>CloudCode admin</span>
             {hubVersion && (
               <span

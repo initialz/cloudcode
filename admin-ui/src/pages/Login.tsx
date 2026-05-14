@@ -2,6 +2,7 @@ import { useState, type FormEvent } from 'react';
 import { useNavigate, useLocation, Navigate } from 'react-router-dom';
 import { apiClient } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
+import { Logo } from '@/components/Logo';
 
 export function Login() {
   const [token, setToken] = useState('');
@@ -38,9 +39,12 @@ export function Login() {
         onSubmit={onSubmit}
         className="w-full max-w-sm space-y-4 p-6 rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm"
       >
-        <div>
-          <h1 className="text-lg font-semibold">CloudCode admin</h1>
-          <p className="text-sm text-zinc-500 mt-1">Sign in with the admin token.</p>
+        <div className="flex items-center gap-3">
+          <Logo className="h-10 w-10 text-zinc-900 dark:text-zinc-100" />
+          <div>
+            <h1 className="text-lg font-semibold">CloudCode admin</h1>
+            <p className="text-sm text-zinc-500 mt-1">Sign in with the admin token.</p>
+          </div>
         </div>
 
         {error && (
