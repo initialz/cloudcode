@@ -21,7 +21,7 @@ use axum::{
     extract::{Request, State},
     http::{header::COOKIE, HeaderMap, StatusCode},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Redirect, Response},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -191,7 +191,12 @@ pub fn router(state: AdminState) -> Router {
         // /admin/assets/<hash>.{js,css,...} → long-cache hashed file
         // anything else under /admin → index.html, SPA router handles
         .route("/admin/assets/*path", get(assets::serve_asset))
-        .route("/admin", get(assets::serve_index))
+        // React Router uses basename="/admin", and when the location
+        // is exactly the basename (no trailing slash) it can't strip
+        // it to a real path — the SPA loads but the index route
+        // doesn't match, so any in-browser reload at /admin lands
+        // on a blank screen. Force the canonical trailing slash.
+        .route("/admin", get(|| async { Redirect::permanent("/admin/") }))
         .route("/admin/", get(assets::serve_index))
         .route("/admin/*spa", get(assets::serve_index))
         .with_state(state)
