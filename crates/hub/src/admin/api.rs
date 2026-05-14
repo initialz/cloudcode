@@ -496,7 +496,7 @@ pub async fn agents_list(State(state): State<AdminState>) -> Response {
 // Agent releases + self-update
 // ---------------------------------------------------------------------
 
-const RELEASES_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+const RELEASES_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 const GITHUB_RELEASES_URL: &str =
     "https://api.github.com/repos/initialz/cloudcode/releases";
 const UPDATE_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);

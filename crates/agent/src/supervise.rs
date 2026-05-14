@@ -29,8 +29,16 @@ const ROLLBACK_THRESHOLD: u32 = 10;
 
 pub fn run(config_path: PathBuf) -> Result<()> {
     let self_exe = std::env::current_exe().context("locating current cloudcode-agent binary")?;
+    // First-run bootstrap: if there's no `current` symlink yet, point
+    // it at the binary we were launched with. From then on the
+    // supervisor always spawns through that symlink, so a self-update
+    // that re-targets it is picked up automatically on the next
+    // restart.
+    bootstrap_current_symlink(&self_exe);
+    let spawn_target = active_binary_path().unwrap_or_else(|| self_exe.clone());
     tracing::info!(
-        exe = %self_exe.display(),
+        self_exe = %self_exe.display(),
+        spawn_target = %spawn_target.display(),
         config = %config_path.display(),
         "supervisor starting"
     );
@@ -48,7 +56,11 @@ pub fn run(config_path: PathBuf) -> Result<()> {
             return Ok(());
         }
 
-        let mut child = match spawn_child(&self_exe, &config_path) {
+        // Re-resolve every iteration so a self-update that flipped
+        // `agent/current` between exits is picked up on the next
+        // spawn.
+        let target = active_binary_path().unwrap_or_else(|| self_exe.clone());
+        let mut child = match spawn_child(&target, &config_path) {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "failed to spawn agent child; backing off");
@@ -225,6 +237,42 @@ fn try_rollback_to_previous() -> bool {
         return false;
     }
     true
+}
+
+/// Create `agent/current` -> `self_exe` if no such symlink exists yet.
+/// Idempotent: a present symlink (even a stale / dangling one) is left
+/// alone — only a self-update is supposed to rewrite it. We deliberately
+/// do nothing on filesystem errors; the caller falls back to `self_exe`
+/// directly, which keeps the agent runnable even if the state dir
+/// isn't writable for some reason.
+fn bootstrap_current_symlink(self_exe: &Path) {
+    let Some(state) = state_dir() else { return };
+    let agent_dir = state.join("agent");
+    if std::fs::create_dir_all(&agent_dir).is_err() {
+        return;
+    }
+    let current = agent_dir.join("current");
+    if current.symlink_metadata().is_ok() {
+        return;
+    }
+    if let Err(e) = std::os::unix::fs::symlink(self_exe, &current) {
+        tracing::warn!(error = %e, "could not bootstrap agent/current symlink");
+    }
+}
+
+/// Returns `agent/current` (as a path you can `Command::new(...)`) if
+/// the symlink exists. We pass the symlink itself rather than the
+/// resolved target so the OS follows it at exec time — that way a
+/// self-update that swaps the symlink between supervisor iterations
+/// takes effect on the next spawn.
+fn active_binary_path() -> Option<PathBuf> {
+    let state = state_dir()?;
+    let current = state.join("agent").join("current");
+    if current.symlink_metadata().is_ok() {
+        Some(current)
+    } else {
+        None
+    }
 }
 
 fn state_dir() -> Option<PathBuf> {
