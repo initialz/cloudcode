@@ -52,6 +52,10 @@ export type AccountDto = {
   disabled: boolean;
   /// Agents whitelisted for this account (strict whitelist).
   allowed_agents: string[];
+  /// Most recent session.started_at, or null if never used.
+  last_used_at: number | null;
+  /// At least one session is currently live.
+  online: boolean;
 };
 
 export type DashboardDto = {

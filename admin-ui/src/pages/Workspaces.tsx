@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { apiClient, type WorkspaceRowDto, type WorkspaceStatus } from '@/lib/api';
-import { formatDate } from '@/lib/time';
+import { formatRelative } from '@/lib/time';
 
 const ALL = '__all__';
 
@@ -195,12 +195,3 @@ function StatusDot({ status }: { status: WorkspaceStatus }) {
   return <span className="text-zinc-400">·</span>;
 }
 
-function formatRelative(ts: number): string {
-  const now = Date.now() / 1000;
-  const dt = now - ts;
-  if (dt < 60) return 'just now';
-  if (dt < 3600) return `${Math.floor(dt / 60)} min ago`;
-  if (dt < 86400) return `${Math.floor(dt / 3600)} hr ago`;
-  if (dt < 86400 * 14) return `${Math.floor(dt / 86400)} d ago`;
-  return formatDate(ts);
-}

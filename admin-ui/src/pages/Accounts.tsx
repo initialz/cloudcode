@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { apiClient, type AccountDto, type AllowedAgentsDto } from '@/lib/api';
 import { Modal } from '@/components/Modal';
 import { CopyableToken } from '@/components/CopyableToken';
-import { formatDate } from '@/lib/time';
+import { formatDate, formatRelative } from '@/lib/time';
 
 type TokenModal = { name: string; token: string; mode: 'created' | 'rotated' };
 
@@ -182,7 +182,9 @@ export function Accounts() {
                 <th className="px-3 py-2 text-left">Name</th>
                 <th className="px-3 py-2 text-left">Token suffix</th>
                 <th className="px-3 py-2 text-left">Status</th>
+                <th className="px-3 py-2 text-left">Online</th>
                 <th className="px-3 py-2 text-left">Agents</th>
+                <th className="px-3 py-2 text-left">Last used</th>
                 <th className="px-3 py-2 text-left">Created</th>
                 <th className="px-3 py-2 text-right">Actions</th>
               </tr>
@@ -190,7 +192,7 @@ export function Accounts() {
             <tbody className="divide-y divide-zinc-200 dark:divide-zinc-800 bg-white dark:bg-zinc-900">
               {accounts.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="px-3 py-6 text-center text-zinc-500">
+                  <td colSpan={8} className="px-3 py-6 text-center text-zinc-500">
                     No accounts yet. Create one above.
                   </td>
                 </tr>
@@ -208,7 +210,18 @@ export function Accounts() {
                         </span>
                       ) : (
                         <span className="text-xs px-2 py-0.5 rounded bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300">
-                          active
+                          enabled
+                        </span>
+                      )}
+                    </td>
+                    <td className="px-3 py-2">
+                      {a.online ? (
+                        <span className="text-xs px-2 py-0.5 rounded bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300">
+                          online
+                        </span>
+                      ) : (
+                        <span className="text-xs px-2 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-500">
+                          offline
                         </span>
                       )}
                     </td>
@@ -229,6 +242,9 @@ export function Accounts() {
                           </>
                         )}
                       </button>
+                    </td>
+                    <td className="px-3 py-2 text-zinc-500">
+                      {a.last_used_at ? formatRelative(a.last_used_at) : '—'}
                     </td>
                     <td className="px-3 py-2 text-zinc-500">
                       {formatDate(a.created_at)}

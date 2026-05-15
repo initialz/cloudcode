@@ -44,3 +44,13 @@ export function formatDateHour(unix: number): string {
   // some engines. Compose from date + hour instead for stability.
   return `${formatDate(unix)} ${formatHour2(unix)}`;
 }
+
+/** "just now" / "5 min ago" / "2 hr ago" / "3 d ago" / "2026-05-01". */
+export function formatRelative(unix: number): string {
+  const dt = Date.now() / 1000 - unix;
+  if (dt < 60) return 'just now';
+  if (dt < 3600) return `${Math.floor(dt / 60)} min ago`;
+  if (dt < 86400) return `${Math.floor(dt / 3600)} hr ago`;
+  if (dt < 86400 * 14) return `${Math.floor(dt / 86400)} d ago`;
+  return formatDate(unix);
+}

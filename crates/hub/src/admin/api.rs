@@ -217,6 +217,12 @@ struct AccountDto {
     /// Agents whitelisted for this account. Empty = locked out (strict
     /// whitelist semantics; admin must grant access from the editor).
     allowed_agents: Vec<String>,
+    /// Wall-clock of this account's most recent session start, or None
+    /// if it has never opened one.
+    last_used_at: Option<i64>,
+    /// True iff this account has at least one session currently live
+    /// (ended_at IS NULL).
+    online: bool,
 }
 
 pub async fn accounts_list(State(state): State<AdminState>) -> Response {
@@ -224,6 +230,17 @@ pub async fn accounts_list(State(state): State<AdminState>) -> Response {
         Ok(r) => r,
         Err(e) => return internal(e),
     };
+    let activity = state
+        .app
+        .db
+        .account_activity_index()
+        .await
+        .unwrap_or_default();
+    let mut activity_map: std::collections::HashMap<String, (Option<i64>, i64)> =
+        std::collections::HashMap::with_capacity(activity.len());
+    for (name, last_used, active_count) in activity {
+        activity_map.insert(name, (last_used, active_count));
+    }
     let mut dto: Vec<AccountDto> = Vec::with_capacity(rows.len());
     for a in rows {
         let allowed = state
@@ -232,12 +249,16 @@ pub async fn accounts_list(State(state): State<AdminState>) -> Response {
             .list_allowed_agents(&a.name)
             .await
             .unwrap_or_default();
+        let (last_used_at, active_count) =
+            activity_map.get(&a.name).copied().unwrap_or((None, 0));
         dto.push(AccountDto {
             name: a.name,
             token_prefix: a.token_prefix,
             created_at: a.created_at,
             disabled: a.disabled,
             allowed_agents: allowed,
+            last_used_at,
+            online: active_count > 0,
         });
     }
     Json(dto).into_response()

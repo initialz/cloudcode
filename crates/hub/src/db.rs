@@ -151,6 +151,35 @@ impl Db {
         Ok(row.get::<i64, _>("n"))
     }
 
+    /// Per-account activity rollup: most recent session start (or
+    /// None if the account has never opened one) and how many of
+    /// its sessions are currently live (ended_at IS NULL). One SQL
+    /// round trip; admin UI uses it next to list_accounts() to
+    /// render Online / Last used columns without N+1ing.
+    pub async fn account_activity_index(
+        &self,
+    ) -> Result<Vec<(String, Option<i64>, i64)>> {
+        let rows = sqlx::query(
+            "SELECT account,
+                    MAX(started_at) AS last_used,
+                    SUM(CASE WHEN ended_at IS NULL THEN 1 ELSE 0 END) AS active_count
+               FROM sessions
+              GROUP BY account",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("account"),
+                    r.get::<Option<i64>, _>("last_used"),
+                    r.get::<Option<i64>, _>("active_count").unwrap_or(0),
+                )
+            })
+            .collect())
+    }
+
     pub async fn list_accounts(&self) -> Result<Vec<DbAccount>> {
         let rows = sqlx::query(
             "SELECT name, token_hash, token_prefix, created_at, disabled
