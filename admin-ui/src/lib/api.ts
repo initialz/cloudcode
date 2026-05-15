@@ -142,6 +142,18 @@ export const apiClient = {
   workspaces: {
     list: () => api<WorkspaceRowDto[]>('/workspaces'),
   },
+  stats: {
+    leaderboard: (window: '7d' | '30d', group: 'account' | 'agent') =>
+      api<LeaderboardRowDto[]>(`/stats/leaderboard?window=${window}&group=${group}`),
+    sessionDuration: (window: '7d' | '30d') =>
+      api<SessionDurationDto>(`/stats/session-duration?window=${window}`),
+    messagesDaily: (days: number) =>
+      api<DailyMessageDto[]>(`/stats/messages-daily?days=${days}`),
+    messagesPerSession: (window: '7d' | '30d') =>
+      api<MessagesPerSessionDto>(`/stats/messages-per-session?window=${window}`),
+    tokensDaily: (days: number) =>
+      api<DailyTokenDto[]>(`/stats/tokens-daily?days=${days}`),
+  },
   audit: {
     list: (q: Record<string, string | number | undefined>) => {
       const params = new URLSearchParams();
@@ -215,6 +227,62 @@ export type AllowedAccountsDto = {
 };
 
 export type WorkspaceStatus = 'active' | 'saved' | 'fresh';
+
+// ── Stats DTOs ─────────────────────────────────────────────────────────────
+
+export type LeaderboardRowDto = {
+  name: string;
+  session_count: number;
+  total_duration_seconds: number;
+  message_count: number;
+};
+
+export type DurationBucketDto = {
+  label: string;
+  from_seconds: number;
+  to_seconds: number | null;
+  count: number;
+};
+
+export type SessionDurationDto = {
+  count: number;
+  mean_seconds: number;
+  median_seconds: number;
+  p95_seconds: number;
+  max_seconds: number;
+  buckets: DurationBucketDto[];
+};
+
+export type DailyMessageDto = {
+  date: string;
+  user: number;
+  assistant: number;
+  other: number;
+};
+
+export type MessageCountBucketDto = {
+  label: string;
+  from: number;
+  to: number | null;
+  count: number;
+};
+
+export type MessagesPerSessionDto = {
+  count: number;
+  mean: number;
+  median: number;
+  p95: number;
+  max: number;
+  buckets: MessageCountBucketDto[];
+};
+
+export type DailyTokenDto = {
+  date: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+};
 
 export type WorkspaceRowDto = {
   agent: string;

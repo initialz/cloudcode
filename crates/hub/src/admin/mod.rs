@@ -185,7 +185,28 @@ pub fn router(state: AdminState) -> Router {
         )
         .route(
             "/admin/api/sessions/:id/messages",
-            get(api::session_messages).route_layer(gate),
+            get(api::session_messages).route_layer(gate.clone()),
+        )
+        // -- stats --
+        .route(
+            "/admin/api/stats/leaderboard",
+            get(api::stats_leaderboard).route_layer(gate.clone()),
+        )
+        .route(
+            "/admin/api/stats/session-duration",
+            get(api::stats_session_duration).route_layer(gate.clone()),
+        )
+        .route(
+            "/admin/api/stats/messages-daily",
+            get(api::stats_messages_daily).route_layer(gate.clone()),
+        )
+        .route(
+            "/admin/api/stats/messages-per-session",
+            get(api::stats_messages_per_session).route_layer(gate.clone()),
+        )
+        .route(
+            "/admin/api/stats/tokens-daily",
+            get(api::stats_tokens_daily).route_layer(gate),
         )
         // -- SPA bundle (built by `cd admin-ui && npm run build`) --
         // /admin/assets/<hash>.{js,css,...} → long-cache hashed file

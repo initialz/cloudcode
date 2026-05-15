@@ -1370,3 +1370,462 @@ pub async fn sessions_list(
     })
     .into_response()
 }
+
+// ---------------------------------------------------------------------
+// stats
+// ---------------------------------------------------------------------
+//
+// Five admin-only analytics endpoints powering the dashboard charts.
+// All time-window inputs accept `window=7d|30d` (default 7d on missing
+// or unknown); date-window inputs accept `days=N` clamped to 1..=180.
+// Endpoints never error on empty data — they return zeros / empty
+// buckets so the frontend can render without special-casing.
+
+fn parse_window_secs(s: Option<&String>) -> i64 {
+    match s.map(String::as_str) {
+        Some("30d") => 30 * 86_400,
+        _ => 7 * 86_400,
+    }
+}
+
+fn parse_days(s: Option<&String>) -> i64 {
+    s.and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(30)
+        .clamp(1, 180)
+}
+
+#[derive(Serialize)]
+struct LeaderboardRow {
+    name: String,
+    session_count: i64,
+    total_duration_seconds: i64,
+    message_count: i64,
+}
+
+pub async fn stats_leaderboard(
+    State(state): State<AdminState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let window = parse_window_secs(q.get("window"));
+    let now = chrono::Utc::now().timestamp();
+    let cutoff = now - window;
+    let group = match q.get("group").map(String::as_str) {
+        Some("agent") => "agent",
+        _ => "account",
+    };
+
+    // Two grouped queries against the same cutoff; we merge in Rust to
+    // avoid a JOIN that explodes per-message rows then collapses.
+    let sess_sql = format!(
+        "SELECT {group} AS name, COUNT(*) AS sess_n,
+                SUM(COALESCE(ended_at, ?1) - started_at) AS dur
+           FROM sessions
+          WHERE started_at >= ?2
+          GROUP BY {group}"
+    );
+    let sess_rows = match sqlx::query(&sess_sql)
+        .bind(now)
+        .bind(cutoff)
+        .fetch_all(&state.app.db.pool)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return internal(e),
+    };
+
+    let msg_sql = format!(
+        "SELECT s.{group} AS name, COUNT(m.id) AS msg_n
+           FROM sessions s
+           JOIN messages m ON m.cc_session_id = s.session_id
+          WHERE s.started_at >= ?1
+          GROUP BY s.{group}"
+    );
+    let msg_rows = match sqlx::query(&msg_sql)
+        .bind(cutoff)
+        .fetch_all(&state.app.db.pool)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return internal(e),
+    };
+
+    use sqlx::Row;
+    let mut merged: std::collections::HashMap<String, LeaderboardRow> =
+        std::collections::HashMap::new();
+    for row in sess_rows {
+        let name: Option<String> = row.get("name");
+        let Some(name) = name else { continue };
+        let sess_n: i64 = row.get("sess_n");
+        let dur: i64 = row.try_get("dur").unwrap_or(0);
+        merged.insert(
+            name.clone(),
+            LeaderboardRow {
+                name,
+                session_count: sess_n,
+                total_duration_seconds: dur,
+                message_count: 0,
+            },
+        );
+    }
+    for row in msg_rows {
+        let name: Option<String> = row.get("name");
+        let Some(name) = name else { continue };
+        let msg_n: i64 = row.get("msg_n");
+        if let Some(e) = merged.get_mut(&name) {
+            e.message_count = msg_n;
+        } else {
+            // Shouldn't happen — session group covers all sessions in
+            // the window, and messages reference sessions via cc_session_id
+            // joined against the same window. Be defensive.
+            merged.insert(
+                name.clone(),
+                LeaderboardRow {
+                    name,
+                    session_count: 0,
+                    total_duration_seconds: 0,
+                    message_count: msg_n,
+                },
+            );
+        }
+    }
+
+    let mut out: Vec<LeaderboardRow> = merged.into_values().collect();
+    out.sort_by(|a, b| b.total_duration_seconds.cmp(&a.total_duration_seconds));
+    out.truncate(20);
+    Json(out).into_response()
+}
+
+#[derive(Serialize)]
+struct DurationBucket {
+    label: &'static str,
+    from_seconds: i64,
+    to_seconds: Option<i64>,
+    count: i64,
+}
+
+#[derive(Serialize)]
+struct SessionDurationStats {
+    count: i64,
+    mean_seconds: f64,
+    median_seconds: i64,
+    p95_seconds: i64,
+    max_seconds: i64,
+    buckets: Vec<DurationBucket>,
+}
+
+fn percentile_i64(sorted: &[i64], p: f64) -> i64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+pub async fn stats_session_duration(
+    State(state): State<AdminState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let window = parse_window_secs(q.get("window"));
+    let now = chrono::Utc::now().timestamp();
+    let cutoff = now - window;
+
+    let rows = match sqlx::query(
+        "SELECT COALESCE(ended_at, ?1) - started_at AS d
+           FROM sessions
+          WHERE started_at >= ?2",
+    )
+    .bind(now)
+    .bind(cutoff)
+    .fetch_all(&state.app.db.pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return internal(e),
+    };
+
+    use sqlx::Row;
+    let mut durations: Vec<i64> = rows
+        .into_iter()
+        .map(|r| r.get::<i64, _>("d").max(0))
+        .collect();
+    durations.sort_unstable();
+
+    let edges: [(&'static str, i64, Option<i64>); 7] = [
+        ("<1m", 0, Some(60)),
+        ("1-5m", 60, Some(300)),
+        ("5-30m", 300, Some(1800)),
+        ("30m-1h", 1800, Some(3600)),
+        ("1-6h", 3600, Some(21_600)),
+        ("6-24h", 21_600, Some(86_400)),
+        (">24h", 86_400, None),
+    ];
+    let mut buckets: Vec<DurationBucket> = edges
+        .iter()
+        .map(|(label, from, to)| DurationBucket {
+            label,
+            from_seconds: *from,
+            to_seconds: *to,
+            count: 0,
+        })
+        .collect();
+    for d in &durations {
+        for b in buckets.iter_mut() {
+            let in_range = *d >= b.from_seconds
+                && match b.to_seconds {
+                    Some(to) => *d < to,
+                    None => true,
+                };
+            if in_range {
+                b.count += 1;
+                break;
+            }
+        }
+    }
+
+    let count = durations.len() as i64;
+    let mean = if durations.is_empty() {
+        0.0
+    } else {
+        durations.iter().sum::<i64>() as f64 / durations.len() as f64
+    };
+    let median = percentile_i64(&durations, 0.50);
+    let p95 = percentile_i64(&durations, 0.95);
+    let max = durations.last().copied().unwrap_or(0);
+
+    Json(SessionDurationStats {
+        count,
+        mean_seconds: mean,
+        median_seconds: median,
+        p95_seconds: p95,
+        max_seconds: max,
+        buckets,
+    })
+    .into_response()
+}
+
+#[derive(Serialize)]
+struct MessagesDailyRow {
+    date: String,
+    user: i64,
+    assistant: i64,
+    other: i64,
+}
+
+pub async fn stats_messages_daily(
+    State(state): State<AdminState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let days = parse_days(q.get("days"));
+    let now = chrono::Utc::now().timestamp();
+    let cutoff = now - days * 86_400;
+
+    let rows = match sqlx::query(
+        "SELECT date(ts, 'unixepoch') AS day, kind, COUNT(*) AS n
+           FROM messages
+          WHERE ts >= ?1
+          GROUP BY day, kind",
+    )
+    .bind(cutoff)
+    .fetch_all(&state.app.db.pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return internal(e),
+    };
+
+    use sqlx::Row;
+    let mut by_day: std::collections::HashMap<String, (i64, i64, i64)> =
+        std::collections::HashMap::new();
+    for row in rows {
+        let day: String = row.get("day");
+        let kind: String = row.get("kind");
+        let n: i64 = row.get("n");
+        let e = by_day.entry(day).or_insert((0, 0, 0));
+        match kind.as_str() {
+            "user" => e.0 += n,
+            "assistant" => e.1 += n,
+            _ => e.2 += n,
+        }
+    }
+
+    // Fill zero days. We anchor at "today UTC" and walk back days-1 days
+    // so the response always has exactly `days` entries.
+    let today = chrono::DateTime::<chrono::Utc>::from_timestamp(now, 0)
+        .map(|d| d.date_naive())
+        .unwrap_or_else(|| chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
+    let mut out: Vec<MessagesDailyRow> = Vec::with_capacity(days as usize);
+    for i in (0..days).rev() {
+        let date = today - chrono::Duration::days(i);
+        let key = date.format("%Y-%m-%d").to_string();
+        let (u, a, o) = by_day.get(&key).copied().unwrap_or((0, 0, 0));
+        out.push(MessagesDailyRow {
+            date: key,
+            user: u,
+            assistant: a,
+            other: o,
+        });
+    }
+    Json(out).into_response()
+}
+
+#[derive(Serialize)]
+struct CountBucket {
+    label: &'static str,
+    from: i64,
+    to: Option<i64>,
+    count: i64,
+}
+
+#[derive(Serialize)]
+struct MessagesPerSessionStats {
+    count: i64,
+    mean: f64,
+    median: i64,
+    p95: i64,
+    max: i64,
+    buckets: Vec<CountBucket>,
+}
+
+pub async fn stats_messages_per_session(
+    State(state): State<AdminState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let window = parse_window_secs(q.get("window"));
+    let cutoff = chrono::Utc::now().timestamp() - window;
+
+    let rows = match sqlx::query(
+        "SELECT COUNT(m.id) AS n
+           FROM sessions s
+           LEFT JOIN messages m ON m.cc_session_id = s.session_id
+          WHERE s.started_at >= ?1
+          GROUP BY s.session_id",
+    )
+    .bind(cutoff)
+    .fetch_all(&state.app.db.pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return internal(e),
+    };
+
+    use sqlx::Row;
+    let mut counts: Vec<i64> = rows.into_iter().map(|r| r.get::<i64, _>("n")).collect();
+    counts.sort_unstable();
+
+    let edges: [(&'static str, i64, Option<i64>); 6] = [
+        ("0", 0, Some(0)),
+        ("1-5", 1, Some(5)),
+        ("6-20", 6, Some(20)),
+        ("21-50", 21, Some(50)),
+        ("51-100", 51, Some(100)),
+        (">100", 101, None),
+    ];
+    let mut buckets: Vec<CountBucket> = edges
+        .iter()
+        .map(|(label, from, to)| CountBucket {
+            label,
+            from: *from,
+            to: *to,
+            count: 0,
+        })
+        .collect();
+    for c in &counts {
+        for b in buckets.iter_mut() {
+            let in_range = *c >= b.from
+                && match b.to {
+                    Some(to) => *c <= to,
+                    None => true,
+                };
+            if in_range {
+                b.count += 1;
+                break;
+            }
+        }
+    }
+
+    let count = counts.len() as i64;
+    let mean = if counts.is_empty() {
+        0.0
+    } else {
+        counts.iter().sum::<i64>() as f64 / counts.len() as f64
+    };
+    let median = percentile_i64(&counts, 0.50);
+    let p95 = percentile_i64(&counts, 0.95);
+    let max = counts.last().copied().unwrap_or(0);
+
+    Json(MessagesPerSessionStats {
+        count,
+        mean,
+        median,
+        p95,
+        max,
+        buckets,
+    })
+    .into_response()
+}
+
+#[derive(Serialize)]
+struct TokensDailyRow {
+    date: String,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_creation_tokens: i64,
+    cache_read_tokens: i64,
+}
+
+pub async fn stats_tokens_daily(
+    State(state): State<AdminState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let days = parse_days(q.get("days"));
+    let now = chrono::Utc::now().timestamp();
+    let cutoff = now - days * 86_400;
+
+    let rows = match sqlx::query(
+        "SELECT date(ts, 'unixepoch') AS day,
+                SUM(CAST(json_extract(body, '$.message.usage.input_tokens') AS INTEGER)) AS i,
+                SUM(CAST(json_extract(body, '$.message.usage.output_tokens') AS INTEGER)) AS o,
+                SUM(CAST(json_extract(body, '$.message.usage.cache_creation_input_tokens') AS INTEGER)) AS cc,
+                SUM(CAST(json_extract(body, '$.message.usage.cache_read_input_tokens') AS INTEGER)) AS cr
+           FROM messages
+          WHERE ts >= ?1 AND kind = 'assistant'
+          GROUP BY day",
+    )
+    .bind(cutoff)
+    .fetch_all(&state.app.db.pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return internal(e),
+    };
+
+    use sqlx::Row;
+    let mut by_day: std::collections::HashMap<String, (i64, i64, i64, i64)> =
+        std::collections::HashMap::new();
+    for row in rows {
+        let day: String = row.get("day");
+        let i: i64 = row.try_get("i").unwrap_or(0);
+        let o: i64 = row.try_get("o").unwrap_or(0);
+        let cc: i64 = row.try_get("cc").unwrap_or(0);
+        let cr: i64 = row.try_get("cr").unwrap_or(0);
+        by_day.insert(day, (i, o, cc, cr));
+    }
+
+    let today = chrono::DateTime::<chrono::Utc>::from_timestamp(now, 0)
+        .map(|d| d.date_naive())
+        .unwrap_or_else(|| chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
+    let mut out: Vec<TokensDailyRow> = Vec::with_capacity(days as usize);
+    for i in (0..days).rev() {
+        let date = today - chrono::Duration::days(i);
+        let key = date.format("%Y-%m-%d").to_string();
+        let (it, ot, cct, crt) = by_day.get(&key).copied().unwrap_or((0, 0, 0, 0));
+        out.push(TokensDailyRow {
+            date: key,
+            input_tokens: it,
+            output_tokens: ot,
+            cache_creation_tokens: cct,
+            cache_read_tokens: crt,
+        });
+    }
+    Json(out).into_response()
+}
