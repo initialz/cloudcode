@@ -125,6 +125,28 @@
     (regex (string-append "^" (param "HOME_DIR") "/\\.claude\\.json")))
 
 ;; ---------------------------------------------------------------------
+;; package managers — explicit opt-in to writable system-wide install
+;; locations so `brew install` / `npm install -g` / `pnpm i -g` work
+;; inside the sandbox.
+;;
+;; These paths are still subject to the other denies above (shell init
+;; files, .git/hooks, ~/.ssh, …). Reading them was already allowed via
+;; the broad file-read* up top — this just permits writes.
+;; ---------------------------------------------------------------------
+(allow file-write*
+    ;; Homebrew on Apple Silicon
+    (subpath "/opt/homebrew")
+    ;; Homebrew on Intel + the common npm/pnpm global prefix
+    (subpath "/usr/local")
+    ;; npm's optional user-prefix (`npm config set prefix ~/.npm-global`)
+    (subpath (string-append (param "HOME_DIR") "/.npm-global"))
+    ;; pnpm store + global install root
+    (subpath (string-append (param "HOME_DIR") "/.pnpm-store"))
+    (subpath (string-append (param "HOME_DIR") "/Library/pnpm"))
+    ;; Homebrew logs
+    (subpath (string-append (param "HOME_DIR") "/Library/Logs/Homebrew")))
+
+;; ---------------------------------------------------------------------
 ;; write access — scratch and the controlling TTY
 ;; ---------------------------------------------------------------------
 (allow file-write*
