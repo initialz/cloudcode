@@ -1,0 +1,211 @@
+// Left sidebar tree: agents -> workspaces.
+// Expanded agents fetch workspaces via the control WS (handled by parent).
+
+import { useState } from 'react';
+import type { AgentItem, WorkspaceItem } from '@/lib/wire';
+
+type WorkspaceState =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'loaded'; items: WorkspaceItem[] };
+
+export type AgentWorkspaceCache = Map<string, WorkspaceState>;
+
+type Props = {
+  agents: AgentItem[];
+  loading: boolean;
+  cache: AgentWorkspaceCache;
+  openTabKeys: Set<string>; // "agent::workspace" keys that already have a tab
+  onExpandAgent: (agent: string) => void;
+  onOpenWorkspace: (agent: string, workspace: string) => void;
+  onResetWorkspace: (agent: string, workspace: string) => void;
+  onDeleteWorkspace: (agent: string, workspace: string) => void;
+};
+
+export default function AgentTree({
+  agents,
+  loading,
+  cache,
+  openTabKeys,
+  onExpandAgent,
+  onOpenWorkspace,
+  onResetWorkspace,
+  onDeleteWorkspace,
+}: Props) {
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+
+  function toggleAgent(name: string, online: boolean) {
+    if (!online) return;
+    const next = new Set(expanded);
+    if (next.has(name)) {
+      next.delete(name);
+    } else {
+      next.add(name);
+      onExpandAgent(name);
+    }
+    setExpanded(next);
+  }
+
+  if (loading) {
+    return (
+      <div className="px-3 py-2 text-xs text-zinc-400 dark:text-zinc-500">
+        Loading agents...
+      </div>
+    );
+  }
+
+  if (agents.length === 0) {
+    return (
+      <div className="px-3 py-2 text-xs text-zinc-400 dark:text-zinc-500">
+        No agents available.
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex-1 overflow-y-auto">
+      {agents.map((agent) => {
+        const isExpanded = expanded.has(agent.name);
+        const wsState: WorkspaceState = cache.get(agent.name) ?? { status: 'idle' };
+
+        return (
+          <div key={agent.name}>
+            {/* Agent row */}
+            <button
+              type="button"
+              onClick={() => toggleAgent(agent.name, agent.current !== undefined ? true : true)}
+              className={`w-full flex items-center gap-1.5 px-2 py-1 text-left text-xs font-mono transition-colors ${
+                agent.current === false
+                  ? 'text-zinc-400 dark:text-zinc-600 cursor-default'
+                  : 'text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800'
+              }`}
+              aria-expanded={isExpanded}
+            >
+              {/* Chevron */}
+              <span
+                className={`shrink-0 transition-transform duration-150 ${isExpanded ? 'rotate-90' : ''}`}
+              >
+                <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+                  <path d="M3 2L7 5L3 8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </span>
+              <span className="flex-1 truncate font-semibold">{agent.name}</span>
+            </button>
+
+            {/* Workspace list */}
+            {isExpanded && (
+              <div>
+                {wsState.status === 'loading' && (
+                  <div className="pl-7 pr-2 py-0.5 text-xs text-zinc-400 dark:text-zinc-500">
+                    ...
+                  </div>
+                )}
+                {wsState.status === 'loaded' && wsState.items.length === 0 && (
+                  <div className="pl-7 pr-2 py-0.5 text-xs text-zinc-400 dark:text-zinc-500 italic">
+                    no workspaces
+                  </div>
+                )}
+                {wsState.status === 'loaded' &&
+                  wsState.items.map((ws) => {
+                    const key = `${agent.name}::${ws.name}`;
+                    const isOpen = openTabKeys.has(key);
+                    return (
+                      <WorkspaceRow
+                        key={ws.name}
+                        workspace={ws}
+                        isOpen={isOpen}
+                        onOpen={() => onOpenWorkspace(agent.name, ws.name)}
+                        onReset={() => onResetWorkspace(agent.name, ws.name)}
+                        onDelete={() => onDeleteWorkspace(agent.name, ws.name)}
+                      />
+                    );
+                  })}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── WorkspaceRow ─────────────────────────────────────────────────────────────
+
+function WorkspaceBadge({ ws }: { ws: WorkspaceItem }) {
+  if (ws.has_client) {
+    return (
+      <span className="text-[#a80000] font-bold" title="active">
+        ●
+      </span>
+    );
+  }
+  if (ws.tmux_alive) {
+    return (
+      <span className="text-[#a86800]" title="saved">
+        ·
+      </span>
+    );
+  }
+  return (
+    <span className="text-transparent select-none" aria-hidden>
+      ·
+    </span>
+  );
+}
+
+function WorkspaceRow({
+  workspace,
+  isOpen,
+  onOpen,
+  onReset,
+  onDelete,
+}: {
+  workspace: WorkspaceItem;
+  isOpen: boolean;
+  onOpen: () => void;
+  onReset: () => void;
+  onDelete: () => void;
+}) {
+  return (
+    <div
+      className={`group flex items-center gap-1 pl-6 pr-1.5 py-0.5 text-xs font-mono cursor-pointer transition-colors ${
+        isOpen
+          ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100'
+          : 'text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-zinc-900 dark:hover:text-zinc-100'
+      }`}
+      onClick={onOpen}
+    >
+      {/* Status badge — fixed width for alignment */}
+      <span className="w-3 text-center shrink-0">
+        <WorkspaceBadge ws={workspace} />
+      </span>
+      <span className="flex-1 truncate">{workspace.name}</span>
+
+      {/* Action buttons — hover-visible */}
+      <span className="shrink-0 flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onReset();
+          }}
+          className="px-1 py-0.5 rounded text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors"
+          title={`Reset ${workspace.name}`}
+          aria-label={`Reset workspace ${workspace.name}`}
+        >
+          r
+        </button>
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onDelete();
+          }}
+          className="px-1 py-0.5 rounded text-zinc-400 hover:text-red-600 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40 transition-colors"
+          title={`Delete ${workspace.name}`}
+          aria-label={`Delete workspace ${workspace.name}`}
+        >
+          d
+        </button>
+      </span>
+    </div>
+  );
+}
