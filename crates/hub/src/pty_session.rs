@@ -693,6 +693,15 @@ where
                     let _ = conn.send(ServerMsg::PtyClose { session_id: prev }).await;
                 }
             }
+            // Per-account sandbox decision — looked up once per
+            // OpenSession so admin-UI toggles take effect on the
+            // next session without restarting anything.
+            let sandbox = ctx
+                .state
+                .db
+                .account_sandbox_enabled(&ctx.account_name)
+                .await
+                .unwrap_or(true);
             let (evt_tx, mut evt_rx) = mpsc::channel::<PtyEventOut>(PTY_EVENT_QUEUE);
             conn.register_session(session_id, evt_tx);
             if conn
@@ -703,6 +712,7 @@ where
                     cols,
                     rows,
                     claude_args,
+                    sandbox,
                 })
                 .await
                 .is_err()
