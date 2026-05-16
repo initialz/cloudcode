@@ -15,7 +15,12 @@ type Props = {
   agents: AgentItem[];
   loading: boolean;
   cache: AgentWorkspaceCache;
-  openTabKeys: Set<string>; // "agent::workspace" keys that already have a tab
+  /** "agent::workspace" keys that already have a tab — used so a
+   *  second click switches tabs instead of opening a duplicate. */
+  openTabKeys: Set<string>;
+  /** Key of the workspace whose tab is currently in focus (right pane).
+   *  Only this row gets the selected-row background. */
+  activeTabKey: string | null;
   onExpandAgent: (agent: string) => void;
   onOpenWorkspace: (agent: string, workspace: string) => void;
   onResetWorkspace: (agent: string, workspace: string) => void;
@@ -27,6 +32,7 @@ export default function AgentTree({
   loading,
   cache,
   openTabKeys,
+  activeTabKey,
   onExpandAgent,
   onOpenWorkspace,
   onResetWorkspace,
@@ -108,12 +114,12 @@ export default function AgentTree({
                 {wsState.status === 'loaded' &&
                   wsState.items.map((ws) => {
                     const key = `${agent.name}::${ws.name}`;
-                    const isOpen = openTabKeys.has(key);
                     return (
                       <WorkspaceRow
                         key={ws.name}
                         workspace={ws}
-                        isOpen={isOpen}
+                        isLive={openTabKeys.has(key)}
+                        isActive={activeTabKey === key}
                         onOpen={() => onOpenWorkspace(agent.name, ws.name)}
                         onReset={() => onResetWorkspace(agent.name, ws.name)}
                         onDelete={() => onDeleteWorkspace(agent.name, ws.name)}
@@ -131,17 +137,21 @@ export default function AgentTree({
 
 // ── WorkspaceRow ─────────────────────────────────────────────────────────────
 
-function WorkspaceBadge({ ws }: { ws: WorkspaceItem }) {
-  if (ws.has_client) {
+function WorkspaceBadge({ ws, isLive }: { ws: WorkspaceItem; isLive: boolean }) {
+  // Live > active (tracked by an open tab in this UI) takes priority
+  // over hub-reported has_client, so the dot turns green the moment
+  // you click open even before the hub's workspace_list refresh
+  // arrives.
+  if (isLive || ws.has_client) {
     return (
-      <span className="text-[#a80000] font-bold" title="active">
+      <span className="text-emerald-500 font-bold" title="live">
         ●
       </span>
     );
   }
   if (ws.tmux_alive) {
     return (
-      <span className="text-[#a86800]" title="saved">
+      <span className="text-amber-500" title="saved">
         ·
       </span>
     );
@@ -155,13 +165,17 @@ function WorkspaceBadge({ ws }: { ws: WorkspaceItem }) {
 
 function WorkspaceRow({
   workspace,
-  isOpen,
+  isLive,
+  isActive,
   onOpen,
   onReset,
   onDelete,
 }: {
   workspace: WorkspaceItem;
-  isOpen: boolean;
+  /** This workspace has an open tab somewhere (= "live"). */
+  isLive: boolean;
+  /** This workspace's tab is the one currently in the right pane. */
+  isActive: boolean;
   onOpen: () => void;
   onReset: () => void;
   onDelete: () => void;
@@ -169,7 +183,7 @@ function WorkspaceRow({
   return (
     <div
       className={`group flex items-center gap-1 pl-6 pr-1.5 py-0.5 text-xs font-mono cursor-pointer transition-colors ${
-        isOpen
+        isActive
           ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100'
           : 'text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-zinc-900 dark:hover:text-zinc-100'
       }`}
@@ -177,7 +191,7 @@ function WorkspaceRow({
     >
       {/* Status badge — fixed width for alignment */}
       <span className="w-3 text-center shrink-0">
-        <WorkspaceBadge ws={workspace} />
+        <WorkspaceBadge ws={workspace} isLive={isLive} />
       </span>
       <span className="flex-1 truncate">{workspace.name}</span>
 

@@ -12,6 +12,7 @@ type Props = {
   agentsLoading: boolean;
   cache: AgentWorkspaceCache;
   openTabKeys: Set<string>;
+  activeTabKey: string | null;
   onExpandAgent: (agent: string) => void;
   onOpenWorkspace: (agent: string, workspace: string) => void;
   onCreateWorkspace: (agent: string, name: string) => void;
@@ -35,6 +36,7 @@ export default function Sidebar({
   agentsLoading,
   cache,
   openTabKeys,
+  activeTabKey,
   onExpandAgent,
   onOpenWorkspace,
   onCreateWorkspace,
@@ -107,6 +109,7 @@ export default function Sidebar({
             loading={agentsLoading}
             cache={cache}
             openTabKeys={openTabKeys}
+            activeTabKey={activeTabKey}
             onExpandAgent={onExpandAgent}
             onOpenWorkspace={onOpenWorkspace}
             onResetWorkspace={askReset}

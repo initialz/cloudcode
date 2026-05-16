@@ -556,6 +556,8 @@ export default function Workbench() {
   // ── Computed: set of open tab keys ───────────────────────────────────────
 
   const openTabKeys = new Set(tabs.map((t) => tabKey(t.agent, t.workspace)));
+  const activeTab = tabs.find((t) => t.id === activeTabId) ?? null;
+  const activeTabKey = activeTab ? tabKey(activeTab.agent, activeTab.workspace) : null;
 
   // ── Render ────────────────────────────────────────────────────────────────
 
@@ -578,6 +580,7 @@ export default function Workbench() {
         agentsLoading={agentsLoading}
         cache={wsCache}
         openTabKeys={openTabKeys}
+        activeTabKey={activeTabKey}
         onExpandAgent={handleExpandAgent}
         onOpenWorkspace={openTab}
         onCreateWorkspace={handleCreateWorkspace}
