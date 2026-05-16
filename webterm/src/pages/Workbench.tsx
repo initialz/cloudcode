@@ -263,20 +263,50 @@ export default function Workbench() {
     ctrlWsRef.current.send({ type: 'create_workspace', name });
   }
 
+  // The hub holds a per-workspace mutex: as long as some session is
+  // attached it refuses delete/reset with "workspace is currently in
+  // use". For the web UI that means a workspace with an open tab can
+  // never be cleaned up. Close the tab first, let the WS-close
+  // propagate so the hub's mutex clears, then fire the menu-level
+  // request from the control WS.
+  function withTabClosed(
+    agent: string,
+    workspace: string,
+    fire: () => void,
+  ) {
+    const key = tabKey(agent, workspace);
+    const openTab = tabsRef.current.find(
+      (t) => tabKey(t.agent, t.workspace) === key,
+    );
+    if (openTab) {
+      closeTabRef.current(openTab.id);
+      // Empirically the hub releases its workspace mutex once the WS
+      // close handshake completes. 400 ms is a safe budget; if we
+      // see flakiness we can bump it or wait on a real ack.
+      setTimeout(fire, 400);
+    } else {
+      fire();
+    }
+  }
+
   function handleResetWorkspace(agent: string, workspace: string) {
     if (!ctrlWsRef.current?.connected) return;
-    if (ctrlAgentRef.current !== agent) {
-      ctrlWsRef.current.send({ type: 'select_agent', agent });
-    }
-    ctrlWsRef.current.send({ type: 'reset_workspace', name: workspace });
+    withTabClosed(agent, workspace, () => {
+      if (ctrlAgentRef.current !== agent) {
+        ctrlWsRef.current?.send({ type: 'select_agent', agent });
+      }
+      ctrlWsRef.current?.send({ type: 'reset_workspace', name: workspace });
+    });
   }
 
   function handleDeleteWorkspace(agent: string, workspace: string) {
     if (!ctrlWsRef.current?.connected) return;
-    if (ctrlAgentRef.current !== agent) {
-      ctrlWsRef.current.send({ type: 'select_agent', agent });
-    }
-    ctrlWsRef.current.send({ type: 'delete_workspace', name: workspace });
+    withTabClosed(agent, workspace, () => {
+      if (ctrlAgentRef.current !== agent) {
+        ctrlWsRef.current?.send({ type: 'select_agent', agent });
+      }
+      ctrlWsRef.current?.send({ type: 'delete_workspace', name: workspace });
+    });
   }
 
   // ── Open tab ──────────────────────────────────────────────────────────────
