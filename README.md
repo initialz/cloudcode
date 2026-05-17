@@ -12,19 +12,11 @@
 
 - **Native claude TUI, end to end.** No wrapper layer — slash commands, todos, diffs, permission prompts all work because CloudCode forwards raw PTY bytes from `tmux+claude` on the agent.
 - **Persistent workspaces.** Close the laptop, lose Wi-Fi, switch from terminal to phone. tmux + claude keep running on the agent. Reconnect and pick up exactly where you left off, mid-task.
+- **Multi-tool panes.** Run claude and codex side-by-side or stacked in the same workspace via webterm's split UI. Each pane is its own tool, sharing the same project directory.
+- **Browser client too.** Self-hosted SPA at `/app/` — drag-select-to-clipboard, mouse-wheel scrollback, per-user default args saved on the hub. Same backend as the CLI.
 - **macOS Seatbelt sandbox (opt-in).** Each workspace's claude runs sealed off from `~/.ssh`, Keychain, sibling workspaces, and cross-account state. Network stays open.
 - **Self-hosted admin UI.** Single binary, embedded React SPA at `/admin/`. Manage accounts and agents with **two-way strict-whitelist ACL** (per-account agent access, per-agent account access), browse live & historical workspaces, sessions, and audit events.
 - **Credentials stay put.** OAuth tokens never leave the agent host. The client only ever sees terminal bytes.
-
-## Modules
-
-```
-cloudcode         the client — raw-mode PTY pump, runs on the laptop
-cloudcode-agent   runs `tmux` + `claude` per workspace on the host where you logged in
-cloudcode-hub     public-facing gateway + admin UI; bundled SPA
-```
-
-Agent dials out to the hub over WSS (NAT-friendly). Client connects to the hub; hub multiplexes PTY bytes across agents on a per-session uuid frame.
 
 ## Quick start
 
@@ -43,24 +35,13 @@ curl -fsSL https://raw.githubusercontent.com/initialz/cloudcode/main/install.sh 
 cloudcode --init && $EDITOR ~/.config/cloudcode/config.toml && cloudcode
 ```
 
-Open the admin UI at `http://<hub>:7101/admin/`, paste the admin token, grant your account access to the agent, and you're done.
+Open the admin UI at `http://<hub>:7101/admin/`, paste the admin token, grant your account access to the agent, and you're done. The user-facing browser client lives at `http://<hub>:7100/app/`.
 
-## From source
+## Documentation
 
-Needs Rust ≥ 1.74, Node ≥ 20 with `pnpm`, and `tmux` on the agent host.
+→ **[User Guide](docs/USER_GUIDE.md)** — installation in depth, multi-tool setup, web UI walkthrough, CLI menu / persistence rules, macOS sandbox, admin UI, self-update, troubleshooting.
 
-```bash
-git clone https://github.com/initialz/cloudcode.git
-cd cloudcode
-(cd admin-ui && pnpm install && pnpm build)   # bundles the SPA into the hub binary
-cargo build --release --workspace
-```
-
-Then use the binaries under `target/release/` (`cloudcode-hub`, `cloudcode-agent`, `cloudcode`) exactly as you would the curl-installed ones — `--init`, `daemon start`, the same `hub.toml` / `agent.toml`.
-
-## Architecture
-
-[`docs/architecture.svg`](docs/architecture.svg) · [`hub.example.toml`](hub.example.toml) · [`agent.example.toml`](agent.example.toml)
+→ [`docs/architecture.svg`](docs/architecture.svg) · [`hub.example.toml`](hub.example.toml) · [`agent.example.toml`](agent.example.toml)
 
 ## Acknowledgements
 

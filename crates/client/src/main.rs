@@ -186,6 +186,17 @@ pub fn write_last_agent(name: &str) {
     }
 }
 
+/// Remove the saved `last_agent` so the next launch starts on the
+/// top-level agent picker. Called when the user quits the menu from
+/// the agent-picker stage (vs. quitting deeper, e.g. workspace
+/// picker, where preserving the agent is the user-friendlier
+/// default).
+pub fn clear_last_agent() {
+    if let Ok(p) = last_agent_path() {
+        let _ = std::fs::remove_file(&p);
+    }
+}
+
 pub fn read_last_workspace(agent: &str) -> Option<String> {
     read_text_file(&last_workspace_path(agent).ok()?)
 }
@@ -350,7 +361,15 @@ async fn run_chat(
                 // picker, not the top-level agent picker.
                 next_start = menu::MenuStart::WorkspacePicker { agent };
             }
-            menu::MenuOutcome::Quit => {
+            menu::MenuOutcome::Quit { from_agent_picker } => {
+                // Quitting at the agent picker == "I'm done with the
+                // CLI, not just this workspace" — clear the
+                // remembered agent so the next launch lands on the
+                // agent picker again instead of auto-jumping into
+                // the last agent's workspace picker.
+                if from_agent_picker {
+                    clear_last_agent();
+                }
                 let _ = wire.out_tx.send(OutFrame::Text(ClientToHub::Close)).await;
                 return Ok(());
             }

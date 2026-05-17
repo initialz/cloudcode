@@ -26,7 +26,14 @@ use std::io::stdout;
 
 pub enum MenuOutcome {
     OpenWorkspace { agent: String, workspace: String },
-    Quit,
+    /// User quit the menu. `from_agent_picker` is true when the quit
+    /// happened on the stage-1 agent picker (so the caller can clear
+    /// the remembered last_agent and bring the user back to the
+    /// agent picker on the next launch). False means they quit deeper
+    /// in (workspace picker), and the caller should preserve any
+    /// last_agent so a subsequent launch lands on the workspace
+    /// picker for the same agent.
+    Quit { from_agent_picker: bool },
 }
 
 /// How the menu should enter. After claude exits the caller passes
@@ -105,7 +112,7 @@ async fn run_inner<B: ratatui::backend::Backend>(
         } else {
             match pick_agent_stage(term, wire, bytes, keys, account).await? {
                 Some(a) => a,
-                None => return Ok(MenuOutcome::Quit),
+                None => return Ok(MenuOutcome::Quit { from_agent_picker: true }),
             }
         };
 
@@ -151,11 +158,11 @@ async fn run_inner<B: ratatui::backend::Backend>(
                 )
             })?;
             let Some(k) = keys.next(bytes).await else {
-                return Ok(MenuOutcome::Quit);
+                return Ok(MenuOutcome::Quit { from_agent_picker: false });
             };
             match k {
                 MenuKey::Escape => continue 'outer,
-                MenuKey::Char('q') => return Ok(MenuOutcome::Quit),
+                MenuKey::Char('q') => return Ok(MenuOutcome::Quit { from_agent_picker: false }),
                 MenuKey::Char('c') => {
                     if let Some(name) =
                         prompt_input(term, bytes, keys, "create workspace", "").await?
@@ -236,7 +243,7 @@ async fn run_inner<B: ratatui::backend::Backend>(
                             }
                         }
                     }
-                    ListAction::Quit => return Ok(MenuOutcome::Quit),
+                    ListAction::Quit => return Ok(MenuOutcome::Quit { from_agent_picker: false }),
                     ListAction::Pass => {}
                 },
             }

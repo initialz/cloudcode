@@ -708,6 +708,28 @@ where
                 .account_sandbox_enabled(&ctx.account_name)
                 .await
                 .unwrap_or(true);
+            // Merge in webterm-side default args when the client
+            // sent none. webterm already does this on its end before
+            // dispatching OpenSession (so its claude_args is
+            // pre-populated when prefs are set); the CLI client
+            // doesn't have a preferences UI, so we do the merge for
+            // it here. `tool` falls back to "claude" because the
+            // CLI omits it when relying on the agent's configured
+            // default — using webterm's default tool keeps the
+            // common case (user set claude args + CLI without
+            // --tool) doing the right thing. Non-empty CLI args
+            // always win.
+            let claude_args = if claude_args.is_empty() {
+                let lookup_tool = tool.as_deref().unwrap_or("claude");
+                args_from_user_preferences(
+                    &ctx.state.db,
+                    &ctx.account_name,
+                    lookup_tool,
+                )
+                .await
+            } else {
+                claude_args
+            };
             let (evt_tx, mut evt_rx) = mpsc::channel::<PtyEventOut>(PTY_EVENT_QUEUE);
             conn.register_session(session_id, evt_tx);
             if conn
@@ -910,6 +932,37 @@ where
         ClientToHub::Close => false,
         ClientToHub::Hello { .. } | ClientToHub::Pong => true,
     }
+}
+
+/// Read the user's webterm preferences blob for `account` and pull
+/// out the default args for `tool`. The blob is opaque JSON owned by
+/// webterm; we know its current shape is `{tool_args: {<tool>:
+/// [String, ...]}}`. Any deviation (missing row, bad JSON, wrong
+/// shape, unknown tool) maps to an empty argv — matching webterm's
+/// own fall-back behaviour, so a misconfigured row never silently
+/// injects wrong flags into claude/codex.
+async fn args_from_user_preferences(
+    db: &crate::db::Db,
+    account: &str,
+    tool: &str,
+) -> Vec<String> {
+    let Ok(Some(blob)) = db.get_user_preferences(account).await else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&blob) else {
+        return Vec::new();
+    };
+    let Some(arr) = json
+        .get("tool_args")
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get(tool))
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect()
 }
 
 /// Same rule as the agent's `validate_name(_, "tool")` — keep them
