@@ -14,7 +14,7 @@ type Props = {
   openTabKeys: Set<string>;
   activeTabKey: string | null;
   onExpandAgent: (agent: string) => void;
-  onOpenWorkspace: (agent: string, workspace: string) => void;
+  onOpenWorkspace: (agent: string, workspace: string, tool?: string) => void;
   onCreateWorkspace: (agent: string, name: string) => void;
   onResetWorkspace: (agent: string, workspace: string) => void;
   onDeleteWorkspace: (agent: string, workspace: string) => void;

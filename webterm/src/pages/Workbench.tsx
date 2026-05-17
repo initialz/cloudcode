@@ -21,9 +21,19 @@ import {
   WireSocket,
   type AgentItem,
   type HubMsg,
+  type PaneLayout,
+  type SplitDirection,
 } from '@/lib/wire';
 import { effectiveTheme, getStoredTheme, type Theme } from '@/lib/theme';
 import { type Tab, tabKey } from '@/lib/tabs';
+import {
+  DEFAULT_PREFERENCES,
+  parsePreferences,
+  serializePreferences,
+  type Preferences,
+} from '@/lib/preferences';
+import type { Tool } from '@/lib/tools';
+import { DEFAULT_TOOL, KNOWN_TOOLS } from '@/lib/tools';
 import Sidebar from '@/components/Sidebar';
 import TabBar from '@/components/TabBar';
 import SettingsDialog from '@/components/SettingsDialog';
@@ -93,6 +103,29 @@ export default function Workbench() {
   // Settings dialog
   const [showSettings, setShowSettings] = useState(false);
 
+  // Per-user preferences (default args per tool, future things). Loaded
+  // from the hub on mount; kept in a ref so non-reactive callbacks
+  // (handleTabMsg, handleSplit) see fresh values without re-binding.
+  const [preferences, setPreferences] = useState<Preferences>(DEFAULT_PREFERENCES);
+  const preferencesRef = useRef<Preferences>(preferences);
+  preferencesRef.current = preferences;
+
+  // Transient error toasts (e.g. split-pane failures). SessionError is a
+  // non-fatal hub event by design, so we surface it inline instead of
+  // tearing down the user's tab.
+  type Toast = { id: string; message: string };
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const addToast = useCallback((message: string) => {
+    const id = crypto.randomUUID();
+    setToasts((prev) => [...prev, { id, message }]);
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 6000);
+  }, []);
+  const dismissToast = useCallback((id: string) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
+
   // Refresh timer ref (30s poll)
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -100,6 +133,13 @@ export default function Workbench() {
   // purpose — touching them during a ref callback must NOT trigger
   // a re-render, or the inline ref creates an infinite loop.
   const containersRef = useRef<Map<string, HTMLDivElement>>(new Map());
+
+  // Per-tab "tmux is sitting in copy-mode with a live selection"
+  // flag, used by the Cmd+C bridge. Lives outside React state
+  // because the tabs reducer rebuilds tab objects on every UPDATE
+  // (e.g. status transitions), which would otherwise discard a
+  // mutation we just made on the old tab reference.
+  const copyModeRef = useRef<Map<string, boolean>>(new Map());
 
   // ── Auth check ─────────────────────────────────────────────────────────────
 
@@ -114,6 +154,32 @@ export default function Workbench() {
         navigate('/login', { replace: true });
       });
   }, [navigate]);
+
+  // ── Preferences load ─────────────────────────────────────────────────────
+  // Fire-and-forget once we know the user is authed. Failures are
+  // non-fatal: webterm just keeps the in-memory defaults until the user
+  // either retries or saves.
+
+  useEffect(() => {
+    if (authLoading) return;
+    apiClient
+      .getPreferences()
+      .then((resp) => setPreferences(parsePreferences(resp.preferences)))
+      .catch(() => {
+        // Network blip on first paint — stick with defaults so the
+        // session-open flow keeps working.
+      });
+  }, [authLoading]);
+
+  const savePreferences = useCallback(async (next: Preferences) => {
+    setPreferences(next);
+    try {
+      await apiClient.putPreferences(serializePreferences(next));
+    } catch {
+      addToast('Could not save preferences — your change applies to this tab but did not persist.');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // ── Control WS helpers ─────────────────────────────────────────────────────
 
@@ -312,8 +378,8 @@ export default function Workbench() {
   // ── Open tab ──────────────────────────────────────────────────────────────
 
   const openTab = useCallback(
-    (agent: string, workspace: string) => {
-      // Deduplicate
+    (agent: string, workspace: string, tool?: string) => {
+      // Deduplicate by agent::workspace (tab is reused regardless of tool)
       const key = tabKey(agent, workspace);
       const existing = tabsRef.current.find(
         (t) => tabKey(t.agent, t.workspace) === key,
@@ -336,10 +402,50 @@ export default function Workbench() {
       term.loadAddon(fitAddon);
       term.loadAddon(linksAddon);
 
+      // OSC 52 clipboard write. tmux (with `set -g set-clipboard on`)
+      // emits this escape on every drag-select copy: `OSC 52 ; c ;
+      // <base64-text> BEL`. Without a handler xterm.js drops it on the
+      // floor for security. We accept it and forward to the system
+      // clipboard so users get drag-select → release → ready-to-paste
+      // without needing Shift overrides or modal "copy mode" toggles.
+      // Only the `c` (clipboard) target is honoured; the `p` (primary
+      // selection) variant is X11-specific and not useful in a browser.
+      term.parser.registerOscHandler(52, (data) => {
+        const sep = data.indexOf(';');
+        if (sep < 0) return false;
+        const targets = data.substring(0, sep);
+        const payload = data.substring(sep + 1);
+        // Empty `targets` means "default = clipboard"; otherwise we
+        // accept any string that includes `c` (clipboard target).
+        if (targets !== '' && !targets.includes('c')) return false;
+        let text: string;
+        try {
+          // Two-step decode: atob gives back a Latin-1 "binary string"
+          // where each JS char carries one byte. For multi-byte UTF-8
+          // (e.g. CJK) we have to re-interpret those bytes as UTF-8 or
+          // the clipboard ends up holding mojibake.
+          const binary = atob(payload);
+          const bytes = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i++) {
+            bytes[i] = binary.charCodeAt(i);
+          }
+          text = new TextDecoder('utf-8').decode(bytes);
+        } catch {
+          return false;
+        }
+        // navigator.clipboard.writeText is async + needs a "transient
+        // user activation" window; mouse-up is one, and OSC 52 arrives
+        // microseconds later so the activation is still live. Failures
+        // (e.g. http page on a non-localhost host) are silent — we
+        // don't want a toast or console spam on every selection.
+        navigator.clipboard.writeText(text).catch(() => {});
+        return true;
+      });
+
       const id = crypto.randomUUID();
 
       const ws = new WireSocket({
-        onMessage: (msg) => handleTabMsg(id, agent, workspace, msg),
+        onMessage: (msg) => handleTabMsg(id, agent, workspace, tool, msg),
         onBinary: (data) => {
           const tab = tabsRef.current.find((t) => t.id === id);
           tab?.term.write(data);
@@ -370,12 +476,39 @@ export default function Workbench() {
         id,
         agent,
         workspace,
+        tool,
         status: 'connecting',
         ws,
         term,
         fitAddon,
         opened: false,
       };
+
+      // Cmd+C bridge: when we believe tmux is sitting in copy-mode
+      // with an active selection (set by the mouse listeners in
+      // attachContainer), pressing Cmd+C sends 'y' to the PTY. tmux's
+      // conf binds 'y' to copy-pipe-and-cancel with an OSC 52 emit,
+      // which our parser handler then writes to the system clipboard.
+      // When the tracking flag is false we let xterm.js's own
+      // Cmd+C handling run, so plain text inside an xterm-native
+      // selection (rare in this setup) still copies.
+      term.attachCustomKeyEventHandler((ev) => {
+        if (ev.type !== 'keydown') return true;
+        const isCmdC =
+          ev.metaKey &&
+          !ev.ctrlKey &&
+          !ev.shiftKey &&
+          !ev.altKey &&
+          ev.key.toLowerCase() === 'c';
+        if (!isCmdC) return true;
+        if (copyModeRef.current.get(id) !== true) return true;
+        const me = tabsRef.current.find((t) => t.id === id);
+        if (me?.ws.connected) {
+          me.ws.sendBinary(new TextEncoder().encode('y'));
+        }
+        copyModeRef.current.set(id, false);
+        return false;
+      });
 
       dispatchTabs({ type: 'ADD', tab: newTab });
       setActiveTabId(id);
@@ -385,12 +518,38 @@ export default function Workbench() {
     [],
   );
 
+  // ── Split pane ────────────────────────────────────────────────────────────
+
+  const handleSplit = useCallback(
+    (tabId: string, tool: string, direction: SplitDirection) => {
+      const tab = tabsRef.current.find((t) => t.id === tabId);
+      if (!tab?.ws.connected) return;
+      const args = (KNOWN_TOOLS as readonly string[]).includes(tool)
+        ? preferencesRef.current.toolArgs[tool as Tool]
+        : [];
+      tab.ws.send({
+        type: 'split_pane',
+        tool,
+        direction,
+        ...(args.length > 0 ? { args } : {}),
+      });
+    },
+    [],
+  );
+
+  const handleChangeLayout = useCallback((tabId: string, layout: PaneLayout) => {
+    const tab = tabsRef.current.find((t) => t.id === tabId);
+    if (!tab?.ws.connected) return;
+    tab.ws.send({ type: 'change_layout', layout });
+  }, []);
+
   // ── PTY WS message handler (per tab) ──────────────────────────────────────
 
   function handleTabMsg(
     tabId: string,
     agent: string,
     workspace: string,
+    tool: string | undefined,
     msg: HubMsg,
   ) {
     switch (msg.type) {
@@ -417,7 +576,27 @@ export default function Workbench() {
             // container not yet measured, fall back to defaults
           }
         }
-        tab.ws.send({ type: 'open_session', workspace, cols, rows });
+        // Per-user default args, looked up by tool. When the user
+        // opened the workspace without an explicit tool we fall back
+        // to webterm's own DEFAULT_TOOL so their args still apply —
+        // matching the user-visible "click Open == start claude"
+        // expectation. If the agent's configured default happens to
+        // be a different tool, the args ride along anyway; explicit
+        // "Open with X" remains the unambiguous path.
+        const effectiveTool: Tool =
+          tool && (KNOWN_TOOLS as readonly string[]).includes(tool)
+            ? (tool as Tool)
+            : DEFAULT_TOOL;
+        const args = preferencesRef.current.toolArgs[effectiveTool];
+        const openMsg: Parameters<typeof tab.ws.send>[0] = {
+          type: 'open_session',
+          workspace,
+          cols,
+          rows,
+          ...(tool ? { tool } : {}),
+          ...(args.length > 0 ? { claude_args: args } : {}),
+        };
+        tab.ws.send(openMsg);
         break;
       }
       case 'session_opened': {
@@ -443,11 +622,20 @@ export default function Workbench() {
         break;
       }
       case 'session_error':
+        // SessionError is non-fatal by protocol contract (see
+        // crates/hub/src/pty_proto.rs). Surface the message as a
+        // toast and leave the tab + underlying claude session intact —
+        // closing the tab here would discard a live conversation just
+        // because Split with codex (or similar) failed.
+        addToast(msg.message || 'Session error');
+        if (ctrlAgentRef.current === agent) {
+          ctrlWsRef.current?.send({ type: 'list_workspaces' });
+        }
+        break;
       case 'session_closed':
-        // claude exited (/exit, Ctrl+C, crash) or the open failed —
-        // collapse the tab immediately so the user doesn't have to
-        // click ✕. The sidebar's status dot tracks the workspace
-        // separately.
+        // claude exited (/exit, Ctrl+C, crash) — collapse the tab so
+        // the user doesn't have to click ✕. The sidebar's status dot
+        // tracks the workspace separately.
         if (ctrlAgentRef.current === agent) {
           ctrlWsRef.current?.send({ type: 'list_workspaces' });
         }
@@ -535,6 +723,46 @@ export default function Workbench() {
       } catch {
         // StrictMode double-mount — already opened
       }
+
+      // Track whether tmux is currently sitting in copy-mode with a
+      // live selection. Set after a drag-with-movement mouseup;
+      // cleared on any plain mousedown (which also fires tmux's
+      // MouseDown-in-copy-mode → cancel binding) or after a Cmd+C
+      // bridges through to tmux. Capture phase so we see the events
+      // before xterm.js forwards them upstream. The state lives in
+      // copyModeRef (Map<tabId, bool>), not on the Tab object,
+      // because the tabs reducer rebuilds Tab references on every
+      // UPDATE and would otherwise discard our mutation.
+      let downX = 0;
+      let downY = 0;
+      let movedDuringDrag = false;
+      el.addEventListener(
+        'mousedown',
+        (ev) => {
+          downX = ev.clientX;
+          downY = ev.clientY;
+          movedDuringDrag = false;
+          copyModeRef.current.set(tabId, false);
+        },
+        true,
+      );
+      el.addEventListener(
+        'mousemove',
+        (ev) => {
+          if (!(ev.buttons & 1)) return;
+          if (Math.abs(ev.clientX - downX) > 4 || Math.abs(ev.clientY - downY) > 4) {
+            movedDuringDrag = true;
+          }
+        },
+        true,
+      );
+      el.addEventListener(
+        'mouseup',
+        () => {
+          if (movedDuringDrag) copyModeRef.current.set(tabId, true);
+        },
+        true,
+      );
     },
     [],
   );
@@ -628,6 +856,8 @@ export default function Workbench() {
           activeTabId={activeTabId}
           onSelect={selectTab}
           onClose={closeTab}
+          onSplit={handleSplit}
+          onChangeLayout={handleChangeLayout}
         />
 
         {/* Terminal containers — all rendered, visibility toggled via class */}
@@ -675,7 +905,34 @@ export default function Workbench() {
         <SettingsDialog
           onClose={() => setShowSettings(false)}
           onThemeChange={handleThemeChange}
+          preferences={preferences}
+          onSavePreferences={savePreferences}
         />
+      )}
+
+      {/* Transient error toasts (non-fatal SessionError frames) */}
+      {toasts.length > 0 && (
+        <div className="pointer-events-none fixed bottom-4 right-4 z-50 flex max-w-md flex-col gap-2">
+          {toasts.map((t) => (
+            <div
+              key={t.id}
+              className="pointer-events-auto flex items-start gap-2 rounded-md border border-red-200 dark:border-red-900 bg-red-50 dark:bg-red-950 px-3 py-2 text-xs font-mono text-red-700 dark:text-red-300 shadow-lg"
+              role="alert"
+            >
+              <span className="flex-1 break-words">{t.message}</span>
+              <button
+                type="button"
+                onClick={() => dismissToast(t.id)}
+                className="shrink-0 rounded p-0.5 opacity-60 hover:opacity-100 hover:bg-red-100 dark:hover:bg-red-900"
+                aria-label="Dismiss"
+              >
+                <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+                  <path d="M2 2L8 8M8 2L2 8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+                </svg>
+              </button>
+            </div>
+          ))}
+        </div>
       )}
     </div>
   );

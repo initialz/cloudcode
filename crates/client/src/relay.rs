@@ -15,6 +15,30 @@ use tokio::sync::mpsc;
 
 pub async fn run(wire: &mut Wire, bytes: &mut ByteRx) -> Result<()> {
     enable_raw_mode()?;
+    // Wipe the main screen + scrollback FIRST, then enter alt-screen
+    // and clear it. Background: claude (v2.x) dumps its chat UI to
+    // main-screen scrollback when it exits, so by the time a new
+    // cloudcode invocation enters alt-screen the previous session's
+    // chat is sitting just above in the local terminal's scrollback.
+    // iTerm2's default config keeps that scrollback visible behind
+    // alt-screen, so the user perceives the old chat "stacked on top
+    // of" the new one. Clearing main + scrollback before entering
+    // alt-screen is the only escape-only way to make the duplicate
+    // go away — the cost is the few lines of shell history above
+    // where the user typed `cloudcode`, which is an acceptable
+    // trade for a full-screen TUI client.
+    //
+    //   [H      — cursor to top-left of main screen
+    //   [2J     — erase the visible main-screen viewport
+    //   [3J     — erase saved scrollback lines (xterm/iTerm/kitty)
+    //   ?1049h  — switch to alt-screen, save cursor, clear it
+    //   [H      — cursor home in alt-screen
+    //   [2J     — defensive re-clear in case ?1049h didn't
+    {
+        let mut stdout = std::io::stdout();
+        let _ = stdout.write_all(b"\x1b[H\x1b[2J\x1b[3J\x1b[?1049h\x1b[H\x1b[2J");
+        let _ = stdout.flush();
+    }
     let result = relay_loop(wire, bytes).await;
     disable_raw_mode().ok();
     let mut stdout = std::io::stdout();

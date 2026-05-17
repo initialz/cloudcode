@@ -3,6 +3,7 @@
 
 import { useState, useEffect } from 'react';
 import type { AgentItem, WorkspaceItem } from '@/lib/wire';
+import { KNOWN_TOOLS } from '@/lib/tools';
 
 type WorkspaceState =
   | { status: 'idle' }
@@ -22,13 +23,16 @@ type Props = {
    *  Only this row gets the selected-row background. */
   activeTabKey: string | null;
   onExpandAgent: (agent: string) => void;
-  onOpenWorkspace: (agent: string, workspace: string) => void;
+  onOpenWorkspace: (agent: string, workspace: string, tool?: string) => void;
   onResetWorkspace: (agent: string, workspace: string) => void;
   onDeleteWorkspace: (agent: string, workspace: string) => void;
   /** Triggered by the right-click context menu on an agent row,
    *  pre-filling the "create workspace" dialog with this agent. */
   onCreateWorkspaceFor: (agent: string) => void;
 };
+
+type AgentMenu = { x: number; y: number; agent: string };
+type WorkspaceMenu = { x: number; y: number; agent: string; workspace: string };
 
 export default function AgentTree({
   agents,
@@ -43,20 +47,30 @@ export default function AgentTree({
   onCreateWorkspaceFor,
 }: Props) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  const [menu, setMenu] = useState<{ x: number; y: number; agent: string } | null>(null);
+  const [agentMenu, setAgentMenu] = useState<AgentMenu | null>(null);
+  const [wsMenu, setWsMenu] = useState<WorkspaceMenu | null>(null);
 
-  // Close the context menu on Escape.
+  const hasAnyMenu = agentMenu !== null || wsMenu !== null;
+
+  // Close menus on Escape.
   useEffect(() => {
-    if (!menu) return;
+    if (!hasAnyMenu) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setMenu(null);
+      if (e.key === 'Escape') {
+        setAgentMenu(null);
+        setWsMenu(null);
+      }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [menu]);
+  }, [hasAnyMenu]);
 
-  function toggleAgent(name: string, online: boolean) {
-    if (!online) return;
+  function closeAllMenus() {
+    setAgentMenu(null);
+    setWsMenu(null);
+  }
+
+  function toggleAgent(name: string) {
     const next = new Set(expanded);
     if (next.has(name)) {
       next.delete(name);
@@ -85,32 +99,81 @@ export default function AgentTree({
 
   return (
     <div className="flex-1 overflow-y-auto relative">
-      {menu && (
-        <>
-          {/* invisible backdrop: any click outside / right-click closes */}
-          <div
-            className="fixed inset-0 z-40"
-            onClick={() => setMenu(null)}
-            onContextMenu={(e) => { e.preventDefault(); setMenu(null); }}
-          />
-          <div
-            className="fixed z-50 min-w-[10rem] bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-md shadow-lg py-1 text-xs font-mono"
-            style={{ left: menu.x, top: menu.y }}
+      {/* Global backdrop for all context menus */}
+      {hasAnyMenu && (
+        <div
+          className="fixed inset-0 z-40"
+          onClick={closeAllMenus}
+          onContextMenu={(e) => { e.preventDefault(); closeAllMenus(); }}
+        />
+      )}
+
+      {/* Agent right-click context menu */}
+      {agentMenu && (
+        <div
+          className="fixed z-50 min-w-[10rem] bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-md shadow-lg py-1 text-xs font-mono"
+          style={{ left: agentMenu.x, top: agentMenu.y }}
+        >
+          <button
+            type="button"
+            onClick={() => {
+              const a = agentMenu.agent;
+              closeAllMenus();
+              onCreateWorkspaceFor(a);
+            }}
+            className="block w-full text-left px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200"
           >
+            Create workspace…
+          </button>
+        </div>
+      )}
+
+      {/* Workspace right-click context menu */}
+      {wsMenu && (
+        <div
+          className="fixed z-50 min-w-[10rem] bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-md shadow-lg py-1 text-xs font-mono"
+          style={{ left: wsMenu.x, top: wsMenu.y }}
+        >
+          {KNOWN_TOOLS.map((tool) => (
             <button
+              key={tool}
               type="button"
               onClick={() => {
-                const a = menu.agent;
-                setMenu(null);
-                onCreateWorkspaceFor(a);
+                const { agent, workspace } = wsMenu;
+                closeAllMenus();
+                onOpenWorkspace(agent, workspace, tool);
               }}
               className="block w-full text-left px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200"
             >
-              Create workspace…
+              Open with {tool}
             </button>
-          </div>
-        </>
+          ))}
+          <div className="my-1 border-t border-zinc-200 dark:border-zinc-700" />
+          <button
+            type="button"
+            onClick={() => {
+              const { agent, workspace } = wsMenu;
+              closeAllMenus();
+              onResetWorkspace(agent, workspace);
+            }}
+            className="block w-full text-left px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200"
+          >
+            Reset
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              const { agent, workspace } = wsMenu;
+              closeAllMenus();
+              onDeleteWorkspace(agent, workspace);
+            }}
+            className="block w-full text-left px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-red-600 dark:text-red-400"
+          >
+            Delete
+          </button>
+        </div>
       )}
+
       {agents.map((agent) => {
         const isExpanded = expanded.has(agent.name);
         const wsState: WorkspaceState = cache.get(agent.name) ?? { status: 'idle' };
@@ -120,15 +183,16 @@ export default function AgentTree({
             {/* Agent row */}
             <button
               type="button"
-              onClick={() => toggleAgent(agent.name, agent.current !== undefined ? true : true)}
+              onClick={() => toggleAgent(agent.name)}
               onContextMenu={(e) => {
                 e.preventDefault();
-                setMenu({ x: e.clientX, y: e.clientY, agent: agent.name });
+                closeAllMenus();
+                setAgentMenu({ x: e.clientX, y: e.clientY, agent: agent.name });
               }}
               className={`w-full flex items-center gap-1.5 px-2 py-1 text-left text-xs font-mono transition-colors ${
                 agent.current === false
                   ? 'text-zinc-400 dark:text-zinc-600 cursor-default'
-                  : menu?.agent === agent.name
+                  : agentMenu?.agent === agent.name
                     ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100'
                     : 'text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800'
               }`}
@@ -168,8 +232,13 @@ export default function AgentTree({
                         isLive={openTabKeys.has(key)}
                         isActive={activeTabKey === key}
                         onOpen={() => onOpenWorkspace(agent.name, ws.name)}
+                        onOpenWithTool={(tool) => onOpenWorkspace(agent.name, ws.name, tool)}
                         onReset={() => onResetWorkspace(agent.name, ws.name)}
                         onDelete={() => onDeleteWorkspace(agent.name, ws.name)}
+                        onContextMenu={(x, y) => {
+                          closeAllMenus();
+                          setWsMenu({ x, y, agent: agent.name, workspace: ws.name });
+                        }}
                       />
                     );
                   })}
@@ -215,8 +284,10 @@ function WorkspaceRow({
   isLive,
   isActive,
   onOpen,
+  onOpenWithTool,
   onReset,
   onDelete,
+  onContextMenu,
 }: {
   workspace: WorkspaceItem;
   /** This workspace has an open tab somewhere (= "live"). */
@@ -224,56 +295,135 @@ function WorkspaceRow({
   /** This workspace's tab is the one currently in the right pane. */
   isActive: boolean;
   onOpen: () => void;
+  onOpenWithTool: (tool: string) => void;
   onReset: () => void;
   onDelete: () => void;
+  onContextMenu: (x: number, y: number) => void;
 }) {
-  return (
-    <div
-      className={`group flex items-center gap-1 pl-6 pr-1.5 py-0.5 text-xs font-mono cursor-pointer transition-colors ${
-        isActive
-          ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100'
-          : 'text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-zinc-900 dark:hover:text-zinc-100'
-      }`}
-      onClick={onOpen}
-    >
-      {/* Status badge — fixed width for alignment */}
-      <span className="w-3 text-center shrink-0">
-        <WorkspaceBadge ws={workspace} isLive={isLive} />
-      </span>
-      <span className="flex-1 truncate">{workspace.name}</span>
+  const [dropdownOpen, setDropdownOpen] = useState(false);
+  const [dropdownPos, setDropdownPos] = useState<{ x: number; y: number } | null>(null);
 
-      {/* Action buttons — hover-visible */}
-      <span className="shrink-0 flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onReset();
-          }}
-          className="p-0.5 rounded text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors"
-          title={`Reset ${workspace.name}`}
-          aria-label={`Reset workspace ${workspace.name}`}
-        >
-          <ResetIcon />
-        </button>
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onDelete();
-          }}
-          className="p-0.5 rounded text-zinc-400 hover:text-red-600 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40 transition-colors"
-          title={`Delete ${workspace.name}`}
-          aria-label={`Delete workspace ${workspace.name}`}
-        >
-          <TrashIcon />
-        </button>
-      </span>
-    </div>
+  function handleChevronClick(e: React.MouseEvent) {
+    e.stopPropagation();
+    if (dropdownOpen) {
+      setDropdownOpen(false);
+      setDropdownPos(null);
+    } else {
+      setDropdownPos({ x: e.clientX, y: e.clientY });
+      setDropdownOpen(true);
+    }
+  }
+
+  return (
+    <>
+      {/* Inline dropdown (hover chevron) */}
+      {dropdownOpen && dropdownPos && (
+        <>
+          <div
+            className="fixed inset-0 z-40"
+            onClick={() => { setDropdownOpen(false); setDropdownPos(null); }}
+            onContextMenu={(e) => { e.preventDefault(); setDropdownOpen(false); setDropdownPos(null); }}
+          />
+          <div
+            className="fixed z-50 min-w-[10rem] bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-md shadow-lg py-1 text-xs font-mono"
+            style={{ left: dropdownPos.x, top: dropdownPos.y }}
+          >
+            {KNOWN_TOOLS.map((tool) => (
+              <button
+                key={tool}
+                type="button"
+                onClick={() => {
+                  setDropdownOpen(false);
+                  setDropdownPos(null);
+                  onOpenWithTool(tool);
+                }}
+                className="block w-full text-left px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200"
+              >
+                Open with {tool}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+
+      <div
+        className={`group flex items-center gap-1 pl-6 pr-1.5 py-0.5 text-xs font-mono cursor-pointer transition-colors ${
+          isActive
+            ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100'
+            : 'text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-zinc-900 dark:hover:text-zinc-100'
+        }`}
+        onClick={onOpen}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          onContextMenu(e.clientX, e.clientY);
+        }}
+      >
+        {/* Status badge — fixed width for alignment */}
+        <span className="w-3 text-center shrink-0">
+          <WorkspaceBadge ws={workspace} isLive={isLive} />
+        </span>
+        <span className="flex-1 truncate">{workspace.name}</span>
+
+        {/* Action buttons — hover-visible */}
+        <span className="shrink-0 flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+          {/* Tool selector chevron */}
+          <button
+            onClick={handleChevronClick}
+            className="p-0.5 rounded text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors"
+            title="Open with tool..."
+            aria-label={`Open ${workspace.name} with specific tool`}
+          >
+            <ChevronDownIcon />
+          </button>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onReset();
+            }}
+            className="p-0.5 rounded text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors"
+            title={`Reset ${workspace.name}`}
+            aria-label={`Reset workspace ${workspace.name}`}
+          >
+            <ResetIcon />
+          </button>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onDelete();
+            }}
+            className="p-0.5 rounded text-zinc-400 hover:text-red-600 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40 transition-colors"
+            title={`Delete ${workspace.name}`}
+            aria-label={`Delete workspace ${workspace.name}`}
+          >
+            <TrashIcon />
+          </button>
+        </span>
+      </div>
+    </>
   );
 }
 
 // ── Icons ────────────────────────────────────────────────────────────────────
 // Inline so they inherit currentColor and don't need a separate
 // icon-pack dependency. Sized to sit on a one-line tree row.
+
+function ChevronDownIcon() {
+  return (
+    <svg
+      width="12"
+      height="12"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <path d="M6 9l6 6 6-6" />
+    </svg>
+  );
+}
 
 function ResetIcon() {
   // Lucide-style rotate-ccw: the arc has a real gap before its ends,

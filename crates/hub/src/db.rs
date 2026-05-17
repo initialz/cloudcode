@@ -144,6 +144,15 @@ impl Db {
                 key   TEXT PRIMARY KEY,
                 value TEXT
             )",
+            // Per-account opaque JSON blob holding webterm UI preferences
+            // (default args per tool, future things). The hub does not
+            // interpret `data`; webterm owns the schema and migrates the
+            // blob in code as it evolves. One row per account.
+            "CREATE TABLE IF NOT EXISTS user_preferences (
+                account    TEXT PRIMARY KEY,
+                data       TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )",
             // Compat for deployments that already ran the unguarded
             // seed (pre-v1.8.x): if the ACL table is non-empty, assume
             // the seed has logically happened and lock the marker in,
@@ -825,6 +834,37 @@ impl Db {
         if let Err(e) = res {
             tracing::debug!(error = %e, "session end update failed");
         }
+    }
+
+    // ---- user preferences (opaque JSON blob per account) --------------
+
+    /// Returns the raw JSON blob the webterm last stored for this
+    /// account, or `None` if the account has never saved preferences.
+    /// The hub does not parse `data` — webterm owns the schema.
+    pub async fn get_user_preferences(&self, account: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT data FROM user_preferences WHERE account = ?1")
+            .bind(account)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get::<String, _>("data")))
+    }
+
+    /// Upsert the per-account preferences blob. `data` must be valid
+    /// JSON; this method does not validate (the API handler does).
+    pub async fn set_user_preferences(&self, account: &str, data: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO user_preferences (account, data, updated_at)
+                  VALUES (?1, ?2, ?3)
+             ON CONFLICT(account) DO UPDATE
+                SET data = excluded.data,
+                    updated_at = excluded.updated_at",
+        )
+        .bind(account)
+        .bind(data)
+        .bind(chrono::Utc::now().timestamp())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }
 

@@ -45,6 +45,28 @@ pub enum ClientToHub {
         rows: u16,
         #[serde(default)]
         claude_args: Vec<String>,
+        /// Which tool to launch in the first pane (claude / codex / …).
+        /// `None` -> let the agent pick its default. New in v1.10.
+        #[serde(default)]
+        tool: Option<String>,
+    },
+    /// In-session: split an extra tmux pane in the current session
+    /// running `tool` (e.g. "codex") with optional extra args.
+    /// Requires an active session. New in v1.10.
+    SplitPane {
+        tool: String,
+        /// Where the new pane lands relative to the current one. Defaults
+        /// to `Down` so older webterm builds without this field keep tmux's
+        /// historical behaviour (split vertically, new pane below).
+        #[serde(default)]
+        direction: SplitDirection,
+        #[serde(default)]
+        args: Vec<String>,
+    },
+    /// In-session: re-arrange every pane in the active session into one
+    /// of tmux's preset layouts. No-op if only one pane is alive.
+    ChangeLayout {
+        layout: PaneLayout,
     },
     /// In-session: terminal-size change (SIGWINCH).
     Resize {
@@ -104,6 +126,32 @@ pub enum HubToClient {
         message: String,
     },
     Ping,
+}
+
+/// Where a SplitPane lands relative to the active pane.
+///
+/// - `Right`: vertical divider, new pane appears to the right (tmux `-h`).
+/// - `Down`:  horizontal divider, new pane appears below       (tmux `-v`).
+///
+/// `Down` is the default to match tmux's own default split behaviour, so
+/// older clients that don't send `direction` keep working.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SplitDirection {
+    Right,
+    #[default]
+    Down,
+}
+
+/// Whole-session pane arrangement, applied via `tmux select-layout`.
+///
+/// - `SideBySide` -> `even-horizontal` (panes in a row).
+/// - `Stacked`    -> `even-vertical`   (panes in a column).
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneLayout {
+    SideBySide,
+    Stacked,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

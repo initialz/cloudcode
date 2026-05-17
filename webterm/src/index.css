@@ -29,3 +29,16 @@ body {
 .xterm-host .xterm {
   height: 100%;
 }
+
+/* I-beam cursor over the terminal so the area reads as "selectable
+   text" — covers both the chat output and the bottom input region.
+   We target xterm.js's own classes (the SPA wrapper div has no
+   xterm-host class despite the names above). !important wins against
+   xterm.js's inline style in mouse-tracking mode. */
+.xterm,
+.xterm .xterm-screen,
+.xterm .xterm-screen canvas,
+.xterm .xterm-rows,
+.xterm .xterm-helper-textarea {
+  cursor: text !important;
+}

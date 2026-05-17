@@ -10,6 +10,8 @@ export type Tab = {
   id: string;
   agent: string;
   workspace: string;
+  /** Tool used when opening the session (e.g. 'claude', 'codex'). */
+  tool?: string;
   status: TabStatus;
   errorMsg?: string;
   ws: WireSocket;
@@ -27,6 +29,9 @@ export function tabKey(agent: string, workspace: string): string {
 }
 
 /** Human-readable label shown in the tab bar. */
-export function tabLabel(tab: Pick<Tab, 'agent' | 'workspace'>): string {
+export function tabLabel(tab: Pick<Tab, 'agent' | 'workspace' | 'tool'>): string {
+  if (tab.tool) {
+    return `${tab.agent}·${tab.workspace}·${tab.tool}`;
+  }
   return `${tab.agent}·${tab.workspace}`;
 }

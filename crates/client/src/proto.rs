@@ -47,6 +47,11 @@ pub enum ClientToHub {
         rows: u16,
         #[serde(default)]
         claude_args: Vec<String>,
+        /// Which tool to run inside the workspace (claude / codex / ...).
+        /// None lets the agent fall back to its configured default
+        /// (`[tools].default` in agent.toml).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool: Option<String>,
     },
     /// In-session: terminal-size change (SIGWINCH).
     Resize {

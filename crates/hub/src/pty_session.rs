@@ -14,9 +14,14 @@
 use crate::app::{self, USER_SESSION_COOKIE};
 use crate::audit::AuditEvent;
 use crate::auth;
-use crate::pty_proto::{AgentInfo, ClientToHub, HubToClient};
+use crate::pty_proto::{
+    AgentInfo, ClientToHub, HubToClient, PaneLayout as ClientPaneLayout,
+    SplitDirection as ClientSplitDir,
+};
 use crate::registry::{AgentConn, PtyEventOut};
-use crate::tunnel::{ClientMsg, ServerMsg};
+use crate::tunnel::{
+    ClientMsg, PaneLayout as AgentPaneLayout, ServerMsg, SplitDirection as AgentSplitDir,
+};
 use crate::AppState;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -653,6 +658,7 @@ where
             cols,
             rows,
             claude_args,
+            tool,
         } => {
             if ctx.active.is_some() {
                 let _ = send_client(
@@ -713,6 +719,7 @@ where
                     rows,
                     claude_args,
                     sandbox,
+                    tool,
                 })
                 .await
                 .is_err()
@@ -807,9 +814,113 @@ where
             }
             true
         }
+        ClientToHub::SplitPane {
+            tool,
+            direction,
+            args,
+        } => {
+            // Split adds another tmux pane *to the active session*; it
+            // requires both an agent and an open session to be in scope.
+            let (Some(conn), Some(active)) = (ctx.selected_agent.as_ref(), ctx.active.as_ref())
+            else {
+                let _ = send_client(
+                    sink,
+                    &HubToClient::SessionError {
+                        message: "no active session to split".into(),
+                    },
+                )
+                .await;
+                return true;
+            };
+            if !valid_tool_name(&tool) {
+                let _ = send_client(
+                    sink,
+                    &HubToClient::SessionError {
+                        message: format!("invalid tool name '{}'", tool),
+                    },
+                )
+                .await;
+                return true;
+            }
+            // Fire-and-forget. The agent will reply with a
+            // SplitPaneResult on the same session_id; the
+            // session-event arm of this loop turns errors into
+            // SessionError frames for the client. Success is silent —
+            // the new pane's output already streams through the
+            // existing PTY tap.
+            let direction = match direction {
+                ClientSplitDir::Right => AgentSplitDir::Right,
+                ClientSplitDir::Down => AgentSplitDir::Down,
+            };
+            if conn
+                .send(ServerMsg::SplitPane {
+                    session_id: active.session_id,
+                    tool,
+                    direction,
+                    args,
+                })
+                .await
+                .is_err()
+            {
+                let _ = send_client(
+                    sink,
+                    &HubToClient::SessionError {
+                        message: "agent disconnected".into(),
+                    },
+                )
+                .await;
+            }
+            true
+        }
+        ClientToHub::ChangeLayout { layout } => {
+            // Same shape as SplitPane: needs an open session, fire-and-forget.
+            let (Some(conn), Some(active)) = (ctx.selected_agent.as_ref(), ctx.active.as_ref())
+            else {
+                let _ = send_client(
+                    sink,
+                    &HubToClient::SessionError {
+                        message: "no active session to re-layout".into(),
+                    },
+                )
+                .await;
+                return true;
+            };
+            let layout = match layout {
+                ClientPaneLayout::SideBySide => AgentPaneLayout::SideBySide,
+                ClientPaneLayout::Stacked => AgentPaneLayout::Stacked,
+            };
+            if conn
+                .send(ServerMsg::ChangeLayout {
+                    session_id: active.session_id,
+                    layout,
+                })
+                .await
+                .is_err()
+            {
+                let _ = send_client(
+                    sink,
+                    &HubToClient::SessionError {
+                        message: "agent disconnected".into(),
+                    },
+                )
+                .await;
+            }
+            true
+        }
         ClientToHub::Close => false,
         ClientToHub::Hello { .. } | ClientToHub::Pong => true,
     }
+}
+
+/// Same rule as the agent's `validate_name(_, "tool")` — keep them
+/// aligned so we reject early on the hub instead of round-tripping.
+fn valid_tool_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 63
+        && !s.starts_with('-')
+        && !s.starts_with('.')
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
 }
 
 async fn handle_agent_event<S>(ctx: &mut ConnCtx, evt: PtyEventOut, sink: &mut S) -> bool
@@ -855,6 +966,14 @@ where
         }
         PtyEventOut::Frame(ClientMsg::PtyError { message, .. }) => {
             let _ = send_client(sink, &HubToClient::SessionError { message }).await;
+            true
+        }
+        PtyEventOut::Frame(ClientMsg::SplitPaneResult { error, .. }) => {
+            if let Some(message) = error {
+                let _ = send_client(sink, &HubToClient::SessionError { message }).await;
+            }
+            // Success: the agent already spawned the pane; its bytes
+            // arrive through the existing PTY tap. Nothing else to do.
             true
         }
         PtyEventOut::Frame(_) => true,

@@ -191,6 +191,8 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
 
     let manager = Arc::new(PtyManager::new(
         config.claude.clone(),
+        config.tools.tools.clone(),
+        config.tools.default.clone(),
         config.tmux.clone(),
         config.recording.clone(),
         config.sandbox.clone(),
@@ -231,13 +233,28 @@ url = "wss://hub.example.com/v1/agent/ws"
 # they got it from `cloudcode-hub --init`.
 registration_token = "ag_PASTE_TOKEN_HERE"
 
-# [claude] section is optional; defaults below are usually fine. The agent
-# spawns `claude` as a subprocess for every user turn, so claude must be
-# installed and you must have run `claude /login` once as the same OS user.
+# [claude] only carries workspace_root now (filesystem root for per-account
+# workspace dirs). The tool wiring moved to [tools] below.
 # [claude]
-# executable     = "claude"                            # PATH lookup by default
-# workspace_root = "~/cloudcode-agent/workspaces"      # one dir per workspace
-# extra_args     = []                                  # appended to claude args
+# workspace_root = "~/cloudcode-agent/workspaces"
+
+# [tools] picks which AI CLIs this agent can spawn. The first pane runs
+# `default`; additional panes (split) can run any other entry by name.
+# Add a [tools.<name>] table per tool you want to expose.
+[tools]
+default = "claude"
+
+[tools.claude]
+executable     = "claude"                # PATH lookup by default
+resume_command = "claude --continue"     # empty -> always fresh
+extra_args     = []
+
+# Uncomment to also expose Codex side-by-side with Claude. Requires
+# `codex` to be installed and logged in as this OS user.
+# [tools.codex]
+# executable     = "codex"
+# resume_command = ""    # codex doesn't support resume; relaunch fresh
+# extra_args     = []
 
 # [sandbox] is deprecated. The sandbox toggle moved to the hub —
 # it's now per-account, set from the admin UI's Accounts page.

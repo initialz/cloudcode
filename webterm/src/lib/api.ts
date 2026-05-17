@@ -56,4 +56,14 @@ export const apiClient = {
     }),
   logout: () => api<void>('/logout', { method: 'POST' }),
   me: () => api<MeDto>('/me'),
+  // Per-user preferences blob (opaque to the hub). `preferences` is
+  // `null` if the user has never saved anything; the SPA then falls
+  // back to its built-in defaults.
+  getPreferences: () =>
+    api<{ preferences: unknown }>('/preferences'),
+  putPreferences: (prefs: unknown) =>
+    api<void>('/preferences', {
+      method: 'PUT',
+      body: JSON.stringify(prefs),
+    }),
 };

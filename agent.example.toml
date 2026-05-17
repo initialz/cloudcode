@@ -21,16 +21,26 @@ url = "wss://hub.example.com/v1/agent/ws"
 # 打印一次。所有 agent 共享同一个 token，hub 用 argon2id 哈希验证。
 registration_token = "ag_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
-# [claude] 段可整段省略 —— 默认就够：
-# - executable     = "claude"                          # tmux 内启动的命令
-# - workspace_root = "~/cloudcode-agent/workspaces"    # 每个 workspace 一个目录
-# - extra_args     = []                                # 追加到 claude 调用末尾
-# Agent 每开一个 session 就 `tmux new -A -s cloudcode-<workspace> -c <cwd> claude`。
-# tmux session 跨断连持久 —— client 关掉再开同 workspace 会 attach 回去。
-# 务必让 agent 跟 `claude /login` 在同一个系统账号下跑。
+# [claude] 现在只用来设 workspace_root（每 workspace 一个子目录）。
+# 旧的 executable / extra_args 字段还能解析，但运行时已经由 [tools.claude]
+# 接管 —— 推荐迁到 [tools] 那一节。
 # [claude]
-# executable     = "claude"
 # workspace_root = "~/cloudcode-agent/workspaces"
+
+# [tools] 决定第一 pane 跑什么、并允许 split 出额外 pane 跑别的 AI CLI。
+# 不写 [tools] 时 agent 会从 [claude] 段合成一个 `claude` 工具，行为跟
+# 老版本一致；要并排跑 codex / 其他 CLI 时再开 [tools.<name>] 即可。
+# [tools]
+# default = "claude"
+#
+# [tools.claude]
+# executable     = "claude"
+# resume_command = "claude --continue"   # 空串 -> 不 resume，重连永远 fresh
+# extra_args     = []
+#
+# [tools.codex]
+# executable     = "codex"
+# resume_command = ""                    # codex 没有 resume，每次新启
 # extra_args     = []
 
 # [tmux] 段可省略 —— 默认 PATH 查找 `tmux`：

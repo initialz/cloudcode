@@ -58,9 +58,17 @@ struct Cli {
     #[arg(long)]
     init: bool,
 
-    /// Everything after `--` is passed through to the remote `claude`
-    /// binary's argv on session creation. Reattach to an existing
-    /// workspace ignores these (tmux only spawns claude on first open).
+    /// Which CLI to run inside the workspace on first open: "claude"
+    /// (default), "codex", or whatever the agent has configured under
+    /// `[tools]` in its agent.toml. Reattach to an existing tmux
+    /// session ignores this; use tmux's own split keys (Ctrl+b %) or
+    /// the webterm split button to spawn another tool in a side pane.
+    #[arg(long, value_name = "NAME")]
+    tool: Option<String>,
+
+    /// Everything after `--` is passed through to the remote tool's
+    /// argv on session creation. Reattach to an existing workspace
+    /// ignores these (tmux only spawns the tool on first open).
     #[arg(last = true, allow_hyphen_values = true)]
     claude_args: Vec<String>,
 
@@ -205,6 +213,7 @@ async fn main() -> ExitCode {
                 run_chat(
                     cli.agent,
                     cli.claude_args,
+                    cli.tool,
                     cli.config.as_ref(),
                     cli.hub_url,
                     cli.token,
@@ -271,6 +280,7 @@ token   = "cc_PASTE_TOKEN_HERE"
 async fn run_chat(
     agent_flag: Option<String>,
     claude_args: Vec<String>,
+    tool: Option<String>,
     config_override: Option<&PathBuf>,
     cli_hub_url: Option<String>,
     cli_token: Option<String>,
@@ -309,6 +319,7 @@ async fn run_chat(
                         cols,
                         rows,
                         claude_args: claude_args.clone(),
+                        tool: tool.clone(),
                     }))
                     .await
                     .map_err(|_| anyhow!("hub disconnected"))?;

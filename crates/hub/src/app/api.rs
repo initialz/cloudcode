@@ -133,3 +133,64 @@ pub async fn me(Extension(account): Extension<AuthedAccount>) -> Response {
     )
         .into_response()
 }
+
+/// `GET /app/api/preferences` — return the raw JSON blob the webterm
+/// last saved for this account. `preferences == null` means "never set"
+/// (webterm then falls back to its built-in defaults).
+pub async fn get_preferences(
+    State(state): State<Arc<AppState>>,
+    Extension(account): Extension<AuthedAccount>,
+) -> Response {
+    let blob = match state.db.get_user_preferences(&account.0).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "get_user_preferences failed");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error", "db error");
+        }
+    };
+    // Re-parse so we hand the SPA back JSON instead of a string-of-JSON.
+    // If the stored row is somehow malformed, surface that as null so
+    // the client falls back to defaults rather than crashing.
+    let parsed: Option<serde_json::Value> = blob
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok());
+    (
+        StatusCode::OK,
+        Json(json!({ "preferences": parsed })),
+    )
+        .into_response()
+}
+
+/// `PUT /app/api/preferences` — replace this account's preferences
+/// blob. Body must be a JSON object (we explicitly reject arrays /
+/// primitives to keep the door open for partial-update semantics
+/// later without an awkward type bump).
+pub async fn put_preferences(
+    State(state): State<Arc<AppState>>,
+    Extension(account): Extension<AuthedAccount>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if !body.is_object() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+            "preferences body must be a JSON object",
+        );
+    }
+    // Cap to a generous-but-finite size so a runaway client can't
+    // turn this into a DoS vector. 32 KiB serialised JSON fits orders
+    // of magnitude more than the realistic settings surface.
+    let serialised = body.to_string();
+    if serialised.len() > 32 * 1024 {
+        return err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "too_large",
+            "preferences exceed 32 KiB",
+        );
+    }
+    if let Err(e) = state.db.set_user_preferences(&account.0, &serialised).await {
+        tracing::warn!(error = %e, "set_user_preferences failed");
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error", "db error");
+    }
+    StatusCode::NO_CONTENT.into_response()
+}

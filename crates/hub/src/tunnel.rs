@@ -75,6 +75,15 @@ pub enum ClientMsg {
         message: String,
     },
 
+    /// Reply to a hub-initiated `SplitPane` request. Session-keyed so the
+    /// hub routes it back through the same client connection. `error =
+    /// None` means the new pane was successfully spawned. New in v1.10.
+    SplitPaneResult {
+        session_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
     /// One JSONL line tailed from claude's per-project history file.
     /// The agent streams these to the hub so the admin UI can show the
     /// conversation for each session. `kind` is the outer `type` field
@@ -147,6 +156,29 @@ pub struct WorkspaceFullItem {
     pub tmux_alive: bool,
 }
 
+/// Where a SplitPane lands relative to the active pane.
+///
+/// - `Right`: vertical divider, new pane appears to the right (tmux `-h`).
+/// - `Down`:  horizontal divider, new pane appears below       (tmux `-v`).
+///
+/// `Down` is the default to match tmux's own default; older hubs without
+/// this field round-trip to the same behaviour.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SplitDirection {
+    Right,
+    #[default]
+    Down,
+}
+
+/// Whole-session pane arrangement, applied via `tmux select-layout`.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneLayout {
+    SideBySide,
+    Stacked,
+}
+
 /// Frames sent from the hub to the agent (text JSON).
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -178,6 +210,11 @@ pub enum ServerMsg {
         /// v1.9 hubs (default false = no sandbox).
         #[serde(default)]
         sandbox: bool,
+        /// Which tool to launch in the first pane (claude / codex / …).
+        /// `None` -> agent falls back to its `[tools].default`.
+        /// Optional for back-compat with pre-v1.10 hubs.
+        #[serde(default)]
+        tool: Option<String>,
     },
     PtyResize {
         session_id: Uuid,
@@ -188,6 +225,27 @@ pub enum ServerMsg {
     /// next PtyOpen on the same (account, workspace) re-attaches.
     PtyClose {
         session_id: Uuid,
+    },
+
+    /// Add a new tmux pane to an existing PTY session, running `tool`
+    /// (with optional extra args) alongside whatever was already there.
+    /// New in v1.10.
+    SplitPane {
+        session_id: Uuid,
+        tool: String,
+        /// Where the new pane lands. Defaults to `Down` so older agents
+        /// that don't know this field keep tmux's default split direction.
+        #[serde(default)]
+        direction: SplitDirection,
+        #[serde(default)]
+        args: Vec<String>,
+    },
+
+    /// Re-arrange the panes in an existing session via `tmux select-layout`.
+    /// New in v1.10.
+    ChangeLayout {
+        session_id: Uuid,
+        layout: PaneLayout,
     },
 
     WorkspaceList {

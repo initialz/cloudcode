@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
@@ -7,8 +8,16 @@ pub struct Config {
     #[serde(default)]
     pub agent: AgentSection,
     pub auth: AuthConfig,
+    /// Legacy single-tool section. Still parsed for back-compat with
+    /// pre-v1.10 agent.toml files; once `[tools]` is populated this
+    /// is only consulted for `workspace_root` (which is tool-agnostic).
     #[serde(default)]
     pub claude: ClaudeConfig,
+    /// New in v1.10: per-tool runtime config. If empty, `Config::load`
+    /// synthesises a single `claude` entry from `[claude]` so existing
+    /// installs keep working.
+    #[serde(default)]
+    pub tools: ToolsSection,
     #[serde(default)]
     pub tmux: TmuxConfig,
     #[serde(default)]
@@ -32,6 +41,10 @@ pub struct AuthConfig {
     pub registration_token: String,
 }
 
+/// Legacy single-`claude` config. Kept so pre-v1.10 agent.toml files
+/// continue to parse; new fields should go on [`ToolConfig`] instead.
+/// `workspace_root` lives here because it's tool-agnostic (fs layout)
+/// and moving it would force every existing agent.toml to be rewritten.
 #[derive(Debug, Deserialize, Clone)]
 pub struct ClaudeConfig {
     /// Argv0 passed to tmux as the session's first command. Override if you
@@ -44,6 +57,59 @@ pub struct ClaudeConfig {
     pub workspace_root: PathBuf,
 
     /// Extra args appended after `claude` when starting the tmux session.
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+}
+
+/// New-style multi-tool config block.
+///
+/// ```toml
+/// [tools]
+/// default = "claude"
+///
+/// [tools.claude]
+/// executable     = "claude"
+/// resume_command = "claude --continue"
+/// extra_args     = []
+///
+/// [tools.codex]
+/// executable     = "codex"
+/// resume_command = ""        # empty -> always fresh, no resume
+/// extra_args     = []
+/// ```
+///
+/// `default` is the tool the first pane runs when the client doesn't
+/// specify one. Empty `resume_command` means the wrapper never tries to
+/// resume — the tool is always relaunched fresh on reattach.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ToolsSection {
+    #[serde(default = "default_tool")]
+    pub default: String,
+    /// Map of tool name -> config. Populated by serde's `flatten`, so
+    /// the section is written as `[tools.<name>]` inline.
+    #[serde(flatten, default)]
+    pub tools: HashMap<String, ToolConfig>,
+}
+
+impl Default for ToolsSection {
+    fn default() -> Self {
+        Self {
+            default: default_tool(),
+            tools: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ToolConfig {
+    /// Executable name or absolute path. Looked up via PATH if not absolute.
+    pub executable: String,
+    /// Command to run on reattach (instead of `executable <extra_args>`).
+    /// Empty string = no resume; always relaunch fresh. The wrapper
+    /// `eval`s this string, so quoting follows shell rules.
+    #[serde(default)]
+    pub resume_command: String,
+    /// Extra args appended after `executable` on every spawn.
     #[serde(default)]
     pub extra_args: Vec<String>,
 }
@@ -79,6 +145,10 @@ pub struct RecordingConfig {
 }
 
 fn default_claude_executable() -> String {
+    "claude".into()
+}
+
+fn default_tool() -> String {
     "claude".into()
 }
 
@@ -136,6 +206,26 @@ impl Default for RecordingConfig {
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let s = std::fs::read_to_string(path)?;
-        Ok(toml::from_str(&s)?)
+        let mut cfg: Config = toml::from_str(&s)?;
+        // Back-compat: pre-v1.10 agent.toml had only [claude] and no
+        // [tools] block. Synthesise a default `claude` tool from the
+        // legacy section so the rest of the agent can speak the new
+        // shape uniformly.
+        if cfg.tools.tools.is_empty() {
+            cfg.tools.tools.insert(
+                "claude".to_string(),
+                ToolConfig {
+                    executable: cfg.claude.executable.clone(),
+                    // Match the previous hard-coded wrapper behaviour
+                    // (which always ran `claude --continue` when a saved
+                    // jsonl existed).
+                    resume_command: "claude --continue".into(),
+                    extra_args: cfg.claude.extra_args.clone(),
+                },
+            );
+            // If `[tools].default` wasn't set we already defaulted to
+            // "claude" via default_tool, so nothing to do here.
+        }
+        Ok(cfg)
     }
 }

@@ -1,11 +1,13 @@
-use crate::config::{ClaudeConfig, RecordingConfig, SandboxConfig, TmuxConfig};
+use crate::config::{ClaudeConfig, RecordingConfig, SandboxConfig, TmuxConfig, ToolConfig};
 use crate::tunnel::{
-    pack_pty_frame, ClientMsg, ServerMsg, WorkspaceFullItem, WorkspaceItem, TAG_PTY_OUTPUT,
+    pack_pty_frame, ClientMsg, PaneLayout, ServerMsg, SplitDirection, WorkspaceFullItem,
+    WorkspaceItem, TAG_PTY_OUTPUT,
 };
 use anyhow::{Context, Result};
 use chrono::SecondsFormat;
 use dashmap::DashMap;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -22,6 +24,8 @@ pub enum OutFrame {
 
 pub struct PtyManager {
     claude: ClaudeConfig,
+    tools: HashMap<String, ToolConfig>,
+    default_tool: String,
     tmux: TmuxConfig,
     recording: RecordingConfig,
     /// When the workspace sandbox is enabled at startup, this holds the
@@ -29,12 +33,24 @@ pub struct PtyManager {
     /// can re-invoke us with the `sandbox-exec` subcommand. `None` means
     /// "sandbox disabled, exec tmux directly".
     self_exe: Option<PathBuf>,
+    /// Path to our agent-owned tmux.conf (one line: `set -g mouse on`).
+    /// Passed via `tmux -f` so each per-workspace tmux server inherits
+    /// mouse mode on startup. `None` only if we failed to write the
+    /// file at boot, in which case spawn falls back to the user's
+    /// default tmux config (i.e. mouse off → wheel will misbehave but
+    /// the session still works).
+    tmux_conf: Option<PathBuf>,
     sessions: Arc<DashMap<Uuid, Arc<PtyHandle>>>,
 }
 
 struct PtyHandle {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     writer: Mutex<Box<dyn Write + Send>>,
+    /// (account, workspace) that this PTY is bound to. Needed by
+    /// `split_pane` to derive the tmux label + session name (we already
+    /// validated these on open, so they're safe to reuse verbatim).
+    account: String,
+    workspace: String,
     /// Stops the jsonl watcher task on drop. Held only for its
     /// Drop side-effect.
     _jsonl: crate::jsonl::WatcherHandle,
@@ -43,6 +59,8 @@ struct PtyHandle {
 impl PtyManager {
     pub fn new(
         claude: ClaudeConfig,
+        tools: HashMap<String, ToolConfig>,
+        default_tool: String,
         tmux: TmuxConfig,
         recording: RecordingConfig,
         // Kept in the signature so call sites compile, but the agent
@@ -82,13 +100,95 @@ impl PtyManager {
             None
         };
 
+        // Write our private tmux.conf next to the recordings dir. tmux
+        // reads `-f` only when starting a server (per-workspace, with
+        // -L), so we just need this file to exist when open_session
+        // spawns the first `tmux new-session`. Mouse mode lets webterm
+        // wheel events scroll tmux's per-pane scrollback (chat history)
+        // instead of being translated to ↑/↓ by xterm.js in alt-screen.
+        let tmux_conf = recording
+            .dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("tmux.conf");
+        let tmux_conf = match std::fs::create_dir_all(tmux_conf.parent().unwrap_or(Path::new(".")))
+            .and_then(|_| {
+                // mouse on             -> wheel scrolls per-pane scrollback;
+                //                         drag-select enters tmux copy mode
+                //                         and highlights the selection.
+                // history-limit 50000  -> default 2000 lines is way too
+                //                         small for AI chat transcripts.
+                // set-clipboard on +   -> on copy, tmux emits an OSC 52
+                // terminal-features       escape carrying the selected text
+                // *:clipboard             upstream. webterm registers an
+                //                         OSC 52 handler that drops it
+                //                         straight into the browser
+                //                         clipboard, so drag → release =
+                //                         system-clipboard copy without
+                //                         needing a modifier key.
+                // UX we want, matching standard desktop selection:
+                //   drag        -> tmux enters copy-mode, selection visible
+                //   release     -> selection STAYS visible (don't auto-copy)
+                //   click       -> exit copy-mode, drop selection
+                //   y/Enter/c   -> copy + OSC 52 + exit; webterm
+                //                  intercepts Cmd+C and sends 'y' to
+                //                  bridge from desktop-style copy
+                //
+                // The piped shell command stays on one line — tmux's
+                // conf parser doesn't honour backslash continuations
+                // inside bind-key argv. Note the leading comma on
+                // terminal-features: `set -a` is raw string append, so
+                // without the separator tmux silently mangles the
+                // value.
+                let copy_pipe =
+                    "send-keys -X copy-pipe-and-cancel 'base64 | tr -d \"\\n\" | (printf \"\\033]52;c;\"; cat; printf \"\\a\")'";
+                let bindings = format!(
+                    // Drag-end: stop the selection but stay in copy
+                    // mode so it remains visible and the user can
+                    // decide what to do next.
+                    "bind-key -T copy-mode    MouseDragEnd1Pane send-keys -X stop-selection\n\
+                     bind-key -T copy-mode-vi MouseDragEnd1Pane send-keys -X stop-selection\n\
+                     bind-key -T copy-mode    MouseDown1Pane    send-keys -X cancel\n\
+                     bind-key -T copy-mode-vi MouseDown1Pane    send-keys -X cancel\n\
+                     bind-key -T copy-mode    Enter {copy_pipe}\n\
+                     bind-key -T copy-mode-vi Enter {copy_pipe}\n\
+                     bind-key -T copy-mode    y     {copy_pipe}\n\
+                     bind-key -T copy-mode-vi y     {copy_pipe}\n\
+                     bind-key -T copy-mode    c     {copy_pipe}\n\
+                     bind-key -T copy-mode-vi c     {copy_pipe}\n",
+                    copy_pipe = copy_pipe
+                );
+                let conf = format!(
+                    "set -g mouse on\n\
+                     set -g history-limit 50000\n\
+                     set -g set-clipboard on\n\
+                     set -as terminal-features ',*:clipboard'\n\
+                     {bindings}"
+                );
+                std::fs::write(&tmux_conf, conf.as_bytes())
+            })
+        {
+            Ok(()) => {
+                tracing::info!(path = %tmux_conf.display(), "wrote tmux.conf (mouse on)");
+                Some(tmux_conf)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, path = %tmux_conf.display(), "could not write tmux.conf; mouse-wheel scrollback will be off");
+                None
+            }
+        };
+
         Ok(Self {
             claude,
+            tools,
+            default_tool,
             tmux: TmuxConfig {
                 executable: tmux_path,
             },
             recording,
             self_exe,
+            tmux_conf,
             sessions: Arc::new(DashMap::new()),
         })
     }
@@ -103,9 +203,18 @@ impl PtyManager {
                 rows,
                 claude_args,
                 sandbox,
+                tool,
             } => {
                 self.open_session(
-                    session_id, account, workspace, cols, rows, claude_args, sandbox, tx,
+                    session_id,
+                    account,
+                    workspace,
+                    cols,
+                    rows,
+                    claude_args,
+                    sandbox,
+                    tool,
+                    tx,
                 )
                 .await;
             }
@@ -120,6 +229,18 @@ impl PtyManager {
             }
             ServerMsg::PtyClose { session_id } => {
                 self.close(session_id, tx).await;
+            }
+            ServerMsg::SplitPane {
+                session_id,
+                tool,
+                direction,
+                args,
+            } => {
+                self.split_pane(session_id, tool, direction, args, tx)
+                    .await;
+            }
+            ServerMsg::ChangeLayout { session_id, layout } => {
+                self.change_layout(session_id, layout, tx).await;
             }
             ServerMsg::WorkspaceList {
                 request_id,
@@ -191,6 +312,7 @@ impl PtyManager {
         rows: u16,
         claude_args: Vec<String>,
         sandbox: bool,
+        tool: Option<String>,
         tx: mpsc::Sender<OutFrame>,
     ) {
         if let Err(e) = validate_name(&account, "account") {
@@ -211,6 +333,19 @@ impl PtyManager {
                 .await;
             return;
         }
+        // Resolve the tool to launch. `None` -> agent's configured
+        // default. Unknown tool name -> PtyError before we touch the
+        // filesystem.
+        let tool_name = tool.unwrap_or_else(|| self.default_tool.clone());
+        let Some(tool_cfg) = self.tools.get(&tool_name).cloned() else {
+            let _ = tx
+                .send(OutFrame::Text(ClientMsg::PtyError {
+                    session_id,
+                    message: format!("unknown tool '{}' (not in agent.toml [tools])", tool_name),
+                }))
+                .await;
+            return;
+        };
         // Same session_id arriving again = "swap workspace in place". Drop the
         // old handle silently (the reader thread will see read==0 and exit
         // without emitting PtyClosed because we set a no-emit marker through
@@ -294,6 +429,15 @@ impl PtyManager {
         } else {
             CommandBuilder::new(&self.tmux.executable)
         };
+        // Our private tmux.conf (set -g mouse on). Must come BEFORE
+        // the subcommand because tmux only honors -f as a global flag.
+        // Only effective when the per-workspace server is starting
+        // fresh (subsequent commands hit the existing server and
+        // ignore -f), which matches the cases we care about.
+        if let Some(conf) = self.tmux_conf.as_ref() {
+            cmd.arg("-f");
+            cmd.arg(conf);
+        }
         cmd.arg("-L");
         cmd.arg(&tmux_label);
         cmd.arg("new-session");
@@ -305,72 +449,41 @@ impl PtyManager {
         cmd.arg("-y");
         cmd.arg(rows.to_string());
         cmd.cwd(&cwd);
-        // Wrap claude in a small shell loop instead of execing it
+        // Wrap the tool in a small shell loop instead of execing it
         // directly. The semantics we want:
         //
-        //   1. First boot: run `claude <args>` exactly as the CLI asked.
-        //   2. When claude exits (/exit, Ctrl+C, crash): detach every
+        //   1. First boot: run `<tool_bin> <args>` exactly as configured.
+        //   2. When the tool exits (/exit, Ctrl+C, crash): detach every
         //      attached tmux client so the cloudcode user pops straight
         //      back to the menu. The tmux session itself stays alive
-        //      (the wrapper is still running), so the picker shows
-        //      it as "saved".
+        //      (the wrapper is still running), so the picker shows it
+        //      as "saved".
         //   3. Sit in a polling sleep until somebody attaches again.
-        //   4. On reattach, restart claude with `--continue` so it
-        //      resumes the previous conversation from
-        //      ~/.claude/projects/<cwd>/.
+        //   4. On reattach, run `$CLOUDCODE_RESUME_CMD` if set; for
+        //      claude that's `claude --continue`, but only if a saved
+        //      jsonl actually exists under
+        //      ~/.claude/projects/<encoded-cwd>/. For other tools we
+        //      always honor whatever resume_command is configured (or
+        //      relaunch fresh if it's empty).
         //
         // Explicit cleanup (delete workspace) still goes through the
         // menu's `d` action, which kills the per-workspace tmux server
         // and tears the wrapper down with it.
-        const WRAPPER: &str = r#"
-first=1
-sess="$(tmux display-message -p '#S' 2>/dev/null)"
-while :; do
-    if [ "$first" = "1" ]; then
-        "$@"
-        first=0
-    else
-        # Only attempt `--continue` if there's actually saved history
-        # under ~/.claude/projects/<encoded-cwd>/. If the first run
-        # /exit'd before writing any jsonl (or the slot was just
-        # reset) `claude --continue` would either print "No
-        # conversation found to continue" or drop into an empty
-        # session — both leave the user stuck. The agent passes the
-        # exact encoded path via CLOUDCODE_CLAUDE_PROJECT_DIR.
-        if [ -n "$CLOUDCODE_CLAUDE_PROJECT_DIR" ] \
-            && ls "$CLOUDCODE_CLAUDE_PROJECT_DIR"/*.jsonl >/dev/null 2>&1; then
-            claude --continue || "$@"
-        else
-            "$@"
-        fi
-    fi
-    # Disconnect every client attached to THIS session. We pass -s
-    # explicitly because `detach-client -a` from a non-attached
-    # caller (our wrapper bash is a server-side child, not a client)
-    # has ambiguous semantics on some tmux versions.
-    if [ -n "$sess" ]; then
-        tmux detach-client -s "$sess" 2>/dev/null
-    else
-        tmux detach-client -a 2>/dev/null
-    fi
-    # Park until somebody reattaches, then respawn claude.
-    while [ "$(tmux list-clients -t "$sess" -F . 2>/dev/null | wc -l)" -eq 0 ]; do
-        sleep 1
-    done
-done
-"#;
         cmd.arg("bash");
         cmd.arg("-c");
-        cmd.arg(WRAPPER);
-        // bash's $0 label, not used by the script.
-        cmd.arg("cloudcode-claude");
-        cmd.arg(&self.claude.executable);
-        for arg in &self.claude.extra_args {
+        cmd.arg(TOOL_WRAPPER);
+        // bash's $0 label, not used by the script. The tool binary itself
+        // is passed via $CLOUDCODE_TOOL_BIN (see cmd.env below), NOT as a
+        // positional arg — otherwise the wrapper would invoke
+        // `"$TOOL_BIN" "$@"` and end up running `claude claude …`, with
+        // the duplicated name treated as an initial prompt.
+        cmd.arg("cloudcode-tool");
+        for arg in &tool_cfg.extra_args {
             cmd.arg(arg);
         }
         // Per-session args forwarded from the client (everything after `--`
-        // on the cloudcode CLI). Only honoured for the first boot; after
-        // that the wrapper switches to `claude --continue`.
+        // on the cloudcode CLI). Only honoured for the first boot; on
+        // reattach the wrapper falls through to `$CLOUDCODE_RESUME_CMD`.
         for arg in &claude_args {
             cmd.arg(arg);
         }
@@ -389,10 +502,15 @@ done
         );
         // Tell the wrapper where claude's per-project jsonl history
         // for this workspace lives, so it can decide whether
-        // `--continue` is safe to try on reattach.
+        // `--continue` is safe to try on reattach. Only meaningful
+        // when the tool is claude; harmless for other tools.
         let home_for_proj = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
         let claude_proj_dir = crate::jsonl::project_dir(&home_for_proj, &cwd);
         cmd.env("CLOUDCODE_CLAUDE_PROJECT_DIR", &claude_proj_dir);
+        // Tool-driving env for the generic wrapper.
+        cmd.env("CLOUDCODE_TOOL", &tool_name);
+        cmd.env("CLOUDCODE_TOOL_BIN", &tool_cfg.executable);
+        cmd.env("CLOUDCODE_RESUME_CMD", &tool_cfg.resume_command);
 
         let child = match pair.slave.spawn_command(cmd) {
             Ok(c) => c,
@@ -444,6 +562,8 @@ done
         let handle = Arc::new(PtyHandle {
             master,
             writer: Mutex::new(writer),
+            account: account.clone(),
+            workspace: workspace.clone(),
             _jsonl: jsonl,
         });
         self.sessions.insert(session_id, handle.clone());
@@ -498,6 +618,205 @@ done
                 reason: Some("closed by hub".into()),
             }))
             .await;
+    }
+
+    /// Spawn an extra tmux pane inside an existing PTY session, running
+    /// `tool_name` (looked up against `[tools]`). The pane inherits the
+    /// session's tmux server (and therefore its sandbox state, if any),
+    /// so we don't need to re-wrap it in `sandbox-exec`.
+    ///
+    /// We invoke tmux out-of-band (`std::process::Command`, not the PTY)
+    /// because split-window is fire-and-forget against the tmux server
+    /// daemon; the resulting pane's output is already being read by the
+    /// reader thread attached to the session's master fd.
+    async fn split_pane(
+        self: &Arc<Self>,
+        session_id: Uuid,
+        tool_name: String,
+        direction: SplitDirection,
+        args: Vec<String>,
+        tx: mpsc::Sender<OutFrame>,
+    ) {
+        let send_err = |error: String| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx
+                    .send(OutFrame::Text(ClientMsg::SplitPaneResult {
+                        session_id,
+                        error: Some(error),
+                    }))
+                    .await;
+            }
+        };
+
+        let Some(handle) = self.sessions.get(&session_id).map(|e| e.value().clone()) else {
+            send_err(format!("unknown session {}", session_id)).await;
+            return;
+        };
+        if let Err(e) = validate_name(&tool_name, "tool") {
+            send_err(e).await;
+            return;
+        }
+        let Some(tool_cfg) = self.tools.get(&tool_name).cloned() else {
+            send_err(format!(
+                "unknown tool '{}' (not in agent.toml [tools])",
+                tool_name
+            ))
+            .await;
+            return;
+        };
+
+        let session_name = format!("cloudcode-{}-{}", handle.account, handle.workspace);
+        let tmux_label = format!("cc-{}-{}", handle.account, handle.workspace);
+        let cwd = self
+            .workspace_root()
+            .join(&handle.account)
+            .join(&handle.workspace);
+
+        // Pre-compute claude project dir so the wrapper's resume gating
+        // works even when tool_name == "claude" in a split pane.
+        let home_for_proj = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+        let claude_proj_dir = crate::jsonl::project_dir(&home_for_proj, &cwd);
+
+        // Build the argv for `tmux split-window`. We use `env` (portable)
+        // to set wrapper env vars instead of tmux's own `-e KEY=VAL`,
+        // which only landed in tmux 3.2. The split pane inherits the
+        // server's sandbox state (a server-side child of tmux), so we
+        // don't wrap it in `sandbox-exec` again.
+        // tmux's split-window orientation is the opposite of what most
+        // people say in conversation: `-h` produces left/right panes
+        // (vertical divider), `-v` produces top/bottom (horizontal
+        // divider). We map our wire-level `Right` / `Down` directly.
+        let split_flag = match direction {
+            SplitDirection::Right => "-h",
+            SplitDirection::Down => "-v",
+        };
+        let mut cmd = std::process::Command::new(&self.tmux.executable);
+        cmd.arg("-L")
+            .arg(&tmux_label)
+            .arg("split-window")
+            .arg(split_flag)
+            .arg("-t")
+            .arg(&session_name)
+            .arg("-c")
+            .arg(&cwd)
+            .arg("--")
+            .arg("env")
+            .arg(format!("CLOUDCODE_TOOL={}", tool_name))
+            .arg(format!("CLOUDCODE_TOOL_BIN={}", tool_cfg.executable))
+            .arg(format!("CLOUDCODE_RESUME_CMD={}", tool_cfg.resume_command))
+            .arg(format!(
+                "CLOUDCODE_CLAUDE_PROJECT_DIR={}",
+                claude_proj_dir.display()
+            ))
+            .arg("bash")
+            .arg("-c")
+            .arg(TOOL_WRAPPER)
+            // $0 label only; the tool binary is sourced from
+            // $CLOUDCODE_TOOL_BIN, not the positional args (see
+            // open_session for the longer explanation).
+            .arg("cloudcode-tool");
+        for a in &tool_cfg.extra_args {
+            cmd.arg(a);
+        }
+        for a in &args {
+            cmd.arg(a);
+        }
+
+        // Run synchronously off the tokio runtime so we don't block the
+        // WS read loop. tmux split-window returns quickly (sub-second)
+        // once the server accepts the command, so spawn_blocking is fine.
+        let output = match tokio::task::spawn_blocking(move || cmd.output()).await {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                send_err(format!("spawn tmux split-window: {}", e)).await;
+                return;
+            }
+            Err(e) => {
+                send_err(format!("join tmux split-window task: {}", e)).await;
+                return;
+            }
+        };
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let msg = if stderr.is_empty() {
+                format!("tmux split-window exited {}", output.status)
+            } else {
+                format!("tmux split-window: {}", stderr)
+            };
+            send_err(msg).await;
+            return;
+        }
+
+        let _ = tx
+            .send(OutFrame::Text(ClientMsg::SplitPaneResult {
+                session_id,
+                error: None,
+            }))
+            .await;
+    }
+
+    /// Re-arrange the panes in an existing session using `tmux
+    /// select-layout`. No-op on a 1-pane session (tmux just keeps it
+    /// as-is). Errors come back as a SplitPaneResult so we don't have
+    /// to invent a separate result variant for what is effectively the
+    /// same fire-and-forget tmux shell-out as split.
+    async fn change_layout(
+        self: &Arc<Self>,
+        session_id: Uuid,
+        layout: PaneLayout,
+        tx: mpsc::Sender<OutFrame>,
+    ) {
+        let send_err = |error: String| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx
+                    .send(OutFrame::Text(ClientMsg::SplitPaneResult {
+                        session_id,
+                        error: Some(error),
+                    }))
+                    .await;
+            }
+        };
+
+        let Some(handle) = self.sessions.get(&session_id).map(|e| e.value().clone()) else {
+            send_err(format!("unknown session {}", session_id)).await;
+            return;
+        };
+        let layout_name = match layout {
+            PaneLayout::SideBySide => "even-horizontal",
+            PaneLayout::Stacked => "even-vertical",
+        };
+        let session_name = format!("cloudcode-{}-{}", handle.account, handle.workspace);
+        let tmux_label = format!("cc-{}-{}", handle.account, handle.workspace);
+        let mut cmd = std::process::Command::new(&self.tmux.executable);
+        cmd.arg("-L")
+            .arg(&tmux_label)
+            .arg("select-layout")
+            .arg("-t")
+            .arg(&session_name)
+            .arg(layout_name);
+
+        let output = match tokio::task::spawn_blocking(move || cmd.output()).await {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                send_err(format!("spawn tmux select-layout: {}", e)).await;
+                return;
+            }
+            Err(e) => {
+                send_err(format!("join tmux select-layout task: {}", e)).await;
+                return;
+            }
+        };
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let msg = if stderr.is_empty() {
+                format!("tmux select-layout exited {}", output.status)
+            } else {
+                format!("tmux select-layout: {}", stderr)
+            };
+            send_err(msg).await;
+        }
     }
 
     async fn workspace_list(&self, request_id: Uuid, account: String, tx: mpsc::Sender<OutFrame>) {
@@ -717,6 +1036,93 @@ done
         self.workspace_root().join(account)
     }
 }
+
+/// Generic shell wrapper used for every pane (first or split). The
+/// wrapper is identical for all tools; behaviour is steered by env
+/// vars set by the spawn path:
+///
+/// - `CLOUDCODE_TOOL`        — tool key (e.g. `claude`, `codex`). The
+///   wrapper only special-cases `claude` (to avoid `--continue` on an
+///   empty conversation slot).
+/// - `CLOUDCODE_TOOL_BIN`    — absolute path / argv0 of the tool binary.
+///   Required; the wrapper exits immediately if it's unset.
+/// - `CLOUDCODE_RESUME_CMD`  — shell snippet evaluated on reattach. Empty
+///   = always relaunch fresh.
+/// - `CLOUDCODE_CLAUDE_PROJECT_DIR` — claude-only: path to the per-cwd
+///   jsonl history dir; resume is suppressed when this is empty or has
+///   no `*.jsonl` yet.
+///
+/// Detach logic only kicks the user back to the menu when *this* is the
+/// last pane in the session — otherwise other panes (codex etc.) are
+/// still doing useful work and shouldn't be torn down behind the user.
+const TOOL_WRAPPER: &str = r#"
+TOOL="${CLOUDCODE_TOOL:-claude}"
+TOOL_BIN="${CLOUDCODE_TOOL_BIN:-}"
+RESUME_CMD="${CLOUDCODE_RESUME_CMD:-}"
+
+if [ -z "$TOOL_BIN" ]; then
+    echo "cloudcode-tool wrapper: CLOUDCODE_TOOL_BIN is required" >&2
+    exit 1
+fi
+
+first=1
+sess="$(tmux display-message -p '#S' 2>/dev/null)"
+while :; do
+    if [ "$first" = "1" ]; then
+        "$TOOL_BIN" "$@"
+        first=0
+    else
+        do_resume=false
+        if [ -n "$RESUME_CMD" ]; then
+            if [ "$TOOL" = "claude" ]; then
+                # claude's `--continue` doesn't reliably non-zero exit
+                # when there's no saved session, so we still gate on a
+                # jsonl file actually existing under
+                # ~/.claude/projects/<encoded-cwd>/.
+                if [ -n "$CLOUDCODE_CLAUDE_PROJECT_DIR" ] \
+                    && ls "$CLOUDCODE_CLAUDE_PROJECT_DIR"/*.jsonl >/dev/null 2>&1; then
+                    do_resume=true
+                fi
+            else
+                do_resume=true
+            fi
+        fi
+        if [ "$do_resume" = "true" ]; then
+            eval "$RESUME_CMD" || "$TOOL_BIN" "$@"
+        else
+            "$TOOL_BIN" "$@"
+        fi
+    fi
+    # Tool has exited. Clear the pane BEFORE detaching so that when a
+    # future client attaches, tmux's initial paint shows a blank pane
+    # rather than briefly flashing the previous tool's exit dump
+    # (claude on Ctrl-C dumps its chat UI back to main-screen, which
+    # otherwise stays in the pane buffer until the wrapper finally
+    # gets around to re-launching claude --continue).
+    printf '\033[H\033[2J\033[3J'
+    # Only detach the tmux client when we're the last pane in the
+    # session. Other panes (e.g. codex running next to claude) are
+    # still in use and the user shouldn't be kicked back to the menu
+    # while they're alive.
+    panes=$(tmux list-panes 2>/dev/null | wc -l)
+    if [ "${panes:-0}" -le 1 ]; then
+        if [ -n "$sess" ]; then
+            tmux detach-client -s "$sess" 2>/dev/null
+        else
+            tmux detach-client -a 2>/dev/null
+        fi
+        # Park until somebody reattaches, then respawn the tool.
+        while [ "$(tmux list-clients -t "$sess" -F . 2>/dev/null | wc -l)" -eq 0 ]; do
+            sleep 1
+        done
+    else
+        # Not the last pane: just kill this pane so the user is left
+        # with whatever else was running. tmux will clean up on its
+        # own once all panes exit.
+        exit 0
+    fi
+done
+"#;
 
 #[allow(clippy::too_many_arguments)]
 fn pty_reader_loop(

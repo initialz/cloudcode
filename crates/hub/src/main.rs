@@ -136,6 +136,12 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
             "/app/api/me",
             get(app::api::me).route_layer(user_gate.clone()),
         )
+        .route(
+            "/app/api/preferences",
+            get(app::api::get_preferences)
+                .put(app::api::put_preferences)
+                .route_layer(user_gate.clone()),
+        )
         .route("/app", get(|| async { Redirect::permanent("/app/") }))
         .route("/app/", get(app::assets::serve_index))
         .route("/app/assets/*path", get(app::assets::serve_asset))
