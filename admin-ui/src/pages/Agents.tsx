@@ -35,6 +35,13 @@ export function Agents() {
 
   useEffect(() => {
     reload();
+    // Periodically refresh so a newly-published release surfaces as
+    // an inline "Update to vX.Y.Z" button shortly after the tag goes
+    // up, instead of only on page load. TEMP cadence — restore to
+    // mount-only (or a slower poll) after the self-update test
+    // cycle finishes.
+    const t = window.setInterval(reload, 60_000);
+    return () => window.clearInterval(t);
   }, []);
 
   // Dot animation while any agent is mid-update.

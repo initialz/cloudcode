@@ -28,20 +28,34 @@ export function Layout() {
     );
   }, []);
 
-  // Probe latest release tag once we know our own version, so we only
-  // show the Update button when it'd actually do something. Failures
-  // are silent — the button just stays hidden.
+  // Probe the latest release tag periodically so the Update badge
+  // shows up shortly after a new tag is published, not just at page
+  // load. We skip re-polling while an update is in flight (avoids
+  // racing with the `updating` / `waiting` state). TEMP cadence —
+  // restore to a longer interval (or back to mount-only) after the
+  // self-update test cycle.
   useEffect(() => {
     if (!hubVersion) return;
-    apiClient.agents.releases().then(
-      (r) => {
-        if (!r.latest) return;
-        if (compareSemver(r.latest, hubVersion) > 0) {
-          setUpdate({ kind: 'available', latest: r.latest });
-        }
-      },
-      () => {},
-    );
+    const check = () => {
+      apiClient.agents.releases().then(
+        (r) => {
+          if (!r.latest) return;
+          const latest = r.latest;
+          setUpdate((cur) => {
+            if (cur.kind === 'updating' || cur.kind === 'waiting' || cur.kind === 'failed') {
+              return cur;
+            }
+            return compareSemver(latest, hubVersion) > 0
+              ? { kind: 'available', latest }
+              : { kind: 'idle' };
+          });
+        },
+        () => {},
+      );
+    };
+    check();
+    const t = window.setInterval(check, 60_000);
+    return () => window.clearInterval(t);
   }, [hubVersion]);
 
   // Dot-animation timer while updating or waiting.
