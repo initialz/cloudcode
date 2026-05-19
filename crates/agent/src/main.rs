@@ -1,4 +1,5 @@
 mod config;
+mod config_schema;
 mod jsonl;
 mod name;
 mod pty;
@@ -178,6 +179,16 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
             config_path.display(),
             config_path.display()
         ));
+    }
+
+    // Best-effort: append commented-out docs for any new schema keys
+    // a previous release didn't write. Soft-fail if the file is
+    // read-only / unparseable; Config::load below will surface the
+    // real problem.
+    if let Err(e) =
+        cloudcode_daemon::config_sync::sync_with_file(&config_path, config_schema::SCHEMA)
+    {
+        tracing::warn!(error = %e, "config schema sync failed");
     }
 
     let config =

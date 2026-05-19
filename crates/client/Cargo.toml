@@ -24,6 +24,7 @@ ratatui.workspace = true
 bytes.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+cloudcode-daemon = { path = "../daemon" }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

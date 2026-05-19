@@ -476,38 +476,53 @@ where
             true
         }
         ClientToHub::DeleteWorkspace { name } => {
-            // v1.13: refuse the delete if some agent holds the lock,
-            // otherwise nuke both the DB row and the on-disk copy.
-            match ctx
+            // v1.13: refuse only when there's an *active* PTY session
+            // on this workspace right now. The DB `locked_by_agent`
+            // field is a long-lived "this agent holds the local
+            // working copy" marker — it stays set after the user
+            // exits claude so a re-open from the same agent doesn't
+            // need a re-pull. Using that as the delete gate (the old
+            // behaviour) meant every workspace became un-deletable
+            // after its first session, with no UX path back. The
+            // session_locks DashMap is the right signal: entries are
+            // inserted in OpenSession and removed on PtyClosed.
+            let actively_used = ctx.state.session_locks.iter().any(|e| {
+                let (_agent, account, ws) = e.key();
+                account == &ctx.account_name && ws == &name
+            });
+            if actively_used {
+                let _ = send_client(
+                    sink,
+                    &HubToClient::SessionError {
+                        message: format!("workspace '{}' is currently in use", name),
+                    },
+                )
+                .await;
+                return true;
+            }
+            // If some agent still holds the long-lived lock (i.e. has
+            // a stale local copy from a past session), queue a
+            // cleanup so it'll rm-rf its copy on next reconnect, and
+            // also push it live if the agent is online. Same pattern
+            // as force-take. We do this even if the agent is offline
+            // — the queue is the durable channel.
+            if let Ok(Some(holder)) = ctx
                 .state
                 .db
                 .get_workspace_lock(&ctx.account_name, &name)
                 .await
             {
-                Ok(Some(holder)) => {
-                    let _ = send_client(
-                        sink,
-                        &HubToClient::SessionError {
-                            message: format!(
-                                "workspace '{}' is currently in use by agent '{}'",
-                                name, holder
-                            ),
-                        },
-                    )
-                    .await;
-                    return true;
+                if let Err(e) = ctx
+                    .state
+                    .db
+                    .queue_pending_cleanup(&holder, &ctx.account_name, &name)
+                    .await
+                {
+                    tracing::warn!(error = %e, "queue_pending_cleanup failed during delete");
                 }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::warn!(error = %e, "get_workspace_lock failed");
-                    let _ = send_client(
-                        sink,
-                        &HubToClient::SessionError {
-                            message: "could not check workspace lock".into(),
-                        },
-                    )
-                    .await;
-                    return true;
+                if let Some(holder_conn) = ctx.state.registry.get(&holder) {
+                    let items = vec![(ctx.account_name.clone(), name.clone())];
+                    let _ = holder_conn.send(ServerMsg::WorkspaceCleanup { items }).await;
                 }
             }
             // Best-effort filesystem cleanup first — leaving orphan

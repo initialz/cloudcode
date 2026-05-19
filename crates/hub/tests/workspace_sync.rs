@@ -251,6 +251,7 @@ async fn spawn_hub() -> Result<HubProcess> {
     let config_path = base.path().join("hub.toml");
     let db_path = base.path().join("hub.db");
     let audit_path = base.path().join("audit.jsonl");
+    let ws_root = base.path().join("hub").join("workspaces");
     let toml = format!(
         r#"
 [server]
@@ -263,11 +264,15 @@ registration_token_hash = "{hash}"
 [admin]
 db_path = "{db}"
 listen = "127.0.0.1:0"
+
+[workspaces]
+root = "{ws_root}"
 "#,
         listen_port = listen_port,
         audit = audit_path.display(),
         hash = agent_token_hash.replace('\\', "\\\\"),
         db = db_path.display(),
+        ws_root = ws_root.display(),
     );
     std::fs::write(&config_path, toml)?;
 

@@ -397,6 +397,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "cloudcode-daemon",
  "crossterm",
  "dirs",
  "futures",
@@ -420,6 +421,9 @@ dependencies = [
  "clap",
  "dirs",
  "libc",
+ "tempfile",
+ "toml_edit",
+ "tracing",
 ]
 
 [[package]]

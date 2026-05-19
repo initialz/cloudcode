@@ -1,3 +1,4 @@
+mod config_schema;
 mod input;
 mod menu;
 mod proto;
@@ -107,6 +108,12 @@ fn resolve_config_path(override_path: Option<&PathBuf>) -> Result<PathBuf> {
 
 fn load_config(override_path: Option<&PathBuf>) -> Result<ClientConfig> {
     let path = resolve_config_path(override_path)?;
+    // Best-effort schema sync. Currently a no-op because the client
+    // config only has required fields, but the call stays wired so
+    // future optional knobs auto-document themselves the way hub /
+    // agent do. Failure (file missing, read-only) is silently
+    // ignored — `read_to_string` below will produce the real error.
+    let _ = cloudcode_daemon::config_sync::sync_with_file(&path, config_schema::SCHEMA);
     let s = std::fs::read_to_string(&path).with_context(|| {
         format!(
             "reading {} (run `cloudcode config` for instructions)",
@@ -330,11 +337,17 @@ async fn run_chat(
         Some(workspace) => menu::MenuStart::AgentPicker { workspace },
         None => menu::MenuStart::WorkspacePicker,
     };
+    let mut pending_error: Option<String> = None;
 
     loop {
-        let outcome = menu::run(&mut wire, &mut bytes, &account_name, next_start).await?;
-        // Default for the next iteration; overridden after a successful PTY.
-        next_start = menu::MenuStart::WorkspacePicker;
+        let outcome = menu::run(
+            &mut wire,
+            &mut bytes,
+            &account_name,
+            next_start,
+            pending_error.take(),
+        )
+        .await?;
         match outcome {
             menu::MenuOutcome::OpenWorkspace { workspace, agent } => {
                 let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -357,7 +370,11 @@ async fn run_chat(
                             break;
                         }
                         Some(HubToClient::SessionError { message }) => {
-                            eprintln!("[cc] {}", message);
+                            // Stash for the next menu invocation —
+                            // the alt screen has just been torn down,
+                            // so a plain stderr print would flash and
+                            // disappear when the menu re-enters.
+                            pending_error = Some(format!("Open failed: {}", message));
                             break;
                         }
                         Some(HubToClient::Ping) => {
@@ -368,6 +385,10 @@ async fn run_chat(
                     }
                 }
                 if !opened {
+                    // Land on the agent picker so the user can retry
+                    // (or Esc back to the workspace picker) without
+                    // re-navigating from scratch.
+                    next_start = menu::MenuStart::AgentPicker { workspace };
                     continue;
                 }
                 write_last_workspace_global(&workspace);

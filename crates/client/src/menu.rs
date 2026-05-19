@@ -46,6 +46,7 @@ pub async fn run(
     bytes: &mut ByteRx,
     account: &str,
     start: MenuStart,
+    pending_error: Option<String>,
 ) -> Result<MenuOutcome> {
     enable_raw_mode()?;
     let mut out = stdout();
@@ -53,6 +54,14 @@ pub async fn run(
     let backend = CrosstermBackend::new(out);
     let mut term = Terminal::new(backend)?;
     let mut keys = MenuKeyQueue::default();
+    // Surface any error the caller picked up after the last menu run
+    // (e.g. SessionError from a failed OpenSession). Without this the
+    // error gets eprintln'd between alt-screen tear-down and re-entry
+    // and the user effectively sees nothing — looks like a silent
+    // bounce back to the picker.
+    if let Some(msg) = pending_error {
+        show_message(&mut term, &msg, bytes, &mut keys).await.ok();
+    }
     let result = run_inner(&mut term, wire, bytes, &mut keys, account, start).await;
     disable_raw_mode().ok();
     execute!(term.backend_mut(), LeaveAlternateScreen).ok();
@@ -195,13 +204,13 @@ async fn pick_workspace_stage<B: ratatui::backend::Backend>(
                 badge: w.locked_by_agent.as_ref().map(|a| Badge::locked(a)),
             })
             .collect();
-        let preferred = pending_select.take();
-        let initial = preferred
-            .as_deref()
-            .and_then(|n| workspaces.iter().position(|w| w.name == n))
-            .unwrap_or(0);
-        if w_state.selected().is_none() || preferred.is_none() {
-            w_state.select(Some(initial.min(workspaces.len().saturating_sub(1))));
+        let names: Vec<&str> = workspaces.iter().map(|w| w.name.as_str()).collect();
+        if let Some(idx) = decide_initial_selection(
+            pending_select.take().as_deref(),
+            w_state.selected(),
+            &names,
+        ) {
+            w_state.select(Some(idx));
         }
         term.draw(|f| {
             draw_layout(
@@ -310,6 +319,41 @@ enum ListAction {
     Pick,
     Quit,
     Pass,
+}
+
+/// Pure helper for the workspace picker's per-iteration "what row
+/// should be selected" decision. Lives outside the async menu loop
+/// so it's unit-testable. Returns `Some(idx)` when the caller should
+/// move selection, `None` when it should leave the existing state
+/// untouched (this is the case that the v1.13.0 ship-blocker bug
+/// got wrong — every iteration was overwriting the user's arrow-key
+/// motion back to row 0).
+///
+/// Precedence:
+///   1. `pending` set and present in the list → that row.
+///   2. `pending` set but not present (e.g. workspace was just
+///      deleted) → row 0 if the list is non-empty, else None.
+///   3. No `pending`, no `current` and list non-empty → row 0
+///      (first-paint default).
+///   4. No `pending`, `current` is Some → leave it alone (return
+///      None) so the user's keyboard motion persists across the
+///      next list refresh.
+fn decide_initial_selection(
+    pending: Option<&str>,
+    current: Option<usize>,
+    names: &[&str],
+) -> Option<usize> {
+    if let Some(name) = pending {
+        if names.is_empty() {
+            return None;
+        }
+        let idx = names.iter().position(|n| *n == name).unwrap_or(0);
+        return Some(idx.min(names.len() - 1));
+    }
+    if current.is_none() && !names.is_empty() {
+        return Some(0);
+    }
+    None
 }
 
 fn handle_list_key(k: MenuKey, state: &mut ListState, len: usize) -> ListAction {
@@ -967,4 +1011,72 @@ async fn expect_text(wire: &mut Wire) -> Result<HubToClient> {
         .recv()
         .await
         .ok_or_else(|| anyhow!("hub disconnected"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_match_picks_that_row() {
+        let names = ["alpha", "beta", "gamma"];
+        assert_eq!(
+            decide_initial_selection(Some("beta"), None, &names),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn pending_no_match_falls_back_to_first() {
+        let names = ["alpha", "beta"];
+        assert_eq!(
+            decide_initial_selection(Some("ghost"), None, &names),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn pending_on_empty_list_returns_none() {
+        let names: [&str; 0] = [];
+        assert_eq!(decide_initial_selection(Some("beta"), None, &names), None);
+    }
+
+    #[test]
+    fn first_paint_with_no_pending_lands_on_row_zero() {
+        let names = ["alpha", "beta"];
+        assert_eq!(decide_initial_selection(None, None, &names), Some(0));
+    }
+
+    #[test]
+    fn empty_list_with_no_pending_returns_none() {
+        let names: [&str; 0] = [];
+        assert_eq!(decide_initial_selection(None, None, &names), None);
+    }
+
+    /// The regression that shipped on v1.13.0 RC: arrow keys appeared
+    /// dead because every loop iteration reset selection back to 0.
+    /// With the fix, an existing user selection must be left alone
+    /// when no pending name is being applied — `decide_initial_selection`
+    /// returns None so the caller doesn't touch `w_state`.
+    #[test]
+    fn existing_selection_is_preserved_across_refresh() {
+        let names = ["alpha", "beta", "gamma"];
+        assert_eq!(decide_initial_selection(None, Some(2), &names), None);
+        assert_eq!(decide_initial_selection(None, Some(0), &names), None);
+    }
+
+    /// After a delete shrinks the list, a pending name that still
+    /// exists must clamp to a valid index.
+    #[test]
+    fn pending_clamps_when_list_shrinks() {
+        let names = ["alpha"];
+        // Pending was set to "alpha" which is still at index 0 —
+        // straightforward. The interesting case is when `position`
+        // returns 0 but the list is genuinely length-1; ensure no
+        // off-by-one.
+        assert_eq!(
+            decide_initial_selection(Some("alpha"), Some(5), &names),
+            Some(0)
+        );
+    }
 }

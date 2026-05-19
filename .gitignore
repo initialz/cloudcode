@@ -9,3 +9,10 @@ audit.jsonl
 
 # Claude Code 本地 agent 定义、scheduled tasks 锁等用户机状态
 .claude/
+
+# v1.13 hub / agent 新的默认 workspace 路径——任何在 repo 内跑过 hub/agent
+# 的开发都会在仓库根、或 crates/hub/、crates/agent/ 下生成这些目录
+hub/workspaces/
+agent/workspaces/
+crates/*/hub/workspaces/
+crates/*/agent/workspaces/

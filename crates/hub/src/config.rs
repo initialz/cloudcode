@@ -14,6 +14,8 @@ pub struct Config {
     pub accounts: Vec<Account>,
     #[serde(default)]
     pub admin: AdminConfig,
+    #[serde(default)]
+    pub workspaces: WorkspacesConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +79,16 @@ fn default_db_path() -> PathBuf {
 
 fn default_admin_listen() -> String {
     "0.0.0.0:7101".into()
+}
+
+/// Hub-canonical workspace storage. Defaults to `./hub/workspaces`
+/// (relative to the hub's cwd, like `./audit.jsonl` /
+/// `./cloudcode-hub.db`). Override `root` with an absolute path when
+/// workspaces should live on a separate volume.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct WorkspacesConfig {
+    #[serde(default)]
+    pub root: Option<PathBuf>,
 }
 
 impl Config {

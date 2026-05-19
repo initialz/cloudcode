@@ -995,15 +995,32 @@ impl PtyManager {
             return;
         }
         let dir = self.workspace_root().join(&account).join(&workspace);
-        // Fresh slate: blow away whatever was there before, then
-        // recreate. We do this synchronously in a tokio blocking task
-        // so the WS read loop isn't stalled.
+        // Wipe the dir's contents but preserve the directory inode
+        // itself. The "rm -rf + mkdir" approach we used to do here
+        // breaks the wrapper's resume-on-reattach flow: when a user
+        // exits claude cleanly the wrapper parks and the tmux server
+        // stays alive holding `cwd = <old inode>`. A subsequent pull
+        // would unlink that inode under it, so the next claude
+        // relaunch (triggered by tmux re-attach) inherits a dangling
+        // cwd — `getcwd()` returns ENOENT and claude exits before it
+        // can even paint, and from hub's POV the session just closes
+        // again. Wiping children instead keeps the inode and the new
+        // canonical bytes still land where the wrapper expects them.
         let dir_for_io = dir.clone();
         let wipe = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            if dir_for_io.exists() {
-                std::fs::remove_dir_all(&dir_for_io)?;
+            if !dir_for_io.exists() {
+                std::fs::create_dir_all(&dir_for_io)?;
+                return Ok(());
             }
-            std::fs::create_dir_all(&dir_for_io)?;
+            for entry in std::fs::read_dir(&dir_for_io)? {
+                let entry = entry?;
+                let path = entry.path();
+                if entry.file_type()?.is_dir() {
+                    std::fs::remove_dir_all(&path)?;
+                } else {
+                    std::fs::remove_file(&path)?;
+                }
+            }
             Ok(())
         })
         .await;
@@ -1690,6 +1707,63 @@ mod tests {
             std::fs::read(ws_dir.join("sub/dir/file.txt")).unwrap(),
             b"deep"
         );
+    }
+
+    /// Pinning the inode-preservation fix: a second pull on the same
+    /// workspace must wipe the contents but keep the directory inode
+    /// alive, otherwise a still-running tmux server (whose cwd is that
+    /// inode) loses its cwd and any tool relaunch on reattach fails
+    /// with ENOENT. See the comment in `workspace_pull_start`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn second_pull_preserves_workspace_dir_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = Arc::new(PtyManager::for_test(dir.path().to_path_buf()));
+        let (tx, mut rx) = mpsc::channel(64);
+        let ws_dir = dir.path().join("alice").join("ws1");
+
+        // First pull: 1 file.
+        let sid1 = Uuid::new_v4();
+        mgr.workspace_pull_start(sid1, "alice".into(), "ws1".into(), 1, tx.clone())
+            .await;
+        mgr.workspace_file(
+            sid1,
+            "first.txt".into(),
+            b"first".to_vec(),
+            true,
+            tx.clone(),
+        )
+        .await;
+        wait_for(&mut rx, |m| matches!(m, ClientMsg::WorkspacePullAck { .. }))
+            .await
+            .expect("first PullAck");
+        let inode_before = std::fs::metadata(&ws_dir).unwrap().ino();
+        assert!(ws_dir.join("first.txt").exists());
+
+        // Second pull: a different file. The dir contents change but
+        // the dir's own inode must survive.
+        let sid2 = Uuid::new_v4();
+        mgr.workspace_pull_start(sid2, "alice".into(), "ws1".into(), 1, tx.clone())
+            .await;
+        mgr.workspace_file(
+            sid2,
+            "second.txt".into(),
+            b"second".to_vec(),
+            true,
+            tx.clone(),
+        )
+        .await;
+        wait_for(&mut rx, |m| matches!(m, ClientMsg::WorkspacePullAck { .. }))
+            .await
+            .expect("second PullAck");
+        let inode_after = std::fs::metadata(&ws_dir).unwrap().ino();
+        assert_eq!(
+            inode_before, inode_after,
+            "workspace dir inode must be stable across pulls"
+        );
+        assert!(!ws_dir.join("first.txt").exists());
+        assert!(ws_dir.join("second.txt").exists());
     }
 
     #[tokio::test]

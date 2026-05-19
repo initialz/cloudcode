@@ -53,7 +53,7 @@
   <div class="meta">
     Date: 2026-05-19 &nbsp;·&nbsp;
     Branch: feature/hub-managed-workspace &nbsp;·&nbsp;
-    Commit: 771c172 &nbsp;·&nbsp;
+    Commit: 64905ba &nbsp;·&nbsp;
     Host: Darwin arm64 &nbsp;·&nbsp;
     Verdict: <span class="badge pass">5/5 PASSED</span>
   </div>
@@ -68,17 +68,17 @@
 
 <h2>Environment + isolation</h2>
 <table>
-  <tr><th>State dir</th><td class="mono">/private/var/folders/s8/rz7zn1d10757p2x7kz724h0c0000gn/T/cc-smoke.wNjsRetzcU</td></tr>
-  <tr><th>Hub listen</th><td class="mono">127.0.0.1:58429 (PTY/agent), 127.0.0.1:58430 (admin)</td></tr>
-  <tr><th>Hub canonical store</th><td class="mono">/private/var/folders/s8/rz7zn1d10757p2x7kz724h0c0000gn/T/cc-smoke.wNjsRetzcU/hub-state/hub/workspaces</td></tr>
-  <tr><th>Agent A workspace_root</th><td class="mono">/private/var/folders/s8/rz7zn1d10757p2x7kz724h0c0000gn/T/cc-smoke.wNjsRetzcU/agent-A/workspaces</td></tr>
-  <tr><th>Agent B workspace_root</th><td class="mono">/private/var/folders/s8/rz7zn1d10757p2x7kz724h0c0000gn/T/cc-smoke.wNjsRetzcU/agent-B/workspaces</td></tr>
-  <tr><th>Agent C workspace_root</th><td class="mono">/private/var/folders/s8/rz7zn1d10757p2x7kz724h0c0000gn/T/cc-smoke.wNjsRetzcU/agent-C/workspaces</td></tr>
+  <tr><th>State dir</th><td class="mono">/private/var/folders/s8/rz7zn1d10757p2x7kz724h0c0000gn/T/cc-smoke.Is1OveNqlx</td></tr>
+  <tr><th>Hub listen</th><td class="mono">127.0.0.1:59382 (PTY/agent), 127.0.0.1:59383 (admin)</td></tr>
+  <tr><th>Hub canonical store</th><td class="mono">/private/var/folders/s8/rz7zn1d10757p2x7kz724h0c0000gn/T/cc-smoke.Is1OveNqlx/hub-state/hub/workspaces</td></tr>
+  <tr><th>Agent A workspace_root</th><td class="mono">/private/var/folders/s8/rz7zn1d10757p2x7kz724h0c0000gn/T/cc-smoke.Is1OveNqlx/agent-A/workspaces</td></tr>
+  <tr><th>Agent B workspace_root</th><td class="mono">/private/var/folders/s8/rz7zn1d10757p2x7kz724h0c0000gn/T/cc-smoke.Is1OveNqlx/agent-B/workspaces</td></tr>
+  <tr><th>Agent C workspace_root</th><td class="mono">/private/var/folders/s8/rz7zn1d10757p2x7kz724h0c0000gn/T/cc-smoke.Is1OveNqlx/agent-C/workspaces</td></tr>
 </table>
-<p>The script writes nothing outside <code class="inline">/private/var/folders/s8/rz7zn1d10757p2x7kz724h0c0000gn/T/cc-smoke.wNjsRetzcU</code> and
+<p>The script writes nothing outside <code class="inline">/private/var/folders/s8/rz7zn1d10757p2x7kz724h0c0000gn/T/cc-smoke.Is1OveNqlx</code> and
 <code class="inline">docs/test-reports/</code>. The user's
 <code class="inline">~/.local/state/cloudcode</code> is never touched (every process boots with
-<code class="inline">CLOUDCODE_STATE_DIR=/private/var/folders/s8/rz7zn1d10757p2x7kz724h0c0000gn/T/cc-smoke.wNjsRetzcU/...</code>).</p>
+<code class="inline">CLOUDCODE_STATE_DIR=/private/var/folders/s8/rz7zn1d10757p2x7kz724h0c0000gn/T/cc-smoke.Is1OveNqlx/...</code>).</p>
 <h2>CASE 1 <span class="badge pass">PASS</span></h2>
 <div class="verdict">Workspace 'demo' created and seeded with README.md</div>
 <h2>CASE 2 <span class="badge pass">PASS</span></h2>
@@ -91,54 +91,54 @@
 <div class="verdict">Frozen-holder force-take + Welcome-drain cleanup work end-to-end</div>
 
 <h2>Script log</h2>
-<pre class="log">[CASE 1] wrote /private/var/folders/s8/rz7zn1d10757p2x7kz724h0c0000gn/T/cc-smoke.wNjsRetzcU/hub-state/hub/workspaces/alice/demo/README.md = &#x27;hello v1.13&#x27;
+<pre class="log">[CASE 1] wrote /private/var/folders/s8/rz7zn1d10757p2x7kz724h0c0000gn/T/cc-smoke.Is1OveNqlx/hub-state/hub/workspaces/alice/demo/README.md = &#x27;hello v1.13&#x27;
 [CASE 2] agent-A pulled README.md (      12 bytes)
 [CASE 3] appended to README.md, created NEW_FILE.md on agent-A
 [CASE 3] hub canonical mirrors push
 [CASE 4] lock holder=smoke-agent-B, agent-A local copy cleared
-[CASE 5] agent-B SIGSTOPped (pid 55161); WS stays half-alive
+[CASE 5] agent-B SIGSTOPped (pid 63154); WS stays half-alive
 [CASE 5] agent-C took lock; pending_workspace_cleanups has 1 row for B
-[CASE 5] agent-B Welcome drain removed /private/var/folders/s8/rz7zn1d10757p2x7kz724h0c0000gn/T/cc-smoke.wNjsRetzcU/agent-B/workspaces/alice/demo</pre>
+[CASE 5] agent-B Welcome drain removed /private/var/folders/s8/rz7zn1d10757p2x7kz724h0c0000gn/T/cc-smoke.Is1OveNqlx/agent-B/workspaces/alice/demo</pre>
 
 <h2>Hub log (tail)</h2>
-<pre class="log">[2m2026-05-19T07:17:45.815753Z[0m [32m INFO[0m [2mcloudcode_hub[0m[2m:[0m cloudcode hub listening on 127.0.0.1:58429
-[2m2026-05-19T07:17:45.815869Z[0m [32m INFO[0m [2mcloudcode_hub[0m[2m:[0m admin UI ready (login at /admin/login) [3madmin[0m[2m=[0m127.0.0.1:58430
-[2m2026-05-19T07:17:46.170893Z[0m [32m INFO[0m [2mcloudcode_hub::ws_handler[0m[2m:[0m agent connected [3magent[0m[2m=[0msmoke-agent-A
-[2m2026-05-19T07:17:46.172584Z[0m [32m INFO[0m [2mcloudcode_hub::ws_handler[0m[2m:[0m agent connected [3magent[0m[2m=[0msmoke-agent-B
-[2m2026-05-19T07:17:47.550389Z[0m [32m INFO[0m [2mcloudcode_hub::pty_session[0m[2m:[0m pushed live WorkspaceCleanup to online previous holder [3magent[0m[2m=[0msmoke-agent-A [3maccount[0m[2m=[0malice [3mworkspace[0m[2m=[0mdemo
-[2m2026-05-19T07:17:59.572312Z[0m [33m WARN[0m [2mcloudcode_hub::registry[0m[2m:[0m no session route for frame; dropping [3msession[0m[2m=[0md0560658-6ba5-4797-bcf5-529255522cb9
-[2m2026-05-19T07:18:01.501318Z[0m [32m INFO[0m [2mcloudcode_hub::ws_handler[0m[2m:[0m agent connected [3magent[0m[2m=[0msmoke-agent-C
-[2m2026-05-19T07:18:01.520577Z[0m [32m INFO[0m [2mcloudcode_hub::pty_session[0m[2m:[0m pushed live WorkspaceCleanup to online previous holder [3magent[0m[2m=[0msmoke-agent-B [3maccount[0m[2m=[0malice [3mworkspace[0m[2m=[0mdemo
-[2m2026-05-19T07:18:01.740453Z[0m [34mDEBUG[0m [2mcloudcode_hub::ws_handler[0m[2m:[0m ws read error [3magent[0m[2m=[0msmoke-agent-B [3merror[0m[2m=[0mIO error: Connection reset by peer (os error 54)
-[2m2026-05-19T07:18:01.740497Z[0m [32m INFO[0m [2mcloudcode_hub::ws_handler[0m[2m:[0m agent disconnected [3magent[0m[2m=[0msmoke-agent-B
-[2m2026-05-19T07:18:01.783436Z[0m [32m INFO[0m [2mcloudcode_hub::ws_handler[0m[2m:[0m agent connected [3magent[0m[2m=[0msmoke-agent-B
-[2m2026-05-19T07:18:01.783971Z[0m [32m INFO[0m [2mcloudcode_hub::ws_handler[0m[2m:[0m draining pending workspace cleanups [3magent[0m[2m=[0msmoke-agent-B [3mcount[0m[2m=[0m1</pre>
+<pre class="log">[2m2026-05-19T07:33:25.810984Z[0m [32m INFO[0m [2mcloudcode_hub[0m[2m:[0m cloudcode hub listening on 127.0.0.1:59382
+[2m2026-05-19T07:33:25.811113Z[0m [32m INFO[0m [2mcloudcode_hub[0m[2m:[0m admin UI ready (login at /admin/login) [3madmin[0m[2m=[0m127.0.0.1:59383
+[2m2026-05-19T07:33:26.174352Z[0m [32m INFO[0m [2mcloudcode_hub::ws_handler[0m[2m:[0m agent connected [3magent[0m[2m=[0msmoke-agent-A
+[2m2026-05-19T07:33:26.189896Z[0m [32m INFO[0m [2mcloudcode_hub::ws_handler[0m[2m:[0m agent connected [3magent[0m[2m=[0msmoke-agent-B
+[2m2026-05-19T07:33:28.043847Z[0m [32m INFO[0m [2mcloudcode_hub::pty_session[0m[2m:[0m pushed live WorkspaceCleanup to online previous holder [3magent[0m[2m=[0msmoke-agent-A [3maccount[0m[2m=[0malice [3mworkspace[0m[2m=[0mdemo
+[2m2026-05-19T07:33:40.060682Z[0m [33m WARN[0m [2mcloudcode_hub::registry[0m[2m:[0m no session route for frame; dropping [3msession[0m[2m=[0m6781eec8-5973-45bb-94d2-036645a84f5d
+[2m2026-05-19T07:33:41.981271Z[0m [32m INFO[0m [2mcloudcode_hub::ws_handler[0m[2m:[0m agent connected [3magent[0m[2m=[0msmoke-agent-C
+[2m2026-05-19T07:33:42.000446Z[0m [32m INFO[0m [2mcloudcode_hub::pty_session[0m[2m:[0m pushed live WorkspaceCleanup to online previous holder [3magent[0m[2m=[0msmoke-agent-B [3maccount[0m[2m=[0malice [3mworkspace[0m[2m=[0mdemo
+[2m2026-05-19T07:33:42.218308Z[0m [34mDEBUG[0m [2mcloudcode_hub::ws_handler[0m[2m:[0m ws read error [3magent[0m[2m=[0msmoke-agent-B [3merror[0m[2m=[0mIO error: Connection reset by peer (os error 54)
+[2m2026-05-19T07:33:42.218349Z[0m [32m INFO[0m [2mcloudcode_hub::ws_handler[0m[2m:[0m agent disconnected [3magent[0m[2m=[0msmoke-agent-B
+[2m2026-05-19T07:33:42.255957Z[0m [32m INFO[0m [2mcloudcode_hub::ws_handler[0m[2m:[0m agent connected [3magent[0m[2m=[0msmoke-agent-B
+[2m2026-05-19T07:33:42.256327Z[0m [32m INFO[0m [2mcloudcode_hub::ws_handler[0m[2m:[0m draining pending workspace cleanups [3magent[0m[2m=[0msmoke-agent-B [3mcount[0m[2m=[0m1</pre>
 
 <h2>Agent A log (tail)</h2>
-<pre class="log">[2m2026-05-19T07:17:46.153267Z[0m [32m INFO[0m [2mcloudcode_agent[0m[2m:[0m starting cloudcode-agent [3magent[0m[2m=[0msmoke-agent-A
-[2m2026-05-19T07:17:46.154060Z[0m [32m INFO[0m [2mcloudcode_agent::pty[0m[2m:[0m tmux ready [3mtmux[0m[2m=[0m/opt/homebrew/bin/tmux
-[2m2026-05-19T07:17:46.154078Z[0m [32m INFO[0m [2mcloudcode_agent::pty[0m[2m:[0m workspace sandbox capability available [3mwrapper[0m[2m=[0m/Users/petez/data/vtech/src/vibe/cloudcode/target/release/cloudcode-agent
-[2m2026-05-19T07:17:46.154187Z[0m [32m INFO[0m [2mcloudcode_agent::pty[0m[2m:[0m wrote tmux.conf (mouse on) [3mpath[0m[2m=[0m/Users/petez/.local/state/cloudcode/agent/tmux.conf
-[2m2026-05-19T07:17:46.154263Z[0m [32m INFO[0m [2mcloudcode_agent::ws[0m[2m:[0m connecting to hub [3murl[0m[2m=[0mws://127.0.0.1:58429/v1/agent/ws [3mname[0m[2m=[0msmoke-agent-A
-[2m2026-05-19T07:17:46.171033Z[0m [32m INFO[0m [2mcloudcode_agent::ws[0m[2m:[0m connected to hub [3magent[0m[2m=[0msmoke-agent-A
-[2m2026-05-19T07:17:46.456143Z[0m [34mDEBUG[0m [2mcloudcode_agent::pty[0m[2m:[0m workspace pull: complete [3msession_id[0m[2m=[0m11ac157a-dc95-44b0-9d15-5eed7e9ae767 [3mfiles[0m[2m=[0m1
-[2m2026-05-19T07:17:46.461262Z[0m [32m INFO[0m [2mcloudcode_agent::jsonl[0m[2m:[0m jsonl: watcher started [3msession[0m[2m=[0m11ac157a-dc95-44b0-9d15-5eed7e9ae767 [3mdir[0m[2m=[0m/Users/petez/.claude/projects/-private-var-folders-s8-rz7zn1d10757p2x7kz724h0c0000gn-T-cc-smoke.wNjsRetzcU-agent-A-workspaces-alice-demo
-[2m2026-05-19T07:17:46.472686Z[0m [32m INFO[0m [2mcloudcode_agent::pty[0m[2m:[0m recording started [3mpath[0m[2m=[0m/Users/petez/.local/state/cloudcode/agent/recordings/alice/demo/11ac157a-dc95-44b0-9d15-5eed7e9ae767.cast [3mat[0m[2m=[0m2026-05-19T07:17:46Z
-[2m2026-05-19T07:17:47.558422Z[0m [32m INFO[0m [2mcloudcode_agent::pty[0m[2m:[0m workspace cleanup: removed [3maccount[0m[2m=[0malice [3mworkspace[0m[2m=[0mdemo
-[2m2026-05-19T07:17:47.558530Z[0m [32m INFO[0m [2mcloudcode_agent::pty[0m[2m:[0m workspace cleanup: done [3mcleared[0m[2m=[0m1 [3mfailed[0m[2m=[0m0
-[2m2026-05-19T07:17:47.559441Z[0m [34mDEBUG[0m [2mcloudcode_agent::sync::runtime[0m[2m:[0m push worker: shutdown [3msession[0m[2m=[0m11ac157a-dc95-44b0-9d15-5eed7e9ae767
-[2m2026-05-19T07:17:47.559470Z[0m [34mDEBUG[0m [2mcloudcode_agent::sync::runtime[0m[2m:[0m push worker: exiting [3msession[0m[2m=[0m11ac157a-dc95-44b0-9d15-5eed7e9ae767
-[2m2026-05-19T07:17:47.559796Z[0m [32m INFO[0m [2mcloudcode_agent::jsonl[0m[2m:[0m jsonl: watcher stopped [3msession[0m[2m=[0m11ac157a-dc95-44b0-9d15-5eed7e9ae767</pre>
+<pre class="log">[2m2026-05-19T07:33:26.159445Z[0m [32m INFO[0m [2mcloudcode_agent[0m[2m:[0m starting cloudcode-agent [3magent[0m[2m=[0msmoke-agent-A
+[2m2026-05-19T07:33:26.159563Z[0m [32m INFO[0m [2mcloudcode_agent::pty[0m[2m:[0m tmux ready [3mtmux[0m[2m=[0m/opt/homebrew/bin/tmux
+[2m2026-05-19T07:33:26.159577Z[0m [32m INFO[0m [2mcloudcode_agent::pty[0m[2m:[0m workspace sandbox capability available [3mwrapper[0m[2m=[0m/Users/petez/data/vtech/src/vibe/cloudcode/target/release/cloudcode-agent
+[2m2026-05-19T07:33:26.159665Z[0m [32m INFO[0m [2mcloudcode_agent::pty[0m[2m:[0m wrote tmux.conf (mouse on) [3mpath[0m[2m=[0m/Users/petez/.local/state/cloudcode/agent/tmux.conf
+[2m2026-05-19T07:33:26.159681Z[0m [32m INFO[0m [2mcloudcode_agent::ws[0m[2m:[0m connecting to hub [3murl[0m[2m=[0mws://127.0.0.1:59382/v1/agent/ws [3mname[0m[2m=[0msmoke-agent-A
+[2m2026-05-19T07:33:26.174469Z[0m [32m INFO[0m [2mcloudcode_agent::ws[0m[2m:[0m connected to hub [3magent[0m[2m=[0msmoke-agent-A
+[2m2026-05-19T07:33:26.940942Z[0m [34mDEBUG[0m [2mcloudcode_agent::pty[0m[2m:[0m workspace pull: complete [3msession_id[0m[2m=[0m69de5e29-42b0-4465-8ea6-25026ac30c02 [3mfiles[0m[2m=[0m1
+[2m2026-05-19T07:33:26.944406Z[0m [32m INFO[0m [2mcloudcode_agent::jsonl[0m[2m:[0m jsonl: watcher started [3msession[0m[2m=[0m69de5e29-42b0-4465-8ea6-25026ac30c02 [3mdir[0m[2m=[0m/Users/petez/.claude/projects/-private-var-folders-s8-rz7zn1d10757p2x7kz724h0c0000gn-T-cc-smoke.Is1OveNqlx-agent-A-workspaces-alice-demo
+[2m2026-05-19T07:33:26.951819Z[0m [32m INFO[0m [2mcloudcode_agent::pty[0m[2m:[0m recording started [3mpath[0m[2m=[0m/Users/petez/.local/state/cloudcode/agent/recordings/alice/demo/69de5e29-42b0-4465-8ea6-25026ac30c02.cast [3mat[0m[2m=[0m2026-05-19T07:33:26Z
+[2m2026-05-19T07:33:28.051664Z[0m [32m INFO[0m [2mcloudcode_agent::pty[0m[2m:[0m workspace cleanup: removed [3maccount[0m[2m=[0malice [3mworkspace[0m[2m=[0mdemo
+[2m2026-05-19T07:33:28.051695Z[0m [32m INFO[0m [2mcloudcode_agent::pty[0m[2m:[0m workspace cleanup: done [3mcleared[0m[2m=[0m1 [3mfailed[0m[2m=[0m0
+[2m2026-05-19T07:33:28.052000Z[0m [34mDEBUG[0m [2mcloudcode_agent::sync::runtime[0m[2m:[0m push worker: shutdown [3msession[0m[2m=[0m69de5e29-42b0-4465-8ea6-25026ac30c02
+[2m2026-05-19T07:33:28.052019Z[0m [34mDEBUG[0m [2mcloudcode_agent::sync::runtime[0m[2m:[0m push worker: exiting [3msession[0m[2m=[0m69de5e29-42b0-4465-8ea6-25026ac30c02
+[2m2026-05-19T07:33:28.052507Z[0m [32m INFO[0m [2mcloudcode_agent::jsonl[0m[2m:[0m jsonl: watcher stopped [3msession[0m[2m=[0m69de5e29-42b0-4465-8ea6-25026ac30c02</pre>
 
 <h2>Agent B log (tail)</h2>
-<pre class="log">[2m2026-05-19T07:18:01.765975Z[0m [32m INFO[0m [2mcloudcode_agent[0m[2m:[0m starting cloudcode-agent [3magent[0m[2m=[0msmoke-agent-B
-[2m2026-05-19T07:18:01.766143Z[0m [32m INFO[0m [2mcloudcode_agent::pty[0m[2m:[0m tmux ready [3mtmux[0m[2m=[0m/opt/homebrew/bin/tmux
-[2m2026-05-19T07:18:01.766167Z[0m [32m INFO[0m [2mcloudcode_agent::pty[0m[2m:[0m workspace sandbox capability available [3mwrapper[0m[2m=[0m/Users/petez/data/vtech/src/vibe/cloudcode/target/release/cloudcode-agent
-[2m2026-05-19T07:18:01.766350Z[0m [32m INFO[0m [2mcloudcode_agent::pty[0m[2m:[0m wrote tmux.conf (mouse on) [3mpath[0m[2m=[0m/Users/petez/.local/state/cloudcode/agent/tmux.conf
-[2m2026-05-19T07:18:01.766398Z[0m [32m INFO[0m [2mcloudcode_agent::ws[0m[2m:[0m connecting to hub [3murl[0m[2m=[0mws://127.0.0.1:58429/v1/agent/ws [3mname[0m[2m=[0msmoke-agent-B
-[2m2026-05-19T07:18:01.783632Z[0m [32m INFO[0m [2mcloudcode_agent::ws[0m[2m:[0m connected to hub [3magent[0m[2m=[0msmoke-agent-B
-[2m2026-05-19T07:18:01.789378Z[0m [32m INFO[0m [2mcloudcode_agent::pty[0m[2m:[0m workspace cleanup: removed [3maccount[0m[2m=[0malice [3mworkspace[0m[2m=[0mdemo
-[2m2026-05-19T07:18:01.789408Z[0m [32m INFO[0m [2mcloudcode_agent::pty[0m[2m:[0m workspace cleanup: done [3mcleared[0m[2m=[0m1 [3mfailed[0m[2m=[0m0</pre>
+<pre class="log">[2m2026-05-19T07:33:42.239192Z[0m [32m INFO[0m [2mcloudcode_agent[0m[2m:[0m starting cloudcode-agent [3magent[0m[2m=[0msmoke-agent-B
+[2m2026-05-19T07:33:42.239330Z[0m [32m INFO[0m [2mcloudcode_agent::pty[0m[2m:[0m tmux ready [3mtmux[0m[2m=[0m/opt/homebrew/bin/tmux
+[2m2026-05-19T07:33:42.239349Z[0m [32m INFO[0m [2mcloudcode_agent::pty[0m[2m:[0m workspace sandbox capability available [3mwrapper[0m[2m=[0m/Users/petez/data/vtech/src/vibe/cloudcode/target/release/cloudcode-agent
+[2m2026-05-19T07:33:42.239472Z[0m [32m INFO[0m [2mcloudcode_agent::pty[0m[2m:[0m wrote tmux.conf (mouse on) [3mpath[0m[2m=[0m/Users/petez/.local/state/cloudcode/agent/tmux.conf
+[2m2026-05-19T07:33:42.239492Z[0m [32m INFO[0m [2mcloudcode_agent::ws[0m[2m:[0m connecting to hub [3murl[0m[2m=[0mws://127.0.0.1:59382/v1/agent/ws [3mname[0m[2m=[0msmoke-agent-B
+[2m2026-05-19T07:33:42.256081Z[0m [32m INFO[0m [2mcloudcode_agent::ws[0m[2m:[0m connected to hub [3magent[0m[2m=[0msmoke-agent-B
+[2m2026-05-19T07:33:42.260857Z[0m [32m INFO[0m [2mcloudcode_agent::pty[0m[2m:[0m workspace cleanup: removed [3maccount[0m[2m=[0malice [3mworkspace[0m[2m=[0mdemo
+[2m2026-05-19T07:33:42.260871Z[0m [32m INFO[0m [2mcloudcode_agent::pty[0m[2m:[0m workspace cleanup: done [3mcleared[0m[2m=[0m1 [3mfailed[0m[2m=[0m0</pre>
 
 <h2>Out of scope</h2>
 <ul class="checks">
@@ -149,7 +149,7 @@
 </ul>
 
 <footer class="report">
-  Generated by scripts/v1.13-smoke.sh on 2026-05-19T16:18:11+09:00
+  Generated by scripts/v1.13-smoke.sh on 2026-05-19T16:33:52+09:00
 </footer>
 </div>
 </body>

@@ -160,11 +160,10 @@ fn default_tool() -> String {
 }
 
 fn default_workspace_root() -> PathBuf {
-    if let Some(home) = dirs::home_dir() {
-        home.join("cloudcode-agent").join("workspaces")
-    } else {
-        PathBuf::from("./cloudcode-agent-workspaces")
-    }
+    // Relative to the agent's cwd, same convention hub now uses.
+    // Operators who want workspaces on a different volume set
+    // `[claude].workspace_root` in agent.toml.
+    PathBuf::from("./agent/workspaces")
 }
 
 fn default_tmux_executable() -> PathBuf {

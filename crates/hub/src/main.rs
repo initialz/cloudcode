@@ -3,6 +3,7 @@ mod app;
 mod audit;
 mod auth;
 mod config;
+mod config_schema;
 mod db;
 mod pty_proto;
 mod pty_session;
@@ -133,6 +134,15 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
+    // Best-effort: append commented-out docs for any new schema keys
+    // a previous release didn't know about. Logged, never fatal — if
+    // the file is read-only (container with bind-mounted config),
+    // missing (--init not yet run), or unparseable, we'll just log
+    // and let `Config::load` below produce the real error.
+    if let Err(e) = cloudcode_daemon::config_sync::sync_with_file(&config_path, config_schema::SCHEMA)
+    {
+        tracing::warn!(error = %e, "config schema sync failed");
+    }
     let config =
         Config::load(&config_path).with_context(|| format!("loading {}", config_path.display()))?;
     let db = Db::open(&config.admin.db_path)
@@ -160,14 +170,17 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
     let listen = config.server.listen.clone();
 
     let user_auth = Arc::new(UserAuth::new(db.clone()));
-    // Hub-managed workspaces live next to the other hub state (binaries,
-    // current/previous symlinks under `<state>/hub/`). Falling back to a
-    // local `./workspaces/` only if `state_dir()` is unreachable (which
-    // shouldn't happen on supported platforms — but `state_dir()` is
-    // `Option<>` so we handle the None branch).
-    let ws_root = update::state_dir()
-        .map(|p| p.join("hub").join("workspaces"))
-        .unwrap_or_else(|| PathBuf::from("./workspaces"));
+    // Hub-managed workspaces default to `./hub/workspaces` (relative
+    // to the hub's cwd, same convention as `./audit.jsonl` /
+    // `./cloudcode-hub.db`). User can override via
+    // `[workspaces].root` in hub.toml — set it to an absolute path
+    // when workspaces want a separate volume from the rest of hub
+    // state.
+    let ws_root = config
+        .workspaces
+        .root
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("./hub/workspaces"));
     let workspaces = WorkspaceStorage::new(ws_root.clone())
         .with_context(|| format!("initialising workspace storage at {}", ws_root.display()))?;
     let state = Arc::new(AppState {

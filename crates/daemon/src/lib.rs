@@ -4,6 +4,13 @@
 //! 本 crate 会 spawn `current_exe --config <config>`（前台模式），setsid
 //! 后台跑，PID 与日志默认放 `~/.local/state/cloudcode/<name>.{pid,log}`，
 //! 可由 `CLOUDCODE_STATE_DIR` 覆盖。
+//!
+//! Also hosts the shared `config_sync` engine — hub / agent / client
+//! each pass their own SCHEMA slice describing the optional knobs in
+//! their TOML config, and this engine appends commented-out doc
+//! blocks for any that aren't already present.
+
+pub mod config_sync;
 
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
