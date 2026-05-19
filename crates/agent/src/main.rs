@@ -4,6 +4,7 @@ mod name;
 mod pty;
 mod sandbox;
 mod supervise;
+mod sync;
 mod tunnel;
 mod update;
 mod ws;
@@ -238,9 +239,11 @@ registration_token = "ag_PASTE_TOKEN_HERE"
 # [claude]
 # workspace_root = "~/cloudcode-agent/workspaces"
 
-# [tools] picks which AI CLIs this agent can spawn. The first pane runs
-# `default`; additional panes (split) can run any other entry by name.
-# Add a [tools.<name>] table per tool you want to expose.
+# [tools] picks the AI CLI this agent spawns inside a workspace. As of
+# v1.13 the supported surface is claude-only — anything you'd want to
+# run alongside claude should be invoked from inside it via plugins /
+# MCP, not as a side-by-side pane. Extra `[tools.<name>]` tables still
+# parse for back-compat but won't show up in the UI.
 [tools]
 default = "claude"
 
@@ -248,13 +251,6 @@ default = "claude"
 executable     = "claude"                # PATH lookup by default
 resume_command = "claude --continue"     # empty -> always fresh
 extra_args     = []
-
-# Uncomment to also expose Codex side-by-side with Claude. Requires
-# `codex` to be installed and logged in as this OS user.
-# [tools.codex]
-# executable     = "codex"
-# resume_command = ""    # codex doesn't support resume; relaunch fresh
-# extra_args     = []
 
 # [sandbox] is deprecated. The sandbox toggle moved to the hub —
 # it's now per-account, set from the admin UI's Accounts page.

@@ -265,7 +265,7 @@ fn update_current_symlink(agent_dir: &Path, new_target: &Path) -> std::io::Resul
     Ok(())
 }
 
-fn state_dir() -> Option<PathBuf> {
+pub(crate) fn state_dir() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("CLOUDCODE_STATE_DIR") {
         return Some(PathBuf::from(p));
     }

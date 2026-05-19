@@ -1190,7 +1190,7 @@ pub async fn workspaces_list(State(state): State<AdminState>) -> Response {
             Ok(items) => {
                 for it in items {
                     let key = (agent_name.clone(), it.account.clone(), it.name.clone());
-                    let has_client = state.app.workspaces.contains_key(&key);
+                    let has_client = state.app.session_locks.contains_key(&key);
                     let status = if has_client {
                         "active"
                     } else if it.tmux_alive {

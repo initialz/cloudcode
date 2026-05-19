@@ -58,11 +58,11 @@ struct Cli {
     #[arg(long)]
     init: bool,
 
-    /// Which CLI to run inside the workspace on first open: "claude"
-    /// (default), "codex", or whatever the agent has configured under
-    /// `[tools]` in its agent.toml. Reattach to an existing tmux
-    /// session ignores this; use tmux's own split keys (Ctrl+b %) or
-    /// the webterm split button to spawn another tool in a side pane.
+    /// Which CLI to run inside the workspace on first open. As of
+    /// v1.13 this is effectively claude; the flag remains so older
+    /// hubs/agents still parse it. Reattach to an existing tmux
+    /// session ignores this; running other tools alongside claude
+    /// is now done from inside claude (plugins / MCP).
     #[arg(long, value_name = "NAME")]
     tool: Option<String>,
 

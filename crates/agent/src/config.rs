@@ -71,16 +71,18 @@ pub struct ClaudeConfig {
 /// executable     = "claude"
 /// resume_command = "claude --continue"
 /// extra_args     = []
-///
-/// [tools.codex]
-/// executable     = "codex"
-/// resume_command = ""        # empty -> always fresh, no resume
-/// extra_args     = []
 /// ```
 ///
 /// `default` is the tool the first pane runs when the client doesn't
 /// specify one. Empty `resume_command` means the wrapper never tries to
 /// resume — the tool is always relaunched fresh on reattach.
+///
+/// v1.13 collapsed the supported tool surface to just `claude`. Older
+/// agent.toml files that still list extra `[tools.<name>]` tables keep
+/// parsing — those entries are harmless to carry, but the hub/webterm
+/// won't offer them as a choice anymore. Anything that needs to run
+/// alongside claude should be invoked from inside claude via the
+/// plugins / MCP entry points.
 #[derive(Debug, Deserialize, Clone)]
 pub struct ToolsSection {
     #[serde(default = "default_tool")]
@@ -113,9 +115,8 @@ pub struct ToolConfig {
     #[serde(default)]
     pub extra_args: Vec<String>,
     /// Opt out of this tool even if it's discoverable on PATH. Lets
-    /// an operator say "I have codex installed for unrelated reasons
-    /// but I don't want cloudcode to expose it". Off (= keep the
-    /// tool) by default.
+    /// an operator pin the tool list explicitly without uninstalling
+    /// the binary. Off (= keep the tool) by default.
     #[serde(default)]
     pub disabled: bool,
 }
@@ -213,12 +214,12 @@ impl Default for RecordingConfig {
 /// explicit `[tools.<name>]` block configured for them. Hardcoded
 /// short-list — extend here when adding a new tool to cloudcode's
 /// supported surface, and update webterm's `KNOWN_TOOLS` to match.
+///
+/// As of v1.13 this is `claude`-only. Tools that need to run next to
+/// claude should be invoked from inside it via plugins / MCP.
 pub const KNOWN_TOOL_NAMES: &[(&str, &str)] = &[
     // (executable / tool name, default resume command)
     ("claude", "claude --continue"),
-    // codex doesn't have a resume flag yet; leave empty so the wrapper
-    // always relaunches fresh.
-    ("codex", ""),
 ];
 
 impl Config {
@@ -313,37 +314,42 @@ registration_token = "ag_test"
 "#;
 
     #[test]
-    fn auto_detects_codex_when_on_path_and_no_tools_block() {
+    fn auto_detects_claude_when_on_path_and_no_tools_block() {
+        // The pre-v1.10 back-compat path synthesises a claude entry
+        // from the legacy [claude] section, so this also covers the
+        // common "config has no [tools] block at all" case.
         let mut cfg = cfg_from(MIN_CONFIG);
-        cfg.resolve_tools(probe_with(&["claude", "codex"]));
-        let mut names: Vec<&String> = cfg.tools.tools.keys().collect();
-        names.sort();
-        assert_eq!(names, vec!["claude", "codex"]);
-        assert_eq!(cfg.tools.tools["codex"].executable, "codex");
-        assert_eq!(cfg.tools.tools["codex"].resume_command, "");
+        cfg.resolve_tools(probe_with(&["claude"]));
+        let names: Vec<&String> = cfg.tools.tools.keys().collect();
+        assert_eq!(names, vec!["claude"]);
+        assert_eq!(cfg.tools.tools["claude"].executable, "claude");
+        assert_eq!(cfg.tools.tools["claude"].resume_command, "claude --continue");
         assert_eq!(cfg.tools.default, "claude");
     }
 
     #[test]
-    fn codex_only_when_claude_disabled() {
-        let mut cfg = cfg_from(MIN_CONFIG);
-        cfg.tools.tools.insert(
-            "claude".to_string(),
-            ToolConfig {
-                executable: "claude".into(),
-                resume_command: String::new(),
-                extra_args: Vec::new(),
-                disabled: true,
-            },
-        );
-        cfg.resolve_tools(probe_with(&["codex"]));
+    fn disabled_flag_filters_claude_even_when_on_path() {
+        let cfg_text = r#"
+[hub]
+url = "wss://example.com/v1/agent/ws"
+
+[auth]
+registration_token = "ag_test"
+
+[tools.claude]
+executable = "claude"
+disabled = true
+"#;
+        let mut cfg = cfg_from(cfg_text);
+        cfg.resolve_tools(probe_with(&["claude"]));
         assert!(!cfg.tools.tools.contains_key("claude"));
-        assert!(cfg.tools.tools.contains_key("codex"));
-        assert_eq!(cfg.tools.default, "codex");
+        // No tools left -> default falls back to the first remaining
+        // key alphabetically, which is empty here.
+        assert!(cfg.tools.default.is_empty());
     }
 
     #[test]
-    fn explicit_tool_config_wins_over_autodetect() {
+    fn explicit_default_pointing_at_filtered_tool_falls_back_to_claude() {
         let cfg_text = r#"
 [hub]
 url = "wss://example.com/v1/agent/ws"
@@ -352,56 +358,17 @@ url = "wss://example.com/v1/agent/ws"
 registration_token = "ag_test"
 
 [tools]
-default = "claude"
+default = "ghost"
 
-[tools.codex]
-executable = "/opt/custom/codex"
-resume_command = ""
-extra_args = ["--verbose"]
-"#;
-        let mut cfg = cfg_from(cfg_text);
-        cfg.resolve_tools(probe_with(&["claude", "codex"]));
-        assert_eq!(cfg.tools.tools["codex"].executable, "/opt/custom/codex");
-        assert_eq!(cfg.tools.tools["codex"].extra_args, vec!["--verbose"]);
-    }
-
-    #[test]
-    fn disabled_flag_filters_tool_even_when_on_path() {
-        let cfg_text = r#"
-[hub]
-url = "wss://example.com/v1/agent/ws"
-
-[auth]
-registration_token = "ag_test"
-
-[tools.codex]
-executable = "codex"
+[tools.ghost]
+executable = "ghost"
 disabled = true
 "#;
         let mut cfg = cfg_from(cfg_text);
-        cfg.resolve_tools(probe_with(&["claude", "codex"]));
-        assert!(!cfg.tools.tools.contains_key("codex"));
-        assert!(cfg.tools.tools.contains_key("claude"));
-    }
-
-    #[test]
-    fn explicit_default_pointing_at_filtered_tool_falls_back() {
-        let cfg_text = r#"
-[hub]
-url = "wss://example.com/v1/agent/ws"
-
-[auth]
-registration_token = "ag_test"
-
-[tools]
-default = "codex"
-
-[tools.codex]
-executable = "codex"
-disabled = true
-"#;
-        let mut cfg = cfg_from(cfg_text);
-        cfg.resolve_tools(probe_with(&["claude", "codex"]));
+        cfg.resolve_tools(probe_with(&["claude"]));
+        // `ghost` was filtered out; resolver synthesises claude from
+        // KNOWN_TOOL_NAMES and pins it as the new default.
         assert_eq!(cfg.tools.default, "claude");
+        assert!(cfg.tools.tools.contains_key("claude"));
     }
 }

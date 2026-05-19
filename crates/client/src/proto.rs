@@ -47,9 +47,10 @@ pub enum ClientToHub {
         rows: u16,
         #[serde(default)]
         claude_args: Vec<String>,
-        /// Which tool to run inside the workspace (claude / codex / ...).
-        /// None lets the agent fall back to its configured default
-        /// (`[tools].default` in agent.toml).
+        /// Which tool to run inside the workspace. As of v1.13 this
+        /// is effectively claude-only; `None` lets the agent fall
+        /// back to its configured default (`[tools].default` in
+        /// agent.toml).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool: Option<String>,
     },

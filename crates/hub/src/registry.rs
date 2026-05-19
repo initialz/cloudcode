@@ -219,8 +219,7 @@ fn classify(frame: &ClientMsg) -> Routing {
     match frame {
         ClientMsg::PtyOpened { session_id, .. }
         | ClientMsg::PtyClosed { session_id, .. }
-        | ClientMsg::PtyError { session_id, .. }
-        | ClientMsg::SplitPaneResult { session_id, .. } => Routing::Session(*session_id),
+        | ClientMsg::PtyError { session_id, .. } => Routing::Session(*session_id),
         ClientMsg::WorkspaceListResult { request_id, .. }
         | ClientMsg::WorkspaceCreateResult { request_id, .. }
         | ClientMsg::WorkspaceDeleteResult { request_id, .. }

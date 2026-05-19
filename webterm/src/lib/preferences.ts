@@ -27,7 +27,9 @@ export const DEFAULT_PREFERENCES: Preferences = {
 };
 
 // ── Wire shape ──────────────────────────────────────────────────────────────
-// Stored on the hub as { tool_args: { claude: [...], codex: [...] } }.
+// Stored on the hub as { tool_args: { <tool>: [...] } }. As of v1.13
+// the only entry that ever ends up populated is `claude`; the map shape
+// is preserved so a future tool addition doesn't need a schema bump.
 // Keep the wire keys snake_case to match the rest of the hub's JSON
 // conventions; map to camelCase at the boundary.
 
@@ -70,8 +72,8 @@ export function argsToText(args: string[]): string {
 }
 
 /** Parse the text typed into the input back into argv. Whitespace-split,
- *  empty entries dropped. Doesn't handle quoted args — keep it dumb until
- *  someone hits a real need (claude/codex flags rarely contain spaces). */
+ *  empty entries dropped. Doesn't handle quoted args — keep it dumb
+ *  until someone hits a real need (claude flags rarely contain spaces). */
 export function textToArgs(text: string): string[] {
   return text
     .trim()

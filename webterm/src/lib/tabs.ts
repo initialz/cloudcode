@@ -10,7 +10,8 @@ export type Tab = {
   id: string;
   agent: string;
   workspace: string;
-  /** Tool used when opening the session (e.g. 'claude', 'codex'). */
+  /** Tool used when opening the session. Effectively 'claude' as of
+   *  v1.13; kept on the wire / Tab shape for back-compat. */
   tool?: string;
   status: TabStatus;
   errorMsg?: string;

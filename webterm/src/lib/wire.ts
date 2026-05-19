@@ -3,16 +3,6 @@
 
 export const PROTOCOL_VERSION = '7';
 
-// `right` = vertical divider, new pane appears to the right (tmux `-h`).
-// `down`  = horizontal divider, new pane appears below       (tmux `-v`).
-export type SplitDirection = 'right' | 'down';
-
-// Re-arrange every pane in the active session into one of tmux's
-// even-* preset layouts. We deliberately expose just two — the common
-// "everything side-by-side" / "everything stacked" choice — and leave
-// main-* / tiled for later if there's demand.
-export type PaneLayout = 'side_by_side' | 'stacked';
-
 // ── Client → Hub ────────────────────────────────────────────────────────────
 
 export type ClientMsg =
@@ -24,8 +14,6 @@ export type ClientMsg =
   | { type: 'delete_workspace'; name: string }
   | { type: 'reset_workspace'; name: string }
   | { type: 'open_session'; workspace: string; cols: number; rows: number; claude_args?: string[]; tool?: string }
-  | { type: 'split_pane'; tool: string; direction: SplitDirection; args?: string[] }
-  | { type: 'change_layout'; layout: PaneLayout }
   | { type: 'resize'; cols: number; rows: number }
   | { type: 'close' }
   | { type: 'pong' };

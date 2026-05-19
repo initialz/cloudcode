@@ -10,6 +10,7 @@ mod registry;
 mod supervise;
 mod tunnel;
 mod update;
+mod workspaces;
 mod ws_handler;
 
 use anyhow::{anyhow, Context};
@@ -29,6 +30,7 @@ use crate::audit::AuditLog;
 use crate::config::Config;
 use crate::db::Db;
 use crate::registry::AgentRegistry;
+use crate::workspaces::WorkspaceStorage;
 
 pub struct AppState {
     pub config: Config,
@@ -38,12 +40,20 @@ pub struct AppState {
     /// (agent_name, account_name, workspace_name) -> session_id, used as a
     /// global mutex so two sessions can't drive `claude` in the same
     /// account+workspace at once. Different accounts on the same agent get
-    /// separate namespaces.
-    pub workspaces: DashMap<(String, String, String), Uuid>,
+    /// separate namespaces. v1.13 introduces a separate
+    /// `WorkspaceStorage` for hub-managed workspace files (see
+    /// `workspaces` below); this map remains the in-memory session
+    /// mutex layer and is unchanged by that refactor.
+    pub session_locks: DashMap<(String, String, String), Uuid>,
     /// User-facing webterm SPA session store. Maps an HttpOnly cookie
     /// session id to the logged-in account name. Backs `/api/*`
     /// and the cookie-auth path through `/v1/pty/ws`.
     pub user_auth: Arc<UserAuth>,
+    /// On-disk hub-canonical workspace store (v1.13). Lives at
+    /// `<state>/hub/workspaces/`. Wire integration arrives in a later
+    /// phase; for now this is plumbed so the agent-side sync engine
+    /// has a stable handle to write against.
+    pub workspaces: WorkspaceStorage,
 }
 
 #[derive(Parser)]
@@ -141,13 +151,24 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
     let listen = config.server.listen.clone();
 
     let user_auth = Arc::new(UserAuth::new(db.clone()));
+    // Hub-managed workspaces live next to the other hub state (binaries,
+    // current/previous symlinks under `<state>/hub/`). Falling back to a
+    // local `./workspaces/` only if `state_dir()` is unreachable (which
+    // shouldn't happen on supported platforms — but `state_dir()` is
+    // `Option<>` so we handle the None branch).
+    let ws_root = update::state_dir()
+        .map(|p| p.join("hub").join("workspaces"))
+        .unwrap_or_else(|| PathBuf::from("./workspaces"));
+    let workspaces = WorkspaceStorage::new(ws_root.clone())
+        .with_context(|| format!("initialising workspace storage at {}", ws_root.display()))?;
     let state = Arc::new(AppState {
         config,
         audit,
         db,
         registry: Arc::new(AgentRegistry::new()),
-        workspaces: DashMap::new(),
+        session_locks: DashMap::new(),
         user_auth,
+        workspaces,
     });
 
     // Root — user-facing webterm SPA + its JSON API. Lives on the

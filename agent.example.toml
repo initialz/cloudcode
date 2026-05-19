@@ -27,20 +27,16 @@ registration_token = "ag_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 # [claude]
 # workspace_root = "~/cloudcode-agent/workspaces"
 
-# [tools] 决定第一 pane 跑什么、并允许 split 出额外 pane 跑别的 AI CLI。
-# 不写 [tools] 时 agent 会从 [claude] 段合成一个 `claude` 工具，行为跟
-# 老版本一致；要并排跑 codex / 其他 CLI 时再开 [tools.<name>] 即可。
+# [tools] 决定 agent 在 workspace 里启动哪个 AI CLI。v1.13 起官方支持
+# 的工具收敛到 claude 一个 —— 想并行跑 codex 等其他 CLI，请用 claude
+# 自身的 plugins / MCP，从 claude 内部调起。不写 [tools] 时 agent 会
+# 从 [claude] 段合成一个 `claude` 条目，跟旧版本一致。
 # [tools]
 # default = "claude"
 #
 # [tools.claude]
 # executable     = "claude"
 # resume_command = "claude --continue"   # 空串 -> 不 resume，重连永远 fresh
-# extra_args     = []
-#
-# [tools.codex]
-# executable     = "codex"
-# resume_command = ""                    # codex 没有 resume，每次新启
 # extra_args     = []
 
 # [tmux] 段可省略 —— 默认 PATH 查找 `tmux`：

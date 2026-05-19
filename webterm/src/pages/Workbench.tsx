@@ -21,8 +21,6 @@ import {
   WireSocket,
   type AgentItem,
   type HubMsg,
-  type PaneLayout,
-  type SplitDirection,
 } from '@/lib/wire';
 import { effectiveTheme, getStoredTheme, type Theme } from '@/lib/theme';
 import { type Tab, tabKey } from '@/lib/tabs';
@@ -33,7 +31,7 @@ import {
   type Preferences,
 } from '@/lib/preferences';
 import type { Tool } from '@/lib/tools';
-import { DEFAULT_TOOL, KNOWN_TOOLS, toolsForAgent } from '@/lib/tools';
+import { DEFAULT_TOOL, KNOWN_TOOLS } from '@/lib/tools';
 import Sidebar from '@/components/Sidebar';
 import TabBar from '@/components/TabBar';
 import SettingsDialog from '@/components/SettingsDialog';
@@ -518,31 +516,6 @@ export default function Workbench() {
     [],
   );
 
-  // ── Split pane ────────────────────────────────────────────────────────────
-
-  const handleSplit = useCallback(
-    (tabId: string, tool: string, direction: SplitDirection) => {
-      const tab = tabsRef.current.find((t) => t.id === tabId);
-      if (!tab?.ws.connected) return;
-      const args = (KNOWN_TOOLS as readonly string[]).includes(tool)
-        ? preferencesRef.current.toolArgs[tool as Tool]
-        : [];
-      tab.ws.send({
-        type: 'split_pane',
-        tool,
-        direction,
-        ...(args.length > 0 ? { args } : {}),
-      });
-    },
-    [],
-  );
-
-  const handleChangeLayout = useCallback((tabId: string, layout: PaneLayout) => {
-    const tab = tabsRef.current.find((t) => t.id === tabId);
-    if (!tab?.ws.connected) return;
-    tab.ws.send({ type: 'change_layout', layout });
-  }, []);
-
   // ── PTY WS message handler (per tab) ──────────────────────────────────────
 
   function handleTabMsg(
@@ -626,7 +599,7 @@ export default function Workbench() {
         // crates/hub/src/pty_proto.rs). Surface the message as a
         // toast and leave the tab + underlying claude session intact —
         // closing the tab here would discard a live conversation just
-        // because Split with codex (or similar) failed.
+        // because a transient agent-side op failed.
         addToast(msg.message || 'Session error');
         if (ctrlAgentRef.current === agent) {
           ctrlWsRef.current?.send({ type: 'list_workspaces' });
@@ -817,16 +790,6 @@ export default function Workbench() {
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? null;
   const activeTabKey = activeTab ? tabKey(activeTab.agent, activeTab.workspace) : null;
 
-  // Tools available for the active tab's agent. If the agent is offline or
-  // not yet in the list we fall back to KNOWN_TOOLS — safest option so the
-  // Split button stays available on pre-v1.13 agents that don't send tools.
-  const activeTabAgentItem = activeTab
-    ? agents.find((a) => a.name === activeTab.agent)
-    : undefined;
-  const toolsForActiveTab: Tool[] = activeTabAgentItem
-    ? toolsForAgent(activeTabAgentItem.tools)
-    : [...KNOWN_TOOLS];
-
   // ── Render ────────────────────────────────────────────────────────────────
 
   if (authLoading) {
@@ -866,9 +829,6 @@ export default function Workbench() {
           activeTabId={activeTabId}
           onSelect={selectTab}
           onClose={closeTab}
-          onSplit={handleSplit}
-          onChangeLayout={handleChangeLayout}
-          toolsForActiveTab={toolsForActiveTab}
         />
 
         {/* Terminal containers — all rendered, visibility toggled via class */}

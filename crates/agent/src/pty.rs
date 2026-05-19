@@ -1,7 +1,6 @@
 use crate::config::{ClaudeConfig, RecordingConfig, SandboxConfig, TmuxConfig, ToolConfig};
 use crate::tunnel::{
-    pack_pty_frame, ClientMsg, PaneLayout, ServerMsg, SplitDirection, WorkspaceFullItem,
-    WorkspaceItem, TAG_PTY_OUTPUT,
+    pack_pty_frame, ClientMsg, ServerMsg, WorkspaceFullItem, WorkspaceItem, TAG_PTY_OUTPUT,
 };
 use anyhow::{Context, Result};
 use chrono::SecondsFormat;
@@ -46,11 +45,6 @@ pub struct PtyManager {
 struct PtyHandle {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     writer: Mutex<Box<dyn Write + Send>>,
-    /// (account, workspace) that this PTY is bound to. Needed by
-    /// `split_pane` to derive the tmux label + session name (we already
-    /// validated these on open, so they're safe to reuse verbatim).
-    account: String,
-    workspace: String,
     /// Stops the jsonl watcher task on drop. Held only for its
     /// Drop side-effect.
     _jsonl: crate::jsonl::WatcherHandle,
@@ -229,18 +223,6 @@ impl PtyManager {
             }
             ServerMsg::PtyClose { session_id } => {
                 self.close(session_id, tx).await;
-            }
-            ServerMsg::SplitPane {
-                session_id,
-                tool,
-                direction,
-                args,
-            } => {
-                self.split_pane(session_id, tool, direction, args, tx)
-                    .await;
-            }
-            ServerMsg::ChangeLayout { session_id, layout } => {
-                self.change_layout(session_id, layout, tx).await;
             }
             ServerMsg::WorkspaceList {
                 request_id,
@@ -562,8 +544,6 @@ impl PtyManager {
         let handle = Arc::new(PtyHandle {
             master,
             writer: Mutex::new(writer),
-            account: account.clone(),
-            workspace: workspace.clone(),
             _jsonl: jsonl,
         });
         self.sessions.insert(session_id, handle.clone());
@@ -618,205 +598,6 @@ impl PtyManager {
                 reason: Some("closed by hub".into()),
             }))
             .await;
-    }
-
-    /// Spawn an extra tmux pane inside an existing PTY session, running
-    /// `tool_name` (looked up against `[tools]`). The pane inherits the
-    /// session's tmux server (and therefore its sandbox state, if any),
-    /// so we don't need to re-wrap it in `sandbox-exec`.
-    ///
-    /// We invoke tmux out-of-band (`std::process::Command`, not the PTY)
-    /// because split-window is fire-and-forget against the tmux server
-    /// daemon; the resulting pane's output is already being read by the
-    /// reader thread attached to the session's master fd.
-    async fn split_pane(
-        self: &Arc<Self>,
-        session_id: Uuid,
-        tool_name: String,
-        direction: SplitDirection,
-        args: Vec<String>,
-        tx: mpsc::Sender<OutFrame>,
-    ) {
-        let send_err = |error: String| {
-            let tx = tx.clone();
-            async move {
-                let _ = tx
-                    .send(OutFrame::Text(ClientMsg::SplitPaneResult {
-                        session_id,
-                        error: Some(error),
-                    }))
-                    .await;
-            }
-        };
-
-        let Some(handle) = self.sessions.get(&session_id).map(|e| e.value().clone()) else {
-            send_err(format!("unknown session {}", session_id)).await;
-            return;
-        };
-        if let Err(e) = validate_name(&tool_name, "tool") {
-            send_err(e).await;
-            return;
-        }
-        let Some(tool_cfg) = self.tools.get(&tool_name).cloned() else {
-            send_err(format!(
-                "unknown tool '{}' (not in agent.toml [tools])",
-                tool_name
-            ))
-            .await;
-            return;
-        };
-
-        let session_name = format!("cloudcode-{}-{}", handle.account, handle.workspace);
-        let tmux_label = format!("cc-{}-{}", handle.account, handle.workspace);
-        let cwd = self
-            .workspace_root()
-            .join(&handle.account)
-            .join(&handle.workspace);
-
-        // Pre-compute claude project dir so the wrapper's resume gating
-        // works even when tool_name == "claude" in a split pane.
-        let home_for_proj = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-        let claude_proj_dir = crate::jsonl::project_dir(&home_for_proj, &cwd);
-
-        // Build the argv for `tmux split-window`. We use `env` (portable)
-        // to set wrapper env vars instead of tmux's own `-e KEY=VAL`,
-        // which only landed in tmux 3.2. The split pane inherits the
-        // server's sandbox state (a server-side child of tmux), so we
-        // don't wrap it in `sandbox-exec` again.
-        // tmux's split-window orientation is the opposite of what most
-        // people say in conversation: `-h` produces left/right panes
-        // (vertical divider), `-v` produces top/bottom (horizontal
-        // divider). We map our wire-level `Right` / `Down` directly.
-        let split_flag = match direction {
-            SplitDirection::Right => "-h",
-            SplitDirection::Down => "-v",
-        };
-        let mut cmd = std::process::Command::new(&self.tmux.executable);
-        cmd.arg("-L")
-            .arg(&tmux_label)
-            .arg("split-window")
-            .arg(split_flag)
-            .arg("-t")
-            .arg(&session_name)
-            .arg("-c")
-            .arg(&cwd)
-            .arg("--")
-            .arg("env")
-            .arg(format!("CLOUDCODE_TOOL={}", tool_name))
-            .arg(format!("CLOUDCODE_TOOL_BIN={}", tool_cfg.executable))
-            .arg(format!("CLOUDCODE_RESUME_CMD={}", tool_cfg.resume_command))
-            .arg(format!(
-                "CLOUDCODE_CLAUDE_PROJECT_DIR={}",
-                claude_proj_dir.display()
-            ))
-            .arg("bash")
-            .arg("-c")
-            .arg(TOOL_WRAPPER)
-            // $0 label only; the tool binary is sourced from
-            // $CLOUDCODE_TOOL_BIN, not the positional args (see
-            // open_session for the longer explanation).
-            .arg("cloudcode-tool");
-        for a in &tool_cfg.extra_args {
-            cmd.arg(a);
-        }
-        for a in &args {
-            cmd.arg(a);
-        }
-
-        // Run synchronously off the tokio runtime so we don't block the
-        // WS read loop. tmux split-window returns quickly (sub-second)
-        // once the server accepts the command, so spawn_blocking is fine.
-        let output = match tokio::task::spawn_blocking(move || cmd.output()).await {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => {
-                send_err(format!("spawn tmux split-window: {}", e)).await;
-                return;
-            }
-            Err(e) => {
-                send_err(format!("join tmux split-window task: {}", e)).await;
-                return;
-            }
-        };
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let msg = if stderr.is_empty() {
-                format!("tmux split-window exited {}", output.status)
-            } else {
-                format!("tmux split-window: {}", stderr)
-            };
-            send_err(msg).await;
-            return;
-        }
-
-        let _ = tx
-            .send(OutFrame::Text(ClientMsg::SplitPaneResult {
-                session_id,
-                error: None,
-            }))
-            .await;
-    }
-
-    /// Re-arrange the panes in an existing session using `tmux
-    /// select-layout`. No-op on a 1-pane session (tmux just keeps it
-    /// as-is). Errors come back as a SplitPaneResult so we don't have
-    /// to invent a separate result variant for what is effectively the
-    /// same fire-and-forget tmux shell-out as split.
-    async fn change_layout(
-        self: &Arc<Self>,
-        session_id: Uuid,
-        layout: PaneLayout,
-        tx: mpsc::Sender<OutFrame>,
-    ) {
-        let send_err = |error: String| {
-            let tx = tx.clone();
-            async move {
-                let _ = tx
-                    .send(OutFrame::Text(ClientMsg::SplitPaneResult {
-                        session_id,
-                        error: Some(error),
-                    }))
-                    .await;
-            }
-        };
-
-        let Some(handle) = self.sessions.get(&session_id).map(|e| e.value().clone()) else {
-            send_err(format!("unknown session {}", session_id)).await;
-            return;
-        };
-        let layout_name = match layout {
-            PaneLayout::SideBySide => "even-horizontal",
-            PaneLayout::Stacked => "even-vertical",
-        };
-        let session_name = format!("cloudcode-{}-{}", handle.account, handle.workspace);
-        let tmux_label = format!("cc-{}-{}", handle.account, handle.workspace);
-        let mut cmd = std::process::Command::new(&self.tmux.executable);
-        cmd.arg("-L")
-            .arg(&tmux_label)
-            .arg("select-layout")
-            .arg("-t")
-            .arg(&session_name)
-            .arg(layout_name);
-
-        let output = match tokio::task::spawn_blocking(move || cmd.output()).await {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => {
-                send_err(format!("spawn tmux select-layout: {}", e)).await;
-                return;
-            }
-            Err(e) => {
-                send_err(format!("join tmux select-layout task: {}", e)).await;
-                return;
-            }
-        };
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let msg = if stderr.is_empty() {
-                format!("tmux select-layout exited {}", output.status)
-            } else {
-                format!("tmux select-layout: {}", stderr)
-            };
-            send_err(msg).await;
-        }
     }
 
     async fn workspace_list(&self, request_id: Uuid, account: String, tx: mpsc::Sender<OutFrame>) {
@@ -1037,13 +818,13 @@ impl PtyManager {
     }
 }
 
-/// Generic shell wrapper used for every pane (first or split). The
+/// Generic shell wrapper used for the workspace's single pane. The
 /// wrapper is identical for all tools; behaviour is steered by env
 /// vars set by the spawn path:
 ///
-/// - `CLOUDCODE_TOOL`        — tool key (e.g. `claude`, `codex`). The
-///   wrapper only special-cases `claude` (to avoid `--continue` on an
-///   empty conversation slot).
+/// - `CLOUDCODE_TOOL`        — tool key (effectively `claude` in v1.13;
+///   the wrapper still special-cases it explicitly to avoid
+///   `--continue` on an empty conversation slot).
 /// - `CLOUDCODE_TOOL_BIN`    — absolute path / argv0 of the tool binary.
 ///   Required; the wrapper exits immediately if it's unset.
 /// - `CLOUDCODE_RESUME_CMD`  — shell snippet evaluated on reattach. Empty
@@ -1052,9 +833,10 @@ impl PtyManager {
 ///   jsonl history dir; resume is suppressed when this is empty or has
 ///   no `*.jsonl` yet.
 ///
-/// Detach logic only kicks the user back to the menu when *this* is the
-/// last pane in the session — otherwise other panes (codex etc.) are
-/// still doing useful work and shouldn't be torn down behind the user.
+/// The detach loop tolerates the user creating extra tmux panes by
+/// hand (Ctrl-b %, Ctrl-b "); when those panes are still around the
+/// wrapper just exits its own pane instead of detaching the whole
+/// session. UI-driven split was removed in v1.13.
 const TOOL_WRAPPER: &str = r#"
 TOOL="${CLOUDCODE_TOOL:-claude}"
 TOOL_BIN="${CLOUDCODE_TOOL_BIN:-}"
@@ -1101,9 +883,9 @@ while :; do
     # gets around to re-launching claude --continue).
     printf '\033[H\033[2J\033[3J'
     # Only detach the tmux client when we're the last pane in the
-    # session. Other panes (e.g. codex running next to claude) are
-    # still in use and the user shouldn't be kicked back to the menu
-    # while they're alive.
+    # session. If the user manually opened other panes (tmux's own
+    # Ctrl-b % / ") they're still in use and the user shouldn't be
+    # kicked back to the menu while they're alive.
     panes=$(tmux list-panes 2>/dev/null | wc -l)
     if [ "${panes:-0}" -le 1 ]; then
         if [ -n "$sess" ]; then

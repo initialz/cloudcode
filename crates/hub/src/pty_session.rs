@@ -14,14 +14,9 @@
 use crate::app::{self, USER_SESSION_COOKIE};
 use crate::audit::AuditEvent;
 use crate::auth;
-use crate::pty_proto::{
-    AgentInfo, ClientToHub, HubToClient, PaneLayout as ClientPaneLayout,
-    SplitDirection as ClientSplitDir,
-};
+use crate::pty_proto::{AgentInfo, ClientToHub, HubToClient};
 use crate::registry::{AgentConn, PtyEventOut};
-use crate::tunnel::{
-    ClientMsg, PaneLayout as AgentPaneLayout, ServerMsg, SplitDirection as AgentSplitDir,
-};
+use crate::tunnel::{ClientMsg, ServerMsg};
 use crate::AppState;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -150,7 +145,7 @@ impl ConnCtx {
                 })
                 .await;
             conn.unregister_session(active.session_id);
-            self.state.workspaces.remove_if(
+            self.state.session_locks.remove_if(
                 &(
                     conn.name.clone(),
                     self.account_name.clone(),
@@ -449,7 +444,7 @@ where
                                 let key =
                                     (agent_name.clone(), account.clone(), it.name.clone());
                                 let has_client =
-                                    ctx.state.workspaces.contains_key(&key);
+                                    ctx.state.session_locks.contains_key(&key);
                                 crate::pty_proto::WorkspaceInfo {
                                     name: it.name,
                                     tmux_alive: it.tmux_alive,
@@ -540,7 +535,7 @@ where
                 .await;
                 return true;
             };
-            if ctx.state.workspaces.contains_key(&(
+            if ctx.state.session_locks.contains_key(&(
                 conn.name.clone(),
                 ctx.account_name.clone(),
                 name.clone(),
@@ -607,7 +602,7 @@ where
                 .await;
                 return true;
             };
-            if ctx.state.workspaces.contains_key(&(
+            if ctx.state.session_locks.contains_key(&(
                 conn.name.clone(),
                 ctx.account_name.clone(),
                 name.clone(),
@@ -704,7 +699,7 @@ where
             // the new client picks up where the old one left off. The
             // evicted client sees SessionClosed and drops back to its
             // own menu.
-            if let Some(prev) = ctx.state.workspaces.insert(key.clone(), session_id) {
+            if let Some(prev) = ctx.state.session_locks.insert(key.clone(), session_id) {
                 if prev != session_id {
                     let _ = conn.send(ServerMsg::PtyClose { session_id: prev }).await;
                 }
@@ -758,7 +753,7 @@ where
             {
                 conn.unregister_session(session_id);
                 ctx.state
-                    .workspaces
+                    .session_locks
                     .remove_if(&key, |_, sid| *sid == session_id);
                 let _ = send_client(
                     sink,
@@ -774,7 +769,7 @@ where
                 Ok(Some(PtyEventOut::Frame(ClientMsg::PtyError { message, .. }))) => {
                     conn.unregister_session(session_id);
                     ctx.state
-                        .workspaces
+                        .session_locks
                         .remove_if(&key, |_, sid| *sid == session_id);
                     let _ = send_client(sink, &HubToClient::SessionError { message }).await;
                     return true;
@@ -782,7 +777,7 @@ where
                 _ => {
                     conn.unregister_session(session_id);
                     ctx.state
-                        .workspaces
+                        .session_locks
                         .remove_if(&key, |_, sid| *sid == session_id);
                     let _ = send_client(
                         sink,
@@ -846,99 +841,6 @@ where
             }
             true
         }
-        ClientToHub::SplitPane {
-            tool,
-            direction,
-            args,
-        } => {
-            // Split adds another tmux pane *to the active session*; it
-            // requires both an agent and an open session to be in scope.
-            let (Some(conn), Some(active)) = (ctx.selected_agent.as_ref(), ctx.active.as_ref())
-            else {
-                let _ = send_client(
-                    sink,
-                    &HubToClient::SessionError {
-                        message: "no active session to split".into(),
-                    },
-                )
-                .await;
-                return true;
-            };
-            if !valid_tool_name(&tool) {
-                let _ = send_client(
-                    sink,
-                    &HubToClient::SessionError {
-                        message: format!("invalid tool name '{}'", tool),
-                    },
-                )
-                .await;
-                return true;
-            }
-            // Fire-and-forget. The agent will reply with a
-            // SplitPaneResult on the same session_id; the
-            // session-event arm of this loop turns errors into
-            // SessionError frames for the client. Success is silent —
-            // the new pane's output already streams through the
-            // existing PTY tap.
-            let direction = match direction {
-                ClientSplitDir::Right => AgentSplitDir::Right,
-                ClientSplitDir::Down => AgentSplitDir::Down,
-            };
-            if conn
-                .send(ServerMsg::SplitPane {
-                    session_id: active.session_id,
-                    tool,
-                    direction,
-                    args,
-                })
-                .await
-                .is_err()
-            {
-                let _ = send_client(
-                    sink,
-                    &HubToClient::SessionError {
-                        message: "agent disconnected".into(),
-                    },
-                )
-                .await;
-            }
-            true
-        }
-        ClientToHub::ChangeLayout { layout } => {
-            // Same shape as SplitPane: needs an open session, fire-and-forget.
-            let (Some(conn), Some(active)) = (ctx.selected_agent.as_ref(), ctx.active.as_ref())
-            else {
-                let _ = send_client(
-                    sink,
-                    &HubToClient::SessionError {
-                        message: "no active session to re-layout".into(),
-                    },
-                )
-                .await;
-                return true;
-            };
-            let layout = match layout {
-                ClientPaneLayout::SideBySide => AgentPaneLayout::SideBySide,
-                ClientPaneLayout::Stacked => AgentPaneLayout::Stacked,
-            };
-            if conn
-                .send(ServerMsg::ChangeLayout {
-                    session_id: active.session_id,
-                    layout,
-                })
-                .await
-                .is_err()
-            {
-                let _ = send_client(
-                    sink,
-                    &HubToClient::SessionError {
-                        message: "agent disconnected".into(),
-                    },
-                )
-                .await;
-            }
-            true
-        }
         ClientToHub::Close => false,
         ClientToHub::Hello { .. } | ClientToHub::Pong => true,
     }
@@ -950,7 +852,7 @@ where
 /// [String, ...]}}`. Any deviation (missing row, bad JSON, wrong
 /// shape, unknown tool) maps to an empty argv — matching webterm's
 /// own fall-back behaviour, so a misconfigured row never silently
-/// injects wrong flags into claude/codex.
+/// injects wrong flags into claude.
 async fn args_from_user_preferences(
     db: &crate::db::Db,
     account: &str,
@@ -981,17 +883,6 @@ fn parse_tool_args_blob(blob: &str, tool: &str) -> Vec<String> {
         .collect()
 }
 
-/// Same rule as the agent's `validate_name(_, "tool")` — keep them
-/// aligned so we reject early on the hub instead of round-tripping.
-fn valid_tool_name(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 63
-        && !s.starts_with('-')
-        && !s.starts_with('.')
-        && s.chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
-}
-
 async fn handle_agent_event<S>(ctx: &mut ConnCtx, evt: PtyEventOut, sink: &mut S) -> bool
 where
     S: SinkExt<Message, Error = axum::Error> + Unpin,
@@ -1006,7 +897,7 @@ where
         PtyEventOut::Frame(ClientMsg::PtyClosed { reason, .. }) => {
             if let (Some(conn), Some(active)) = (ctx.selected_agent.as_ref(), ctx.active.take()) {
                 conn.unregister_session(active.session_id);
-                ctx.state.workspaces.remove_if(
+                ctx.state.session_locks.remove_if(
                     &(
                         conn.name.clone(),
                         ctx.account_name.clone(),
@@ -1037,14 +928,6 @@ where
             let _ = send_client(sink, &HubToClient::SessionError { message }).await;
             true
         }
-        PtyEventOut::Frame(ClientMsg::SplitPaneResult { error, .. }) => {
-            if let Some(message) = error {
-                let _ = send_client(sink, &HubToClient::SessionError { message }).await;
-            }
-            // Success: the agent already spawned the pane; its bytes
-            // arrive through the existing PTY tap. Nothing else to do.
-            true
-        }
         PtyEventOut::Frame(_) => true,
     }
 }
@@ -1063,12 +946,13 @@ mod tests {
 
     #[test]
     fn pref_args_pulls_typed_array_for_requested_tool() {
-        let blob = r#"{"tool_args":{"claude":["--model","claude-3-opus"],"codex":[]}}"#;
+        let blob = r#"{"tool_args":{"claude":["--model","claude-3-opus"]}}"#;
         assert_eq!(
             parse_tool_args_blob(blob, "claude"),
             vec!["--model".to_string(), "claude-3-opus".to_string()]
         );
-        assert_eq!(parse_tool_args_blob(blob, "codex"), Vec::<String>::new());
+        // Unknown tool key -> empty argv (matches webterm fall-back).
+        assert_eq!(parse_tool_args_blob(blob, "ghost"), Vec::<String>::new());
     }
 
     #[test]
@@ -1077,12 +961,15 @@ mod tests {
         assert!(parse_tool_args_blob("\"oops\"", "claude").is_empty());
         assert!(parse_tool_args_blob("{}", "claude").is_empty());
         assert!(parse_tool_args_blob(r#"{"tool_args":[]}"#, "claude").is_empty());
+        // Wrong tool key in the map -> empty.
         assert!(
-            parse_tool_args_blob(r#"{"tool_args":{"codex":["x"]}}"#, "claude").is_empty()
+            parse_tool_args_blob(r#"{"tool_args":{"ghost":["x"]}}"#, "claude").is_empty()
         );
+        // Right key, wrong value type -> empty.
         assert!(
             parse_tool_args_blob(r#"{"tool_args":{"claude":"--model x"}}"#, "claude").is_empty()
         );
+        // Mixed-type array: keep only the string entries.
         assert_eq!(
             parse_tool_args_blob(
                 r#"{"tool_args":{"claude":["--a",42,"--b",null,"--c"]}}"#,

@@ -169,6 +169,35 @@ impl Db {
                 expires_at INTEGER NOT NULL
             )",
             "CREATE INDEX IF NOT EXISTS idx_user_sessions_expires ON user_sessions(expires_at)",
+            // Hub-managed workspaces (v1.13). The hub holds the canonical
+            // copy of a workspace's files under <state>/hub/workspaces/;
+            // agents pull a working copy and need a hub-side lock to
+            // push changes. `locked_by_agent` / `locked_at` are NULL
+            // when nobody owns the workspace. `size_bytes` is the
+            // aggregate size of the canonical copy, refreshed by the
+            // sync engine on each successful push.
+            "CREATE TABLE IF NOT EXISTS workspaces (
+                account            TEXT NOT NULL,
+                name               TEXT NOT NULL,
+                created_at         INTEGER NOT NULL,
+                locked_by_agent    TEXT,
+                locked_at          INTEGER,
+                last_sync_at       INTEGER,
+                size_bytes         INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (account, name)
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_workspaces_locked_by ON workspaces(locked_by_agent)",
+            // When the hub force-takes a lock from an offline agent we
+            // queue a "rm -rf local copy" instruction here. The agent
+            // drains its row on the next hello frame and applies it
+            // before reconnecting to any sessions.
+            "CREATE TABLE IF NOT EXISTS pending_workspace_cleanups (
+                agent      TEXT NOT NULL,
+                account    TEXT NOT NULL,
+                workspace  TEXT NOT NULL,
+                queued_at  INTEGER NOT NULL,
+                PRIMARY KEY (agent, account, workspace)
+            )",
             // Compat for deployments that already ran the unguarded
             // seed (pre-v1.8.x): if the ACL table is non-empty, assume
             // the seed has logically happened and lock the marker in,
@@ -970,6 +999,205 @@ impl Db {
         .await?;
         Ok(())
     }
+
+    // ---- workspaces (v1.13 hub-managed workspace metadata) ------------
+
+    /// Every workspace owned by `account`, alphabetised. Returns an
+    /// empty Vec for accounts that have never created a workspace.
+    pub async fn list_workspaces(&self, account: &str) -> Result<Vec<WorkspaceRow>> {
+        let rows = sqlx::query(
+            "SELECT account, name, created_at, locked_by_agent, locked_at,
+                    last_sync_at, size_bytes
+               FROM workspaces
+              WHERE account = ?1
+              ORDER BY name",
+        )
+        .bind(account)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| WorkspaceRow {
+                account: r.get("account"),
+                name: r.get("name"),
+                created_at: r.get("created_at"),
+                locked_by_agent: r.get("locked_by_agent"),
+                locked_at: r.get("locked_at"),
+                last_sync_at: r.get("last_sync_at"),
+                size_bytes: r.get("size_bytes"),
+            })
+            .collect())
+    }
+
+    /// Insert a brand-new workspace row. Errors on (account, name)
+    /// conflict — callers should treat that as "workspace already
+    /// exists, pick another name" rather than silently merging.
+    pub async fn create_workspace(&self, account: &str, name: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO workspaces (account, name, created_at, size_bytes)
+                  VALUES (?1, ?2, ?3, 0)",
+        )
+        .bind(account)
+        .bind(name)
+        .bind(chrono::Utc::now().timestamp())
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("creating workspace {account}/{name}"))?;
+        Ok(())
+    }
+
+    /// Drop the workspace metadata row. The caller is responsible for
+    /// deleting the on-disk copy via `WorkspaceStorage::delete`; this
+    /// method only touches the DB.
+    pub async fn delete_workspace(&self, account: &str, name: &str) -> Result<()> {
+        sqlx::query("DELETE FROM workspaces WHERE account = ?1 AND name = ?2")
+            .bind(account)
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Set or clear the workspace lock. Passing `Some(agent)` records
+    /// the agent and the current timestamp; passing `None` clears both
+    /// columns. Errors if the workspace row does not exist.
+    pub async fn set_workspace_lock(
+        &self,
+        account: &str,
+        name: &str,
+        agent: Option<&str>,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let rows = match agent {
+            Some(a) => sqlx::query(
+                "UPDATE workspaces
+                    SET locked_by_agent = ?1, locked_at = ?2
+                  WHERE account = ?3 AND name = ?4",
+            )
+            .bind(a)
+            .bind(now)
+            .bind(account)
+            .bind(name)
+            .execute(&self.pool)
+            .await?
+            .rows_affected(),
+            None => sqlx::query(
+                "UPDATE workspaces
+                    SET locked_by_agent = NULL, locked_at = NULL
+                  WHERE account = ?1 AND name = ?2",
+            )
+            .bind(account)
+            .bind(name)
+            .execute(&self.pool)
+            .await?
+            .rows_affected(),
+        };
+        if rows == 0 {
+            anyhow::bail!("workspace '{}/{}' not found", account, name);
+        }
+        Ok(())
+    }
+
+    /// Returns the agent name currently holding the lock, or `None` if
+    /// the workspace is unlocked or doesn't exist. Treating "missing
+    /// workspace" and "unlocked workspace" identically keeps callers
+    /// simple — both states mean "no agent owns this".
+    pub async fn get_workspace_lock(
+        &self,
+        account: &str,
+        name: &str,
+    ) -> Result<Option<String>> {
+        let row = sqlx::query(
+            "SELECT locked_by_agent FROM workspaces
+              WHERE account = ?1 AND name = ?2",
+        )
+        .bind(account)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|r| r.get::<Option<String>, _>("locked_by_agent")))
+    }
+
+    /// Record a successful sync from an agent: stamp `last_sync_at` to
+    /// now and store the new aggregate size. Errors if the workspace
+    /// row is missing — sync should never produce metadata for an
+    /// uncreated workspace.
+    pub async fn update_workspace_sync_meta(
+        &self,
+        account: &str,
+        name: &str,
+        size_bytes: i64,
+    ) -> Result<()> {
+        let rows = sqlx::query(
+            "UPDATE workspaces
+                SET last_sync_at = ?1, size_bytes = ?2
+              WHERE account = ?3 AND name = ?4",
+        )
+        .bind(chrono::Utc::now().timestamp())
+        .bind(size_bytes)
+        .bind(account)
+        .bind(name)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if rows == 0 {
+            anyhow::bail!("workspace '{}/{}' not found", account, name);
+        }
+        Ok(())
+    }
+
+    /// Queue a "the hub force-took your lock, drop your local copy"
+    /// instruction for `agent`. Idempotent via `INSERT OR REPLACE` —
+    /// re-queueing the same triple just refreshes `queued_at`.
+    pub async fn queue_pending_cleanup(
+        &self,
+        agent: &str,
+        account: &str,
+        workspace: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO pending_workspace_cleanups
+                (agent, account, workspace, queued_at)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(agent)
+        .bind(account)
+        .bind(workspace)
+        .bind(chrono::Utc::now().timestamp())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Drain the cleanup queue for `agent`: return every `(account,
+    /// workspace)` pair the agent should rm -rf, and delete those rows
+    /// in the same transaction so a second call returns nothing. The
+    /// agent reports back per-pair success out-of-band; if it crashes
+    /// mid-cleanup we just re-queue.
+    pub async fn take_pending_cleanups(
+        &self,
+        agent: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query(
+            "SELECT account, workspace FROM pending_workspace_cleanups
+              WHERE agent = ?1
+              ORDER BY queued_at",
+        )
+        .bind(agent)
+        .fetch_all(&mut *tx)
+        .await?;
+        let out: Vec<(String, String)> = rows
+            .into_iter()
+            .map(|r| (r.get::<String, _>("account"), r.get::<String, _>("workspace")))
+            .collect();
+        sqlx::query("DELETE FROM pending_workspace_cleanups WHERE agent = ?1")
+            .bind(agent)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(out)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1032,6 +1260,22 @@ pub struct MessageDisplayRow {
     pub ts: i64,
     pub kind: String,
     pub body: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkspaceRow {
+    pub account: String,
+    pub name: String,
+    pub created_at: i64,
+    /// Agent that currently holds the write lock, if any.
+    pub locked_by_agent: Option<String>,
+    /// Timestamp the lock was last acquired. NULL iff `locked_by_agent`
+    /// is also NULL.
+    pub locked_at: Option<i64>,
+    /// Last successful push from an agent. NULL until the workspace
+    /// has been synced at least once.
+    pub last_sync_at: Option<i64>,
+    pub size_bytes: i64,
 }
 
 #[derive(Debug, Clone, Default)]
