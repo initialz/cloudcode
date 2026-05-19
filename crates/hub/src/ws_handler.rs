@@ -6,12 +6,19 @@ use axum::extract::State;
 use axum::response::Response;
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const SEND_QUEUE: usize = 256;
+/// Minimum time between two `update_workspace_sync_meta` calls for
+/// the same `(account, workspace)`. A busy editor save burst will
+/// fire dozens of WorkspacePushFile frames in quick succession; we
+/// don't want to size-scan + UPDATE the DB on every one. The
+/// staleness this introduces (≤5s) only affects the admin UI's
+/// "last sync" column, not any correctness path.
+const SYNC_META_DEBOUNCE: Duration = Duration::from_secs(5);
 
 pub async fn upgrade(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
@@ -69,6 +76,33 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
     tracing::info!(agent = %name, "agent connected");
 
+    // v1.13: drain any pending "your lock was force-taken" instructions
+    // for this agent. If there are any, push a WorkspaceCleanup frame
+    // *before* any other ServerMsg so the agent can rm -rf its stale
+    // copies before the next OpenSession races. We deliberately drain
+    // (not just peek) — if the WS dies before the agent acts on the
+    // frame the worst case is the agent re-uploads a stale copy on the
+    // next sync, which the hub overwrites on the next pull. We re-queue
+    // only when the hub itself force-takes a new lock.
+    match state.db.take_pending_cleanups(&name).await {
+        Ok(items) if !items.is_empty() => {
+            tracing::info!(
+                agent = %name,
+                count = items.len(),
+                "draining pending workspace cleanups"
+            );
+            if send_text(&mut sink, &ServerMsg::WorkspaceCleanup { items })
+                .await
+                .is_err()
+            {
+                state.registry.unregister(&conn);
+                return;
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(agent = %name, error = %e, "take_pending_cleanups failed"),
+    }
+
     let writer = tokio::spawn(async move {
         let mut ping = tokio::time::interval(PING_INTERVAL);
         ping.tick().await;
@@ -99,6 +133,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         }
         let _ = sink.close().await;
     });
+
+    // Per-(account, workspace) "last meta refresh" timestamps for the
+    // sync-meta debounce. Lives for the lifetime of the agent
+    // connection — cleared when this handler returns.
+    let mut last_meta_refresh: std::collections::HashMap<(String, String), Instant> =
+        std::collections::HashMap::new();
 
     while let Some(item) = stream.next().await {
         let msg = match item {
@@ -131,6 +171,31 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         })
                         .await;
                 }
+                Ok(ClientMsg::WorkspacePushFile {
+                    session_id,
+                    path,
+                    content,
+                }) => {
+                    handle_workspace_push(
+                        &state,
+                        &conn,
+                        session_id,
+                        path,
+                        content,
+                        &mut last_meta_refresh,
+                    )
+                    .await;
+                }
+                Ok(ClientMsg::WorkspaceDeleteFile { session_id, path }) => {
+                    handle_workspace_delete(
+                        &state,
+                        &conn,
+                        session_id,
+                        path,
+                        &mut last_meta_refresh,
+                    )
+                    .await;
+                }
                 Ok(frame) => conn.handle_text_frame(frame).await,
                 Err(e) => tracing::warn!(agent = %name, error = %e, "bad frame"),
             },
@@ -141,8 +206,153 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     }
 
     tracing::info!(agent = %name, "agent disconnected");
+    // Release any workspace locks this agent still held so they don't
+    // stay "owned" by a dead connection. The next OpenSession for the
+    // workspace will see it as free and take it without needing
+    // `force=true`.
+    match state.db.release_all_workspace_locks_for_agent(&name).await {
+        Ok(n) if n > 0 => {
+            tracing::info!(agent = %name, n, "released workspace locks on disconnect");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(agent = %name, error = %e, "lock release on disconnect failed"),
+    }
     state.registry.unregister(&conn);
     writer.abort();
+}
+
+/// Hub-side handler for `ClientMsg::WorkspacePushFile`. Looks the
+/// session up in the reverse index, writes the file into the canonical
+/// store, and acks the agent. Failures ack with `ok=false`; the agent
+/// keeps the row in its push queue and retries.
+async fn handle_workspace_push(
+    state: &Arc<AppState>,
+    conn: &Arc<crate::registry::AgentConn>,
+    session_id: uuid::Uuid,
+    path: String,
+    content: Vec<u8>,
+    last_meta_refresh: &mut std::collections::HashMap<(String, String), Instant>,
+) {
+    let Some((account, workspace, _agent)) = state
+        .session_workspaces
+        .get(&session_id)
+        .map(|e| e.value().clone())
+    else {
+        tracing::warn!(
+            session = %session_id,
+            path = %path,
+            "WorkspacePushFile for unknown session; acking with error"
+        );
+        let _ = conn
+            .send(ServerMsg::WorkspaceFileAck {
+                session_id,
+                path,
+                ok: false,
+                error: Some("unknown session".into()),
+            })
+            .await;
+        return;
+    };
+
+    let (ok, error) = match state
+        .workspaces
+        .write_file(&account, &workspace, &path, &content)
+    {
+        Ok(()) => (true, None),
+        Err(e) => (false, Some(e.to_string())),
+    };
+    if ok {
+        maybe_refresh_sync_meta(state, &account, &workspace, last_meta_refresh).await;
+    }
+    let _ = conn
+        .send(ServerMsg::WorkspaceFileAck {
+            session_id,
+            path,
+            ok,
+            error,
+        })
+        .await;
+}
+
+/// Mirror of `handle_workspace_push` for the delete path.
+async fn handle_workspace_delete(
+    state: &Arc<AppState>,
+    conn: &Arc<crate::registry::AgentConn>,
+    session_id: uuid::Uuid,
+    path: String,
+    last_meta_refresh: &mut std::collections::HashMap<(String, String), Instant>,
+) {
+    let Some((account, workspace, _agent)) = state
+        .session_workspaces
+        .get(&session_id)
+        .map(|e| e.value().clone())
+    else {
+        tracing::warn!(
+            session = %session_id,
+            path = %path,
+            "WorkspaceDeleteFile for unknown session; acking with error"
+        );
+        let _ = conn
+            .send(ServerMsg::WorkspaceFileAck {
+                session_id,
+                path,
+                ok: false,
+                error: Some("unknown session".into()),
+            })
+            .await;
+        return;
+    };
+
+    let (ok, error) = match state.workspaces.delete_file(&account, &workspace, &path) {
+        Ok(()) => (true, None),
+        Err(e) => (false, Some(e.to_string())),
+    };
+    if ok {
+        maybe_refresh_sync_meta(state, &account, &workspace, last_meta_refresh).await;
+    }
+    let _ = conn
+        .send(ServerMsg::WorkspaceFileAck {
+            session_id,
+            path,
+            ok,
+            error,
+        })
+        .await;
+}
+
+/// Throttled `last_sync_at` + `size_bytes` refresh. Each (account,
+/// workspace) is updated at most once per `SYNC_META_DEBOUNCE`, so a
+/// 200-file editor save burst hits the DB once instead of 200 times.
+async fn maybe_refresh_sync_meta(
+    state: &Arc<AppState>,
+    account: &str,
+    workspace: &str,
+    last_meta_refresh: &mut std::collections::HashMap<(String, String), Instant>,
+) {
+    let key = (account.to_string(), workspace.to_string());
+    let now = Instant::now();
+    let due = last_meta_refresh
+        .get(&key)
+        .map(|prev| now.duration_since(*prev) >= SYNC_META_DEBOUNCE)
+        .unwrap_or(true);
+    if !due {
+        return;
+    }
+    last_meta_refresh.insert(key, now);
+    let size = match state.workspaces.total_size(account, workspace) {
+        Ok(s) => s as i64,
+        Err(e) => {
+            tracing::debug!(error = %e, "total_size failed; skipping sync meta refresh");
+            return;
+        }
+    };
+    if let Err(e) = state
+        .db
+        .update_workspace_sync_meta(account, workspace, size)
+        .await
+    {
+        tracing::debug!(error = %e, "update_workspace_sync_meta failed");
+    }
 }
 
 async fn send_text<S>(sink: &mut S, msg: &ServerMsg) -> Result<(), ()>

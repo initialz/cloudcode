@@ -8,11 +8,8 @@ export type TabStatus = 'connecting' | 'opening' | 'live' | 'closed' | 'error';
 
 export type Tab = {
   id: string;
-  agent: string;
   workspace: string;
-  /** Tool used when opening the session. Effectively 'claude' as of
-   *  v1.13; kept on the wire / Tab shape for back-compat. */
-  tool?: string;
+  agent: string;
   status: TabStatus;
   errorMsg?: string;
   ws: WireSocket;
@@ -29,10 +26,7 @@ export function tabKey(agent: string, workspace: string): string {
   return `${agent}::${workspace}`;
 }
 
-/** Human-readable label shown in the tab bar. */
-export function tabLabel(tab: Pick<Tab, 'agent' | 'workspace' | 'tool'>): string {
-  if (tab.tool) {
-    return `${tab.agent}·${tab.workspace}·${tab.tool}`;
-  }
-  return `${tab.agent}·${tab.workspace}`;
+/** Human-readable label shown in the tab bar: workspace·agent */
+export function tabLabel(tab: Pick<Tab, 'workspace' | 'agent'>): string {
+  return `${tab.workspace}·${tab.agent}`;
 }

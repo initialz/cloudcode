@@ -1,6 +1,6 @@
-// IDE-style workbench: left sidebar (agent tree) + right tab bar + xterm area.
+// IDE-style workbench: left sidebar (workspace tree) + right tab bar + xterm area.
 // Owns:
-//   1. Control WS — menu phase (list agents / workspaces, create/delete/reset)
+//   1. Control WS — menu phase (list workspaces / agents, create/delete/reset)
 //   2. Per-tab PTY WS — one independent WireSocket + Terminal per open workspace
 
 import {
@@ -20,6 +20,7 @@ import { apiClient } from '@/lib/api';
 import {
   WireSocket,
   type AgentItem,
+  type WorkspaceItem,
   type HubMsg,
 } from '@/lib/wire';
 import { effectiveTheme, getStoredTheme, type Theme } from '@/lib/theme';
@@ -30,12 +31,10 @@ import {
   serializePreferences,
   type Preferences,
 } from '@/lib/preferences';
-import type { Tool } from '@/lib/tools';
-import { DEFAULT_TOOL, KNOWN_TOOLS } from '@/lib/tools';
 import Sidebar from '@/components/Sidebar';
 import TabBar from '@/components/TabBar';
 import SettingsDialog from '@/components/SettingsDialog';
-import type { AgentWorkspaceCache } from '@/components/AgentTree';
+import ConfirmDialog from '@/components/ConfirmDialog';
 
 // ── xterm theme helpers ──────────────────────────────────────────────────────
 
@@ -71,6 +70,14 @@ function tabsReducer(state: Tab[], action: TabAction): Tab[] {
   }
 }
 
+// ── Takeover confirm state ────────────────────────────────────────────────────
+
+type TakeoverPending = {
+  workspace: string;
+  agent: string;
+  lockedBy: string;
+};
+
 // ── Workbench ────────────────────────────────────────────────────────────────
 
 export default function Workbench() {
@@ -84,13 +91,10 @@ export default function Workbench() {
   const ctrlWsRef = useRef<WireSocket | null>(null);
   const [ctrlReady, setCtrlReady] = useState(false);
 
-  // Agent tree data
+  // Per-account workspace list + agent list
+  const [workspaces, setWorkspaces] = useState<WorkspaceItem[]>([]);
+  const [workspacesLoading, setWorkspacesLoading] = useState(true);
   const [agents, setAgents] = useState<AgentItem[]>([]);
-  const [agentsLoading, setAgentsLoading] = useState(true);
-  const [wsCache, setWsCache] = useState<AgentWorkspaceCache>(new Map());
-
-  // Currently "selected" agent on the control connection (needed for create/list)
-  const ctrlAgentRef = useRef<string | null>(null);
 
   // Tabs
   const [tabs, dispatchTabs] = useReducer(tabsReducer, []);
@@ -101,16 +105,17 @@ export default function Workbench() {
   // Settings dialog
   const [showSettings, setShowSettings] = useState(false);
 
-  // Per-user preferences (default args per tool, future things). Loaded
-  // from the hub on mount; kept in a ref so non-reactive callbacks
-  // (handleTabMsg, handleSplit) see fresh values without re-binding.
+  // Takeover confirm dialog (locked workspace)
+  const [takeoverPending, setTakeoverPending] = useState<TakeoverPending | null>(null);
+
+  // Per-user preferences (default args, future things). Loaded from the hub on
+  // mount; kept in a ref so non-reactive callbacks see fresh values without
+  // re-binding.
   const [preferences, setPreferences] = useState<Preferences>(DEFAULT_PREFERENCES);
   const preferencesRef = useRef<Preferences>(preferences);
   preferencesRef.current = preferences;
 
-  // Transient error toasts (e.g. split-pane failures). SessionError is a
-  // non-fatal hub event by design, so we surface it inline instead of
-  // tearing down the user's tab.
+  // Transient error toasts (non-fatal hub events).
   type Toast = { id: string; message: string };
   const [toasts, setToasts] = useState<Toast[]>([]);
   const addToast = useCallback((message: string) => {
@@ -127,16 +132,10 @@ export default function Workbench() {
   // Refresh timer ref (30s poll)
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Container DOM nodes per tab id. Kept outside of React state on
-  // purpose — touching them during a ref callback must NOT trigger
-  // a re-render, or the inline ref creates an infinite loop.
+  // Container DOM nodes per tab id.
   const containersRef = useRef<Map<string, HTMLDivElement>>(new Map());
 
-  // Per-tab "tmux is sitting in copy-mode with a live selection"
-  // flag, used by the Cmd+C bridge. Lives outside React state
-  // because the tabs reducer rebuilds tab objects on every UPDATE
-  // (e.g. status transitions), which would otherwise discard a
-  // mutation we just made on the old tab reference.
+  // Per-tab copy-mode flag (see attachContainer).
   const copyModeRef = useRef<Map<string, boolean>>(new Map());
 
   // ── Auth check ─────────────────────────────────────────────────────────────
@@ -154,19 +153,13 @@ export default function Workbench() {
   }, [navigate]);
 
   // ── Preferences load ─────────────────────────────────────────────────────
-  // Fire-and-forget once we know the user is authed. Failures are
-  // non-fatal: webterm just keeps the in-memory defaults until the user
-  // either retries or saves.
 
   useEffect(() => {
     if (authLoading) return;
     apiClient
       .getPreferences()
       .then((resp) => setPreferences(parsePreferences(resp.preferences)))
-      .catch(() => {
-        // Network blip on first paint — stick with defaults so the
-        // session-open flow keeps working.
-      });
+      .catch(() => {});
   }, [authLoading]);
 
   const savePreferences = useCallback(async (next: Preferences) => {
@@ -181,23 +174,20 @@ export default function Workbench() {
 
   // ── Control WS helpers ─────────────────────────────────────────────────────
 
-  const refreshWorkspaces = useCallback((agent: string) => {
+  const refreshWorkspaces = useCallback(() => {
     if (!ctrlWsRef.current?.connected) return;
-    // If control ws is already on this agent, just list; otherwise switch first.
-    if (ctrlAgentRef.current === agent) {
-      ctrlWsRef.current.send({ type: 'list_workspaces' });
-    } else {
-      ctrlWsRef.current.send({ type: 'select_agent', agent });
-    }
+    ctrlWsRef.current.send({ type: 'list_workspaces' });
+  }, []);
+
+  const refreshAgents = useCallback(() => {
+    if (!ctrlWsRef.current?.connected) return;
+    ctrlWsRef.current.send({ type: 'list_agents' });
   }, []);
 
   const schedulePoll = useCallback(() => {
     if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
     pollTimerRef.current = setTimeout(() => {
-      // Re-fetch all currently expanded agents
-      if (ctrlAgentRef.current) {
-        refreshWorkspaces(ctrlAgentRef.current);
-      }
+      refreshWorkspaces();
       schedulePoll();
     }, 30_000);
   }, [refreshWorkspaces]);
@@ -209,49 +199,27 @@ export default function Workbench() {
       switch (msg.type) {
         case 'welcome':
           setCtrlReady(true);
+          // Fetch both workspace list and agent list on connect
+          ctrlWsRef.current?.send({ type: 'list_workspaces' });
           ctrlWsRef.current?.send({ type: 'list_agents' });
+          break;
+
+        case 'workspace_list':
+          setWorkspaces(msg.items);
+          setWorkspacesLoading(false);
           break;
 
         case 'agent_list':
           setAgents(msg.items);
-          setAgentsLoading(false);
-          break;
-
-        case 'agent_selected':
-          ctrlAgentRef.current = msg.agent;
-          // Mark as loading in cache
-          setWsCache((prev) => {
-            const next = new Map(prev);
-            if (!next.has(msg.agent) || next.get(msg.agent)?.status === 'idle') {
-              next.set(msg.agent, { status: 'loading' });
-            }
-            return next;
-          });
-          ctrlWsRef.current?.send({ type: 'list_workspaces' });
-          break;
-
-        case 'workspace_list':
-          if (ctrlAgentRef.current) {
-            const agent = ctrlAgentRef.current;
-            setWsCache((prev) => {
-              const next = new Map(prev);
-              next.set(agent, { status: 'loaded', items: msg.items });
-              return next;
-            });
-          }
           break;
 
         case 'workspace_created':
         case 'workspace_deleted':
         case 'workspace_reset':
-          // Refresh the current agent's list
-          if (ctrlAgentRef.current) {
-            ctrlWsRef.current?.send({ type: 'list_workspaces' });
-          }
+          refreshWorkspaces();
           break;
 
         case 'rejected':
-          // Control WS rejected — most likely session expired
           navigate('/login', { replace: true });
           break;
 
@@ -259,7 +227,7 @@ export default function Workbench() {
           break;
       }
     },
-    [navigate],
+    [navigate, refreshWorkspaces],
   );
 
   // ── Build control WS ───────────────────────────────────────────────────────
@@ -278,8 +246,6 @@ export default function Workbench() {
       },
     });
 
-    // Patch handlers to intercept Welcome so we can set ctrlReady + list agents
-    // handleCtrlMsg already handles 'welcome', so just connect directly.
     ws.connect();
     ctrlWsRef.current = ws;
     schedulePoll();
@@ -294,90 +260,55 @@ export default function Workbench() {
 
   // ── Sidebar callbacks ──────────────────────────────────────────────────────
 
-  function handleExpandAgent(agent: string) {
-    // Mark as loading if first time
-    setWsCache((prev) => {
-      const next = new Map(prev);
-      if (!next.has(agent)) {
-        next.set(agent, { status: 'loading' });
-      }
-      return next;
-    });
-
+  function handleCreateWorkspace(name: string) {
     if (!ctrlWsRef.current?.connected) return;
-
-    if (ctrlAgentRef.current === agent) {
-      // Already selected — just refresh
-      ctrlWsRef.current.send({ type: 'list_workspaces' });
-    } else {
-      // Switch agent on control ws (triggers agent_selected → list_workspaces)
-      ctrlWsRef.current.send({ type: 'select_agent', agent });
-    }
-  }
-
-  function handleCreateWorkspace(agent: string, name: string) {
-    if (!ctrlWsRef.current?.connected) return;
-    if (ctrlAgentRef.current !== agent) {
-      // Switch then create — create_workspace fires after agent_selected
-      // We need to queue the create; simplest: switch and rely on the
-      // agent_selected handler, but we don't have a queue mechanism.
-      // Instead switch synchronously and immediately send create.
-      ctrlWsRef.current.send({ type: 'select_agent', agent });
-    }
     ctrlWsRef.current.send({ type: 'create_workspace', name });
   }
 
-  // The hub holds a per-workspace mutex: as long as some session is
-  // attached it refuses delete/reset with "workspace is currently in
-  // use". For the web UI that means a workspace with an open tab can
-  // never be cleaned up. Close the tab first, let the WS-close
-  // propagate so the hub's mutex clears, then fire the menu-level
-  // request from the control WS.
-  function withTabClosed(
-    agent: string,
-    workspace: string,
-    fire: () => void,
-  ) {
-    const key = tabKey(agent, workspace);
-    const openTab = tabsRef.current.find(
-      (t) => tabKey(t.agent, t.workspace) === key,
-    );
+  function handleResetWorkspace(workspace: string) {
+    if (!ctrlWsRef.current?.connected) return;
+    // Find any open tab for this workspace (any agent)
+    const openTab = tabsRef.current.find((t) => t.workspace === workspace);
+    const doReset = () => {
+      ctrlWsRef.current?.send({ type: 'reset_workspace', name: workspace });
+    };
     if (openTab) {
       closeTabRef.current(openTab.id);
-      // Empirically the hub releases its workspace mutex once the WS
-      // close handshake completes. 400 ms is a safe budget; if we
-      // see flakiness we can bump it or wait on a real ack.
-      setTimeout(fire, 400);
+      setTimeout(doReset, 400);
     } else {
-      fire();
+      doReset();
     }
   }
 
-  function handleResetWorkspace(agent: string, workspace: string) {
+  function handleDeleteWorkspace(workspace: string) {
     if (!ctrlWsRef.current?.connected) return;
-    withTabClosed(agent, workspace, () => {
-      if (ctrlAgentRef.current !== agent) {
-        ctrlWsRef.current?.send({ type: 'select_agent', agent });
-      }
-      ctrlWsRef.current?.send({ type: 'reset_workspace', name: workspace });
-    });
-  }
-
-  function handleDeleteWorkspace(agent: string, workspace: string) {
-    if (!ctrlWsRef.current?.connected) return;
-    withTabClosed(agent, workspace, () => {
-      if (ctrlAgentRef.current !== agent) {
-        ctrlWsRef.current?.send({ type: 'select_agent', agent });
-      }
+    const openTab = tabsRef.current.find((t) => t.workspace === workspace);
+    const doDelete = () => {
       ctrlWsRef.current?.send({ type: 'delete_workspace', name: workspace });
-    });
+    };
+    if (openTab) {
+      closeTabRef.current(openTab.id);
+      setTimeout(doDelete, 400);
+    } else {
+      doDelete();
+    }
   }
 
   // ── Open tab ──────────────────────────────────────────────────────────────
 
   const openTab = useCallback(
-    (agent: string, workspace: string, tool?: string) => {
-      // Deduplicate by agent::workspace (tab is reused regardless of tool)
+    (workspace: string, agent: string, force?: boolean) => {
+      // Check if workspace is locked by a different agent; surface takeover
+      // dialog unless force is already set (called from confirm handler).
+      if (!force) {
+        const ws = workspaces.find((w) => w.name === workspace);
+        if (ws?.locked_by_agent && ws.locked_by_agent !== agent) {
+          setTakeoverPending({ workspace, agent, lockedBy: ws.locked_by_agent });
+          return;
+        }
+      }
+
+      // Deduplicate by agent::workspace
       const key = tabKey(agent, workspace);
       const existing = tabsRef.current.find(
         (t) => tabKey(t.agent, t.workspace) === key,
@@ -400,28 +331,15 @@ export default function Workbench() {
       term.loadAddon(fitAddon);
       term.loadAddon(linksAddon);
 
-      // OSC 52 clipboard write. tmux (with `set -g set-clipboard on`)
-      // emits this escape on every drag-select copy: `OSC 52 ; c ;
-      // <base64-text> BEL`. Without a handler xterm.js drops it on the
-      // floor for security. We accept it and forward to the system
-      // clipboard so users get drag-select → release → ready-to-paste
-      // without needing Shift overrides or modal "copy mode" toggles.
-      // Only the `c` (clipboard) target is honoured; the `p` (primary
-      // selection) variant is X11-specific and not useful in a browser.
+      // OSC 52 clipboard write.
       term.parser.registerOscHandler(52, (data) => {
         const sep = data.indexOf(';');
         if (sep < 0) return false;
         const targets = data.substring(0, sep);
         const payload = data.substring(sep + 1);
-        // Empty `targets` means "default = clipboard"; otherwise we
-        // accept any string that includes `c` (clipboard target).
         if (targets !== '' && !targets.includes('c')) return false;
         let text: string;
         try {
-          // Two-step decode: atob gives back a Latin-1 "binary string"
-          // where each JS char carries one byte. For multi-byte UTF-8
-          // (e.g. CJK) we have to re-interpret those bytes as UTF-8 or
-          // the clipboard ends up holding mojibake.
           const binary = atob(payload);
           const bytes = new Uint8Array(binary.length);
           for (let i = 0; i < binary.length; i++) {
@@ -431,11 +349,6 @@ export default function Workbench() {
         } catch {
           return false;
         }
-        // navigator.clipboard.writeText is async + needs a "transient
-        // user activation" window; mouse-up is one, and OSC 52 arrives
-        // microseconds later so the activation is still live. Failures
-        // (e.g. http page on a non-localhost host) are silent — we
-        // don't want a toast or console spam on every selection.
         navigator.clipboard.writeText(text).catch(() => {});
         return true;
       });
@@ -443,18 +356,13 @@ export default function Workbench() {
       const id = crypto.randomUUID();
 
       const ws = new WireSocket({
-        onMessage: (msg) => handleTabMsg(id, agent, workspace, tool, msg),
+        onMessage: (msg) => handleTabMsg(id, workspace, agent, force ?? false, msg),
         onBinary: (data) => {
           const tab = tabsRef.current.find((t) => t.id === id);
           tab?.term.write(data);
         },
-        onClose: (_code, _reason) => {
-          // WS dropped — close the tab so the user doesn't have to
-          // click ✕ on a dead session. Refresh the sidebar so the
-          // workspace's status dot tracks reality.
-          if (ctrlAgentRef.current === agent) {
-            ctrlWsRef.current?.send({ type: 'list_workspaces' });
-          }
+        onClose: () => {
+          refreshWorkspaces();
           closeTabRef.current(id);
         },
         onError: () => {
@@ -472,9 +380,8 @@ export default function Workbench() {
 
       const newTab: Tab = {
         id,
-        agent,
         workspace,
-        tool,
+        agent,
         status: 'connecting',
         ws,
         term,
@@ -482,14 +389,7 @@ export default function Workbench() {
         opened: false,
       };
 
-      // Cmd+C bridge: when we believe tmux is sitting in copy-mode
-      // with an active selection (set by the mouse listeners in
-      // attachContainer), pressing Cmd+C sends 'y' to the PTY. tmux's
-      // conf binds 'y' to copy-pipe-and-cancel with an OSC 52 emit,
-      // which our parser handler then writes to the system clipboard.
-      // When the tracking flag is false we let xterm.js's own
-      // Cmd+C handling run, so plain text inside an xterm-native
-      // selection (rare in this setup) still copies.
+      // Cmd+C bridge for tmux copy-mode.
       term.attachCustomKeyEventHandler((ev) => {
         if (ev.type !== 'keydown') return true;
         const isCmdC =
@@ -513,29 +413,22 @@ export default function Workbench() {
       ws.connect();
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [],
+    [workspaces],
   );
 
   // ── PTY WS message handler (per tab) ──────────────────────────────────────
 
   function handleTabMsg(
     tabId: string,
-    agent: string,
     workspace: string,
-    tool: string | undefined,
+    agent: string,
+    force: boolean,
     msg: HubMsg,
   ) {
     switch (msg.type) {
       case 'welcome': {
         dispatchTabs({ type: 'UPDATE', id: tabId, patch: { status: 'opening' } });
-        // Select agent, then open session
-        const tab = tabsRef.current.find((t) => t.id === tabId);
-        if (!tab) break;
-        tab.ws.send({ type: 'select_agent', agent });
-        break;
-      }
-      case 'agent_selected': {
-        // Now open session. Get current fit dimensions.
+        // v1.13: send open_session directly with workspace + agent (no select_agent dance).
         const tab = tabsRef.current.find((t) => t.id === tabId);
         if (!tab) break;
         let cols = 80;
@@ -546,35 +439,23 @@ export default function Workbench() {
             cols = tab.term.cols;
             rows = tab.term.rows;
           } catch {
-            // container not yet measured, fall back to defaults
+            // container not yet measured
           }
         }
-        // Per-user default args, looked up by tool. When the user
-        // opened the workspace without an explicit tool we fall back
-        // to webterm's own DEFAULT_TOOL so their args still apply —
-        // matching the user-visible "click Open == start claude"
-        // expectation. If the agent's configured default happens to
-        // be a different tool, the args ride along anyway; explicit
-        // "Open with X" remains the unambiguous path.
-        const effectiveTool: Tool =
-          tool && (KNOWN_TOOLS as readonly string[]).includes(tool)
-            ? (tool as Tool)
-            : DEFAULT_TOOL;
-        const args = preferencesRef.current.toolArgs[effectiveTool];
-        const openMsg: Parameters<typeof tab.ws.send>[0] = {
+        const args = preferencesRef.current.toolArgs['claude'] ?? [];
+        tab.ws.send({
           type: 'open_session',
           workspace,
+          agent,
+          ...(force ? { force: true } : {}),
           cols,
           rows,
-          ...(tool ? { tool } : {}),
           ...(args.length > 0 ? { claude_args: args } : {}),
-        };
-        tab.ws.send(openMsg);
+        });
         break;
       }
       case 'session_opened': {
         dispatchTabs({ type: 'UPDATE', id: tabId, patch: { status: 'live' } });
-        // Do a proper fit + resize now that session is open
         setTimeout(() => {
           const tab = tabsRef.current.find((t) => t.id === tabId);
           if (!tab || !containersRef.current.has(tab.id)) return;
@@ -587,31 +468,16 @@ export default function Workbench() {
           if (tab.id === activeTabIdRef.current) {
             tab.term.focus();
           }
-          // Refresh workspace list to show active dot
-          if (ctrlAgentRef.current === agent) {
-            ctrlWsRef.current?.send({ type: 'list_workspaces' });
-          }
+          refreshWorkspaces();
         }, 50);
         break;
       }
       case 'session_error':
-        // SessionError is non-fatal by protocol contract (see
-        // crates/hub/src/pty_proto.rs). Surface the message as a
-        // toast and leave the tab + underlying claude session intact —
-        // closing the tab here would discard a live conversation just
-        // because a transient agent-side op failed.
         addToast(msg.message || 'Session error');
-        if (ctrlAgentRef.current === agent) {
-          ctrlWsRef.current?.send({ type: 'list_workspaces' });
-        }
+        refreshWorkspaces();
         break;
       case 'session_closed':
-        // claude exited (/exit, Ctrl+C, crash) — collapse the tab so
-        // the user doesn't have to click ✕. The sidebar's status dot
-        // tracks the workspace separately.
-        if (ctrlAgentRef.current === agent) {
-          ctrlWsRef.current?.send({ type: 'list_workspaces' });
-        }
+        refreshWorkspaces();
         closeTabRef.current(tabId);
         break;
       default:
@@ -619,7 +485,6 @@ export default function Workbench() {
     }
   }
 
-  // Need a ref to activeTabId inside the session_opened timeout callback
   const activeTabIdRef = useRef<string | null>(null);
   activeTabIdRef.current = activeTabId;
 
@@ -635,7 +500,6 @@ export default function Workbench() {
       }
       dispatchTabs({ type: 'REMOVE', id });
 
-      // Pick next active tab
       setActiveTabId((prev) => {
         if (prev !== id) return prev;
         const remaining = all.filter((t) => t.id !== id);
@@ -647,9 +511,6 @@ export default function Workbench() {
     [],
   );
 
-  // openTab's callbacks are created before closeTab in source order
-  // but reference it; route through a ref so the call site doesn't
-  // close over an undefined identifier on first render.
   const closeTabRef = useRef<(id: string) => void>(() => {});
   closeTabRef.current = closeTab;
 
@@ -657,7 +518,6 @@ export default function Workbench() {
 
   const selectTab = useCallback((id: string) => {
     setActiveTabId(id);
-    // After state flush, fit + focus the terminal
     requestAnimationFrame(() => {
       const tab = tabsRef.current.find((t) => t.id === id);
       if (!tab || !containersRef.current.has(tab.id)) return;
@@ -677,11 +537,6 @@ export default function Workbench() {
 
   const attachContainer = useCallback(
     (tabId: string, el: HTMLDivElement | null) => {
-      // Stash / clear the DOM node in a ref (not React state) so this
-      // callback never triggers a re-render — an inline `ref={(el) =>
-      // attachContainer(id, el)}` is a fresh closure every render,
-      // which React treats as a ref change. If the callback caused a
-      // setState we'd infinite-loop.
       if (!el) {
         containersRef.current.delete(tabId);
         return;
@@ -694,18 +549,10 @@ export default function Workbench() {
         tab.fitAddon.fit();
         tab.opened = true;
       } catch {
-        // StrictMode double-mount — already opened
+        // StrictMode double-mount
       }
 
-      // Track whether tmux is currently sitting in copy-mode with a
-      // live selection. Set after a drag-with-movement mouseup;
-      // cleared on any plain mousedown (which also fires tmux's
-      // MouseDown-in-copy-mode → cancel binding) or after a Cmd+C
-      // bridges through to tmux. Capture phase so we see the events
-      // before xterm.js forwards them upstream. The state lives in
-      // copyModeRef (Map<tabId, bool>), not on the Tab object,
-      // because the tabs reducer rebuilds Tab references on every
-      // UPDATE and would otherwise discard our mutation.
+      // Track copy-mode state for Cmd+C bridge.
       let downX = 0;
       let downY = 0;
       let movedDuringDrag = false;
@@ -800,23 +647,24 @@ export default function Workbench() {
     );
   }
 
-  void ctrlReady; // used to suppress unused-var lint; ctrlReady drives UI indirectly via agentsLoading
+  void ctrlReady;
 
   return (
     <div className="h-full flex overflow-hidden bg-white dark:bg-zinc-950">
       {/* Left sidebar */}
       <Sidebar
         account={account}
+        workspaces={workspaces}
+        workspacesLoading={workspacesLoading}
         agents={agents}
-        agentsLoading={agentsLoading}
-        cache={wsCache}
         openTabKeys={openTabKeys}
         activeTabKey={activeTabKey}
-        onExpandAgent={handleExpandAgent}
         onOpenWorkspace={openTab}
         onCreateWorkspace={handleCreateWorkspace}
         onResetWorkspace={handleResetWorkspace}
         onDeleteWorkspace={handleDeleteWorkspace}
+        onRefreshWorkspaces={refreshWorkspaces}
+        onRefreshAgents={refreshAgents}
         onSettings={() => setShowSettings(true)}
         onLogout={handleLogout}
       />
@@ -831,7 +679,7 @@ export default function Workbench() {
           onClose={closeTab}
         />
 
-        {/* Terminal containers — all rendered, visibility toggled via class */}
+        {/* Terminal containers */}
         <div className="flex-1 relative overflow-hidden bg-white dark:bg-zinc-950">
           {tabs.length === 0 && (
             <div className="absolute inset-0 flex items-center justify-center text-sm text-zinc-400 dark:text-zinc-600 select-none">
@@ -845,7 +693,6 @@ export default function Workbench() {
               ref={(el) => attachContainer(tab.id, el)}
               className={`absolute inset-0 ${tab.id === activeTabId ? 'block' : 'hidden'}`}
             >
-              {/* Status overlays */}
               {(tab.status === 'connecting' || tab.status === 'opening') && (
                 <div className="absolute inset-0 flex items-center justify-center bg-white/80 dark:bg-zinc-950/80 z-10 pointer-events-none">
                   <span className="text-sm text-zinc-500 dark:text-zinc-400">
@@ -881,7 +728,23 @@ export default function Workbench() {
         />
       )}
 
-      {/* Transient error toasts (non-fatal SessionError frames) */}
+      {/* Takeover confirm dialog */}
+      {takeoverPending && (
+        <ConfirmDialog
+          title="Take over workspace?"
+          body={`Workspace '${takeoverPending.workspace}' is currently held by agent '${takeoverPending.lockedBy}'. Take over? The other agent's local copy will be cleared on next online.`}
+          confirmLabel="Take over"
+          danger={false}
+          onConfirm={() => {
+            const { workspace, agent } = takeoverPending;
+            setTakeoverPending(null);
+            openTab(workspace, agent, true);
+          }}
+          onCancel={() => setTakeoverPending(null)}
+        />
+      )}
+
+      {/* Transient error toasts */}
       {toasts.length > 0 && (
         <div className="pointer-events-none fixed bottom-4 right-4 z-50 flex max-w-md flex-col gap-2">
           {toasts.map((t) => (

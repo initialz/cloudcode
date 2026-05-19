@@ -8,12 +8,12 @@ export const PROTOCOL_VERSION = '7';
 export type ClientMsg =
   | { type: 'hello'; token: string; version: string }
   | { type: 'list_agents' }
-  | { type: 'select_agent'; agent: string | null }
-  | { type: 'list_workspaces' }
+  | { type: 'select_agent'; agent: string | null }   // kept for back-compat
+  | { type: 'list_workspaces' }                       // per-account, no agent context needed
   | { type: 'create_workspace'; name: string }
   | { type: 'delete_workspace'; name: string }
   | { type: 'reset_workspace'; name: string }
-  | { type: 'open_session'; workspace: string; cols: number; rows: number; claude_args?: string[]; tool?: string }
+  | { type: 'open_session'; workspace: string; agent: string; force?: boolean; cols: number; rows: number; claude_args?: string[] }
   | { type: 'resize'; cols: number; rows: number }
   | { type: 'close' }
   | { type: 'pong' };
@@ -29,7 +29,12 @@ export type AgentItem = {
    *  old agents out of every tool option. */
   tools: string[];
 };
-export type WorkspaceItem = { name: string; tmux_alive: boolean; has_client: boolean };
+export type WorkspaceItem = {
+  name: string;
+  locked_by_agent: string | null;  // null = free; non-null = current holder
+  last_sync_at: number | null;     // unix seconds
+  size_bytes: number;
+};
 
 export type HubMsg =
   | { type: 'welcome'; account: string }

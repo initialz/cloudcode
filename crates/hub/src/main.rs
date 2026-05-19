@@ -45,6 +45,15 @@ pub struct AppState {
     /// `workspaces` below); this map remains the in-memory session
     /// mutex layer and is unchanged by that refactor.
     pub session_locks: DashMap<(String, String, String), Uuid>,
+    /// Reverse index of `session_locks`: `session_id` → `(account,
+    /// workspace, agent)`. Populated by the OpenSession orchestrator
+    /// and consumed by the agent-side push handler (which knows the
+    /// session id but not which workspace the bytes are bound for).
+    /// Kept in lockstep with `session_locks` — every insert/remove
+    /// touches both maps. The trailing `agent` tag lets us also
+    /// route file pushes back to the right `AgentConn` if we ever
+    /// need to fan-out / fail-over.
+    pub session_workspaces: DashMap<Uuid, (String, String, String)>,
     /// User-facing webterm SPA session store. Maps an HttpOnly cookie
     /// session id to the logged-in account name. Backs `/api/*`
     /// and the cookie-auth path through `/v1/pty/ws`.
@@ -167,6 +176,7 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         db,
         registry: Arc::new(AgentRegistry::new()),
         session_locks: DashMap::new(),
+        session_workspaces: DashMap::new(),
         user_auth,
         workspaces,
     });

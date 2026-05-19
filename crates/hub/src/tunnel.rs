@@ -134,6 +134,41 @@ pub enum ClientMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+
+    // -- v1.13 hub-managed workspace sync ----------------------------------
+
+    /// Agent acknowledges it has consumed the `WorkspacePullStart` +
+    /// `WorkspaceFile` stream for this session and is ready for the hub
+    /// to send `PtyOpen` on top of the populated workspace dir.
+    /// `ok=false` (with `error` set) tells the hub the pull failed and
+    /// it should release the lock + propagate `SessionError` upstream.
+    WorkspacePullAck {
+        session_id: Uuid,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
+    /// Agent pushes one whole-file content to the hub for the
+    /// session's (account, workspace). The hub writes it atomically
+    /// into its `WorkspaceStorage` and replies with `WorkspaceFileAck`.
+    /// Single-frame design — large files are not chunked at this
+    /// layer; the sync engine on the agent side decides the size
+    /// threshold above which a file is not synced at all.
+    WorkspacePushFile {
+        session_id: Uuid,
+        path: String,
+        #[serde(with = "serde_bytes")]
+        content: Vec<u8>,
+    },
+
+    /// Agent reports a local delete for the (account, workspace)
+    /// bound to `session_id`. Hub removes the file from its canonical
+    /// copy and replies with `WorkspaceFileAck`.
+    WorkspaceDeleteFile {
+        session_id: Uuid,
+        path: String,
+    },
 }
 
 /// One row in a WorkspaceListResult. Same shape on both sides of the
@@ -242,6 +277,55 @@ pub enum ServerMsg {
         /// `.sha256` manifest URL covering the same asset.
         sha256_url: String,
     },
+
+    // -- v1.13 hub-managed workspace sync ----------------------------------
+
+    /// Hub announces the start of a workspace pull for `session_id`.
+    /// Agent should clear / recreate `<workspace_root>/<account>/<workspace>/`
+    /// and accept the next `file_count` `WorkspaceFile` frames before the
+    /// `PtyOpen` arrives. The agent MUST send a `WorkspacePullAck` after
+    /// the stream terminates (signalled by `is_last=true`).
+    WorkspacePullStart {
+        session_id: Uuid,
+        account: String,
+        workspace: String,
+        file_count: u64,
+    },
+
+    /// One file in the pull stream. `is_last=true` marks the final
+    /// frame and ends the stream. For an empty workspace the hub
+    /// still sends exactly one frame with `path=""`, empty `content`,
+    /// and `is_last=true` so the agent has an unambiguous end-of-stream
+    /// marker without needing to count.
+    WorkspaceFile {
+        session_id: Uuid,
+        path: String,
+        #[serde(with = "serde_bytes")]
+        content: Vec<u8>,
+        is_last: bool,
+    },
+
+    /// Hub acks an agent push / delete op. On `ok=false` the agent
+    /// should keep the row in its push_queue and retry on the next
+    /// sync tick.
+    WorkspaceFileAck {
+        session_id: Uuid,
+        path: String,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
+    /// Sent right after `Welcome` whenever the agent has any pending
+    /// "the hub force-took your lock; rm -rf your local copy"
+    /// instructions queued up from being offline. Each `(account,
+    /// workspace)` pair is the agent's signal to delete that local
+    /// directory before it re-engages any session for that workspace.
+    /// Empty `items` is never sent; if there is nothing to clean up
+    /// the hub omits the frame entirely.
+    WorkspaceCleanup {
+        items: Vec<(String, String)>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -250,4 +334,124 @@ pub enum RejectReason {
     NameTaken,
     AuthFailed,
     VersionMismatch,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `serde_bytes` encodes `Vec<u8>` as a JSON array of integers
+    /// (not a string). The agent's mirror of `ServerMsg` uses the
+    /// same attribute, so what comes out of one side has to parse on
+    /// the other. This test pins the on-wire shape and confirms
+    /// round-trip identity for the typical 32-byte payload size.
+    #[test]
+    fn workspace_file_frame_roundtrips_through_json() {
+        let sid = Uuid::new_v4();
+        let original = ServerMsg::WorkspaceFile {
+            session_id: sid,
+            path: "src/lib/foo.rs".into(),
+            // Include high bytes + a NUL to confirm serde_bytes
+            // doesn't truncate at a null terminator the way a
+            // string-typed payload would.
+            content: vec![0u8, 1, 2, 0xFE, 0xFF, b'A'],
+            is_last: false,
+        };
+        let json = serde_json::to_string(&original).expect("encode");
+        // Tag is the serde-snake-case variant name.
+        assert!(json.contains(r#""type":"workspace_file""#), "got: {json}");
+        assert!(json.contains(r#""is_last":false"#));
+        let back: ServerMsg = serde_json::from_str(&json).expect("decode");
+        match back {
+            ServerMsg::WorkspaceFile {
+                session_id,
+                path,
+                content,
+                is_last,
+            } => {
+                assert_eq!(session_id, sid);
+                assert_eq!(path, "src/lib/foo.rs");
+                assert_eq!(content, vec![0u8, 1, 2, 0xFE, 0xFF, b'A']);
+                assert!(!is_last);
+            }
+            other => panic!("decoded wrong variant: {:?}", other),
+        }
+    }
+
+    /// Empty pull stream sentinel — the hub sends one frame even for
+    /// a zero-file workspace. Encoding + decoding has to preserve
+    /// `path=""`, `content=[]`, `is_last=true` faithfully.
+    #[test]
+    fn workspace_file_empty_sentinel_roundtrips() {
+        let sid = Uuid::new_v4();
+        let original = ServerMsg::WorkspaceFile {
+            session_id: sid,
+            path: String::new(),
+            content: Vec::new(),
+            is_last: true,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let back: ServerMsg = serde_json::from_str(&json).unwrap();
+        match back {
+            ServerMsg::WorkspaceFile {
+                path,
+                content,
+                is_last,
+                ..
+            } => {
+                assert!(path.is_empty());
+                assert!(content.is_empty());
+                assert!(is_last);
+            }
+            other => panic!("decoded wrong variant: {:?}", other),
+        }
+    }
+
+    /// Cleanup frame carries (account, workspace) tuples — make sure
+    /// the tuple shape is what the wire actually sees.
+    #[test]
+    fn workspace_cleanup_frame_roundtrips() {
+        let original = ServerMsg::WorkspaceCleanup {
+            items: vec![
+                ("alice".to_string(), "demo".to_string()),
+                ("bob".to_string(), "scratch".to_string()),
+            ],
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let back: ServerMsg = serde_json::from_str(&json).unwrap();
+        if let ServerMsg::WorkspaceCleanup { items } = back {
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[0], ("alice".into(), "demo".into()));
+            assert_eq!(items[1], ("bob".into(), "scratch".into()));
+        } else {
+            panic!("decoded wrong variant: {:?}", back);
+        }
+    }
+
+    /// Agent → hub push frame, including the binary payload path.
+    /// Mirror of the `WorkspaceFile` test on the ClientMsg side.
+    #[test]
+    fn workspace_push_file_frame_roundtrips() {
+        let sid = Uuid::new_v4();
+        let original = ClientMsg::WorkspacePushFile {
+            session_id: sid,
+            path: "Cargo.toml".into(),
+            content: b"[package]\nname=\"x\"\n".to_vec(),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains(r#""type":"workspace_push_file""#));
+        let back: ClientMsg = serde_json::from_str(&json).unwrap();
+        match back {
+            ClientMsg::WorkspacePushFile {
+                session_id,
+                path,
+                content,
+            } => {
+                assert_eq!(session_id, sid);
+                assert_eq!(path, "Cargo.toml");
+                assert_eq!(content, b"[package]\nname=\"x\"\n".to_vec());
+            }
+            other => panic!("decoded wrong variant: {:?}", other),
+        }
+    }
 }

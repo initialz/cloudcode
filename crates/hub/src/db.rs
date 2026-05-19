@@ -1146,6 +1146,48 @@ impl Db {
         Ok(())
     }
 
+    /// Clear `locked_by_agent` on every workspace currently held by
+    /// `agent`. Called when the agent disconnects so a workspace
+    /// doesn't stay "owned" by a dead connection forever. Returns the
+    /// number of workspaces unlocked (useful for tracing).
+    pub async fn release_all_workspace_locks_for_agent(&self, agent: &str) -> Result<u64> {
+        let r = sqlx::query(
+            "UPDATE workspaces
+                SET locked_by_agent = NULL, locked_at = NULL
+              WHERE locked_by_agent = ?1",
+        )
+        .bind(agent)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// Every workspace across every account. Powers the admin
+    /// inventory page in v1.13; no pagination yet (volumes are tiny
+    /// relative to audit / sessions).
+    pub async fn list_all_workspaces(&self) -> Result<Vec<WorkspaceRow>> {
+        let rows = sqlx::query(
+            "SELECT account, name, created_at, locked_by_agent, locked_at,
+                    last_sync_at, size_bytes
+               FROM workspaces
+              ORDER BY account, name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| WorkspaceRow {
+                account: r.get("account"),
+                name: r.get("name"),
+                created_at: r.get("created_at"),
+                locked_by_agent: r.get("locked_by_agent"),
+                locked_at: r.get("locked_at"),
+                last_sync_at: r.get("last_sync_at"),
+                size_bytes: r.get("size_bytes"),
+            })
+            .collect())
+    }
+
     /// Queue a "the hub force-took your lock, drop your local copy"
     /// instruction for `agent`. Idempotent via `INSERT OR REPLACE` —
     /// re-queueing the same triple just refreshes `queued_at`.
@@ -1285,4 +1327,146 @@ pub struct AuditFilter {
     pub kind: Option<String>,
     pub since: Option<i64>,
     pub until: Option<i64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Spin up a fresh on-disk SQLite under the OS temp dir. Each
+    /// test gets a unique file so they can run in parallel without
+    /// stepping on each other.
+    async fn fresh_db() -> Db {
+        let path = std::env::temp_dir().join(format!(
+            "cloudcode-hub-db-test-{}.sqlite",
+            uuid::Uuid::new_v4().simple()
+        ));
+        Db::open(&path).await.expect("open db")
+    }
+
+    /// `list_workspaces` is the load-bearing call behind the new
+    /// `ListWorkspaces` handler. Lock + sync metadata MUST come
+    /// through unchanged for the client to render the picker.
+    #[tokio::test]
+    async fn list_workspaces_surfaces_lock_and_sync_metadata() {
+        let db = fresh_db().await;
+        db.create_workspace("alice", "demo").await.unwrap();
+        db.create_workspace("alice", "scratch").await.unwrap();
+        // Lock + size for one of them.
+        db.set_workspace_lock("alice", "demo", Some("box-1"))
+            .await
+            .unwrap();
+        db.update_workspace_sync_meta("alice", "demo", 4096)
+            .await
+            .unwrap();
+
+        let rows = db.list_workspaces("alice").await.unwrap();
+        assert_eq!(rows.len(), 2);
+        // ORDER BY name → demo, scratch
+        assert_eq!(rows[0].name, "demo");
+        assert_eq!(rows[0].locked_by_agent.as_deref(), Some("box-1"));
+        assert_eq!(rows[0].size_bytes, 4096);
+        assert!(rows[0].last_sync_at.is_some());
+        assert_eq!(rows[1].name, "scratch");
+        assert!(rows[1].locked_by_agent.is_none());
+        assert_eq!(rows[1].size_bytes, 0);
+
+        // Another account sees nothing.
+        assert!(db.list_workspaces("bob").await.unwrap().is_empty());
+    }
+
+    /// Lock takeover flow:
+    ///   - agent A acquires the lock.
+    ///   - hub takes it over for agent B: queues a cleanup row for A,
+    ///     sets the lock to B.
+    ///   - on A's next "hello", drain returns its cleanup row exactly
+    ///     once. A second drain on A returns empty.
+    #[tokio::test]
+    async fn workspace_lock_force_takeover_with_pending_cleanup() {
+        let db = fresh_db().await;
+        db.create_workspace("alice", "ws").await.unwrap();
+
+        // A acquires.
+        db.set_workspace_lock("alice", "ws", Some("agent-A"))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_workspace_lock("alice", "ws").await.unwrap(),
+            Some("agent-A".to_string())
+        );
+
+        // Hub force-takes for B: queue cleanup for A, swap the lock.
+        db.queue_pending_cleanup("agent-A", "alice", "ws")
+            .await
+            .unwrap();
+        db.set_workspace_lock("alice", "ws", Some("agent-B"))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_workspace_lock("alice", "ws").await.unwrap(),
+            Some("agent-B".to_string())
+        );
+
+        // A reconnects: drain its cleanups.
+        let pending = db.take_pending_cleanups("agent-A").await.unwrap();
+        assert_eq!(pending, vec![("alice".to_string(), "ws".to_string())]);
+        // Drain is exhaustive — a second call after the agent has
+        // applied the cleanup returns nothing.
+        assert!(db.take_pending_cleanups("agent-A").await.unwrap().is_empty());
+    }
+
+    /// Disconnect path: every workspace this agent held has to be
+    /// freed so the next OpenSession can proceed without `force=true`.
+    #[tokio::test]
+    async fn release_all_locks_clears_only_target_agents_rows() {
+        let db = fresh_db().await;
+        db.create_workspace("alice", "a").await.unwrap();
+        db.create_workspace("alice", "b").await.unwrap();
+        db.create_workspace("alice", "c").await.unwrap();
+        db.set_workspace_lock("alice", "a", Some("agent-1"))
+            .await
+            .unwrap();
+        db.set_workspace_lock("alice", "b", Some("agent-1"))
+            .await
+            .unwrap();
+        db.set_workspace_lock("alice", "c", Some("agent-2"))
+            .await
+            .unwrap();
+
+        let freed = db
+            .release_all_workspace_locks_for_agent("agent-1")
+            .await
+            .unwrap();
+        assert_eq!(freed, 2);
+
+        assert!(db.get_workspace_lock("alice", "a").await.unwrap().is_none());
+        assert!(db.get_workspace_lock("alice", "b").await.unwrap().is_none());
+        assert_eq!(
+            db.get_workspace_lock("alice", "c").await.unwrap(),
+            Some("agent-2".to_string())
+        );
+    }
+
+    /// Admin-facing `list_all_workspaces` collapses across accounts
+    /// and orders deterministically (account, name).
+    #[tokio::test]
+    async fn list_all_workspaces_orders_across_accounts() {
+        let db = fresh_db().await;
+        db.create_workspace("bob", "x").await.unwrap();
+        db.create_workspace("alice", "z").await.unwrap();
+        db.create_workspace("alice", "y").await.unwrap();
+        let rows = db.list_all_workspaces().await.unwrap();
+        let names: Vec<(String, String)> = rows
+            .into_iter()
+            .map(|r| (r.account, r.name))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("alice".to_string(), "y".to_string()),
+                ("alice".to_string(), "z".to_string()),
+                ("bob".to_string(), "x".to_string()),
+            ]
+        );
+    }
 }

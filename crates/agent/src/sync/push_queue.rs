@@ -207,7 +207,9 @@ impl PushQueue {
         Ok(())
     }
 
-    /// Total queue depth.
+    /// Total queue depth. Currently only exercised in unit tests; kept
+    /// public for future telemetry / admin endpoints.
+    #[allow(dead_code)]
     pub async fn len(&self) -> Result<u64> {
         let row = sqlx::query("SELECT COUNT(*) AS n FROM push_queue")
             .fetch_one(&self.db)

@@ -244,8 +244,6 @@ export type AllowedAccountsDto = {
   online: boolean;
 };
 
-export type WorkspaceStatus = 'active' | 'saved' | 'fresh';
-
 // ── Stats DTOs ─────────────────────────────────────────────────────────────
 
 export type LeaderboardRowDto = {
@@ -303,12 +301,9 @@ export type DailyTokenDto = {
 };
 
 export type WorkspaceRowDto = {
-  agent: string;
   account: string;
-  workspace: string;
-  status: WorkspaceStatus;
-  has_client: boolean;
-  tmux_alive: boolean;
-  agent_online: boolean;
-  last_started_at: number | null;
+  name: string;
+  locked_by_agent: string | null;
+  last_sync_at: number | null;
+  size_bytes: number;
 };

@@ -14,19 +14,30 @@ pub enum ClientToHub {
         version: String,
     },
     /// Pre-session: bind this client connection to an agent. `None` lets the
-    /// hub pick the first online agent (alphabetically). All subsequent
-    /// workspace ops + the eventual OpenSession use this agent.
+    /// hub pick the first online agent (alphabetically). Becomes
+    /// semi-redundant in v1.13 — `OpenSession` now carries an explicit
+    /// `agent` field — but is kept for AgentList/SelectAgent flows the
+    /// CLI menu relies on. No state on the hub end beyond a cached
+    /// pointer for `AgentList { current }` rendering.
     SelectAgent {
         #[serde(default)]
         agent: Option<String>,
     },
     /// Pre-session: list online agents.
     ListAgents,
-    /// Pre-session (or in-session): list workspaces on the selected agent.
+    /// List workspaces visible to this account. In v1.13 workspaces are
+    /// hub-canonical and per-account; they are NOT routed to any agent.
+    /// The reply's `WorkspaceInfo.locked_by_agent` field tells the
+    /// caller which agent (if any) currently owns each workspace's lock.
     ListWorkspaces,
+    /// Create a hub-canonical workspace under the calling account.
+    /// Errors if `(account, name)` already exists.
     CreateWorkspace {
         name: String,
     },
+    /// Delete a hub-canonical workspace. Errors if it is currently
+    /// locked by an agent — the caller must wait for the lock to
+    /// release (or remove the agent first).
     DeleteWorkspace {
         name: String,
     },
@@ -36,21 +47,28 @@ pub enum ClientToHub {
     ResetWorkspace {
         name: String,
     },
-    /// Open a PTY session in the given workspace on the selected agent.
-    /// `claude_args` is forwarded verbatim to `claude`'s argv when the
-    /// session is first created (tmux ignores it on re-attach).
+    /// Open a PTY session in a workspace on a specific agent. The hub
+    /// streams the canonical workspace bytes down to the agent, takes
+    /// the workspace lock, and only then issues `PtyOpen`. `claude_args`
+    /// is forwarded verbatim to `claude`'s argv on first spawn.
+    ///
+    /// `force = true` lets the caller wrest the lock away from another
+    /// agent that currently holds it (typically because that agent went
+    /// offline). The old holder's local copy is queued for cleanup via
+    /// `pending_workspace_cleanups` so when it reconnects it deletes
+    /// its stale working copy before doing anything else.
     OpenSession {
         workspace: String,
+        /// Explicit target agent. v1.13 wire shape — older clients that
+        /// relied on `SelectAgent`'s implicit binding still work because
+        /// the CLI client always sets this field now.
+        agent: String,
+        #[serde(default)]
+        force: bool,
         cols: u16,
         rows: u16,
         #[serde(default)]
         claude_args: Vec<String>,
-        /// Which tool to launch in the workspace. As of v1.13 this is
-        /// effectively claude-only; `None` lets the agent pick its
-        /// default. Kept on the wire for back-compat with pre-v1.10
-        /// hubs that didn't know about multi-tool.
-        #[serde(default)]
-        tool: Option<String>,
     },
     /// In-session: terminal-size change (SIGWINCH).
     Resize {
@@ -128,15 +146,25 @@ pub struct AgentInfo {
 
 /// Workspace status row carried in HubToClient::WorkspaceList.
 ///
-/// - `tmux_alive` = agent has a live tmux server for this workspace
-///   (so the previous claude state is still recoverable).
-/// - `has_client` = some cloudcode client is currently attached to it.
-///   Opening it would trigger take-over.
+/// v1.13 redefined this around the hub-canonical model: workspaces no
+/// longer live on a specific agent, so we surface the lock holder
+/// (`locked_by_agent`), the timestamp of the last successful sync
+/// (`last_sync_at`), and the size of the canonical copy on disk
+/// (`size_bytes`). All three come straight from the hub's `workspaces`
+/// table.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct WorkspaceInfo {
     pub name: String,
+    /// Agent currently holding the write lock, if any. `None` means the
+    /// workspace is free for any agent to pick up.
     #[serde(default)]
-    pub tmux_alive: bool,
+    pub locked_by_agent: Option<String>,
+    /// Unix seconds of the last successful agent → hub sync. `None`
+    /// for brand-new workspaces that have never been synced.
     #[serde(default)]
-    pub has_client: bool,
+    pub last_sync_at: Option<i64>,
+    /// Aggregate size in bytes of the canonical copy on disk. `0` for
+    /// empty workspaces.
+    #[serde(default)]
+    pub size_bytes: u64,
 }

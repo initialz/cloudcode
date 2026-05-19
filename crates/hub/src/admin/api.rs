@@ -1115,142 +1115,58 @@ pub async fn agent_delete(
 // Workspaces inventory
 // ---------------------------------------------------------------------
 
+/// v1.13: hub-canonical workspaces (one row per `(account, name)` in
+/// the `workspaces` table). The old per-agent fan-out is gone — the
+/// hub owns the bytes now, so we just read its own DB.
 #[derive(Serialize)]
 struct WorkspaceRowDto {
-    agent: String,
     account: String,
-    workspace: String,
-    /// "active" — a cloudcode client is attached right now.
-    /// "saved"  — tmux still has state but nobody is connected.
-    /// "fresh"  — directory exists but no tmux state (or agent offline).
-    status: &'static str,
-    has_client: bool,
-    tmux_alive: bool,
-    agent_online: bool,
-    /// `started_at` of the most recent session in this slot, if any.
-    last_started_at: Option<i64>,
+    name: String,
+    /// Name of the agent currently holding the write lock, or null.
+    locked_by_agent: Option<String>,
+    /// Whether `locked_by_agent` is currently online (helps the admin
+    /// decide whether the workspace is genuinely contended or just
+    /// stuck on a dead connection).
+    locked_agent_online: bool,
+    last_sync_at: Option<i64>,
+    /// Aggregate size in bytes of the canonical copy. Refreshed by
+    /// the sync engine on each successful push.
+    size_bytes: i64,
+    created_at: i64,
 }
 
-const WORKSPACES_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
-
 pub async fn workspaces_list(State(state): State<AdminState>) -> Response {
-    use crate::registry::AgentConn;
-    use crate::tunnel::{ClientMsg, ServerMsg};
-
-    let conns = state.app.registry.list_conns();
-    let last_started_rows = state
+    let rows = match state.app.db.list_all_workspaces().await {
+        Ok(r) => r,
+        Err(e) => return internal(e),
+    };
+    let online: std::collections::HashSet<String> = state
         .app
-        .db
-        .last_started_per_workspace()
-        .await
-        .unwrap_or_default();
-    let mut last_started: std::collections::HashMap<(String, String, String), i64> =
-        std::collections::HashMap::new();
-    for (agent, account, workspace, ts) in last_started_rows {
-        last_started.insert((agent, account, workspace), ts);
-    }
-
-    // Fan-out to every online agent in parallel.
-    let online_names: std::collections::HashSet<String> =
-        conns.iter().map(|c| c.name.clone()).collect();
-    type FanoutResult = (String, Result<Vec<crate::tunnel::WorkspaceFullItem>, String>);
-    let mut tasks: Vec<tokio::task::JoinHandle<FanoutResult>> = Vec::new();
-    for conn in conns {
-        let conn: std::sync::Arc<AgentConn> = conn;
-        tasks.push(tokio::spawn(async move {
-            let request_id = uuid::Uuid::new_v4();
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            conn.register_workspace_request(request_id, tx);
-            if conn
-                .send(ServerMsg::WorkspaceListAll { request_id })
-                .await
-                .is_err()
-            {
-                return (conn.name.clone(), Err("agent disconnected".into()));
+        .registry
+        .list_active()
+        .into_iter()
+        .collect();
+    let mut out: Vec<WorkspaceRowDto> = rows
+        .into_iter()
+        .map(|r| {
+            let locked_agent_online = r
+                .locked_by_agent
+                .as_ref()
+                .map(|a| online.contains(a))
+                .unwrap_or(false);
+            WorkspaceRowDto {
+                account: r.account,
+                name: r.name,
+                locked_by_agent: r.locked_by_agent,
+                locked_agent_online,
+                last_sync_at: r.last_sync_at,
+                size_bytes: r.size_bytes,
+                created_at: r.created_at,
             }
-            match tokio::time::timeout(WORKSPACES_REQUEST_TIMEOUT, rx).await {
-                Ok(Ok(ClientMsg::WorkspaceListAllResult { items, error, .. })) => match error {
-                    Some(e) => (conn.name.clone(), Err(e)),
-                    None => (conn.name.clone(), Ok(items)),
-                },
-                Ok(Ok(_)) => (conn.name.clone(), Err("unexpected reply".into())),
-                _ => (conn.name.clone(), Err("timeout".into())),
-            }
-        }));
-    }
-
-    let mut rows: Vec<WorkspaceRowDto> = Vec::new();
-    let mut seen: std::collections::HashSet<(String, String, String)> =
-        std::collections::HashSet::new();
-    for t in tasks {
-        let Ok((agent_name, result)) = t.await else {
-            continue;
-        };
-        match result {
-            Ok(items) => {
-                for it in items {
-                    let key = (agent_name.clone(), it.account.clone(), it.name.clone());
-                    let has_client = state.app.session_locks.contains_key(&key);
-                    let status = if has_client {
-                        "active"
-                    } else if it.tmux_alive {
-                        "saved"
-                    } else {
-                        "fresh"
-                    };
-                    let ts = last_started.get(&key).copied();
-                    seen.insert(key.clone());
-                    rows.push(WorkspaceRowDto {
-                        agent: agent_name.clone(),
-                        account: it.account,
-                        workspace: it.name,
-                        status,
-                        has_client,
-                        tmux_alive: it.tmux_alive,
-                        agent_online: true,
-                        last_started_at: ts,
-                    });
-                }
-            }
-            Err(e) => {
-                tracing::debug!(agent = %agent_name, error = %e, "list_all failed");
-            }
-        }
-    }
-
-    // Surface historical workspaces whose agent is offline (or didn't
-    // respond): they still belong on the inventory page, just shown as
-    // fresh with agent_online=false so the admin can see them.
-    for ((agent, account, workspace), ts) in last_started.iter() {
-        let key = (agent.clone(), account.clone(), workspace.clone());
-        if seen.contains(&key) {
-            continue;
-        }
-        let online = online_names.contains(agent);
-        if online {
-            // Agent is online but its list didn't include this workspace
-            // — it was likely deleted on the agent side. Skip.
-            continue;
-        }
-        rows.push(WorkspaceRowDto {
-            agent: agent.clone(),
-            account: account.clone(),
-            workspace: workspace.clone(),
-            status: "fresh",
-            has_client: false,
-            tmux_alive: false,
-            agent_online: false,
-            last_started_at: Some(*ts),
-        });
-    }
-
-    rows.sort_by(|a, b| {
-        a.agent
-            .cmp(&b.agent)
-            .then_with(|| a.account.cmp(&b.account))
-            .then_with(|| a.workspace.cmp(&b.workspace))
-    });
-    Json(rows).into_response()
+        })
+        .collect();
+    out.sort_by(|a, b| a.account.cmp(&b.account).then_with(|| a.name.cmp(&b.name)));
+    Json(out).into_response()
 }
 
 // ---------------------------------------------------------------------

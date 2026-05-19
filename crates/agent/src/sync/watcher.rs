@@ -50,6 +50,10 @@ pub enum WatchEvent {
 }
 
 impl WatchEvent {
+    /// Convenience accessor — kept for debug logging in callers that
+    /// don't pattern-match on the variant; both call sites currently
+    /// destructure, so this is dead in release but useful in tests.
+    #[allow(dead_code)]
     fn path(&self) -> &Path {
         match self {
             WatchEvent::Changed { path } | WatchEvent::Removed { path } => path,

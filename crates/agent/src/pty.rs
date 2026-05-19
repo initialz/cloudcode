@@ -1,4 +1,7 @@
 use crate::config::{ClaudeConfig, RecordingConfig, SandboxConfig, TmuxConfig, ToolConfig};
+use crate::sync::{
+    run_push_worker, AckMsg, IgnoreFilter, PushQueue, PushWorker, WorkspaceWatcher,
+};
 use crate::tunnel::{
     pack_pty_frame, ClientMsg, ServerMsg, WorkspaceFullItem, WorkspaceItem, TAG_PTY_OUTPUT,
 };
@@ -11,7 +14,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OnceCell};
 use uuid::Uuid;
 
 /// What the WS writer task drains: either a JSON control frame or a binary
@@ -40,6 +43,19 @@ pub struct PtyManager {
     /// the session still works).
     tmux_conf: Option<PathBuf>,
     sessions: Arc<DashMap<Uuid, Arc<PtyHandle>>>,
+    /// Active workspace pulls keyed by session_id. An entry exists for
+    /// the window between `WorkspacePullStart` and the final
+    /// `WorkspaceFile { is_last: true }`. We hold it here rather than
+    /// in `PtyHandle` because the pull arrives BEFORE PtyOpen — there
+    /// is no PtyHandle yet at that point.
+    pulls: Arc<DashMap<Uuid, PullState>>,
+    /// Shared push queue across every session this agent is running.
+    /// Opened lazily on first use so the agent can boot without a
+    /// state dir (e.g. in tests that never trigger sync).
+    push_queue: Arc<OnceCell<Arc<PushQueue>>>,
+    /// Routes inbound `WorkspaceFileAck` frames to the right session's
+    /// push worker. Cleared when the session closes.
+    ack_routes: Arc<DashMap<Uuid, mpsc::Sender<AckMsg>>>,
 }
 
 struct PtyHandle {
@@ -48,6 +64,41 @@ struct PtyHandle {
     /// Stops the jsonl watcher task on drop. Held only for its
     /// Drop side-effect.
     _jsonl: crate::jsonl::WatcherHandle,
+    /// Workspace sync state for this session. Optional because not
+    /// every PtyOpen is preceded by a pull (e.g. legacy hubs).
+    _sync: Option<SessionSync>,
+}
+
+/// Owns the watcher + push-worker handles. Dropping it tears both
+/// down (the worker via shutdown_tx, the watcher via its own Drop).
+struct SessionSync {
+    /// Held only for its Drop side-effect — the watcher stops when
+    /// this goes out of scope.
+    _watcher: WorkspaceWatcher,
+    /// Fires the push worker's shutdown branch.
+    shutdown_tx: mpsc::Sender<()>,
+}
+
+impl Drop for SessionSync {
+    fn drop(&mut self) {
+        // Best-effort; if the worker already exited the send fails
+        // harmlessly. We never await this — we're in a Drop.
+        let _ = self.shutdown_tx.try_send(());
+    }
+}
+
+/// State the agent tracks for one in-flight `WorkspacePullStart` ->
+/// `WorkspaceFile*` -> `WorkspacePullAck` round trip.
+///
+/// `expected` / `received` are tracked for debug logging — we don't
+/// gate the final ack on them because the hub explicitly flags the
+/// last frame via `is_last`. If `received` ends up != `expected` we
+/// still log a warning so operators can spot a leaky stream.
+struct PullState {
+    account: String,
+    workspace: String,
+    expected: u64,
+    received: u64,
 }
 
 impl PtyManager {
@@ -184,7 +235,60 @@ impl PtyManager {
             self_exe,
             tmux_conf,
             sessions: Arc::new(DashMap::new()),
+            pulls: Arc::new(DashMap::new()),
+            push_queue: Arc::new(OnceCell::new()),
+            ack_routes: Arc::new(DashMap::new()),
         })
+    }
+
+    /// Test-only constructor that skips the tmux probe and FS dir
+    /// setup. The pull / cleanup / ack paths only consult
+    /// `claude.workspace_root`, so the other fields can be defaulted.
+    #[cfg(test)]
+    pub(crate) fn for_test(workspace_root: PathBuf) -> Self {
+        Self {
+            claude: ClaudeConfig {
+                workspace_root,
+                ..Default::default()
+            },
+            tools: HashMap::new(),
+            default_tool: String::new(),
+            tmux: TmuxConfig {
+                executable: PathBuf::from("tmux"),
+            },
+            recording: RecordingConfig {
+                dir: PathBuf::from("."),
+                keep_days: 0,
+            },
+            self_exe: None,
+            tmux_conf: None,
+            sessions: Arc::new(DashMap::new()),
+            pulls: Arc::new(DashMap::new()),
+            push_queue: Arc::new(OnceCell::new()),
+            ack_routes: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Lazily open (or return) the shared push queue. Returns `Err` if
+    /// no state dir can be determined — the caller surfaces this as a
+    /// PullAck failure to the hub so the open is aborted cleanly.
+    async fn push_queue(&self) -> Result<Arc<PushQueue>> {
+        if let Some(q) = self.push_queue.get() {
+            return Ok(q.clone());
+        }
+        let path = crate::sync::push_queue::default_db_path()
+            .ok_or_else(|| anyhow::anyhow!("no state dir for push queue"))?;
+        // Race is safe: OnceCell::get_or_try_init serialises initialisation.
+        let q = self
+            .push_queue
+            .get_or_try_init(|| async {
+                let q = PushQueue::open(&path)
+                    .await
+                    .with_context(|| format!("open push queue at {}", path.display()))?;
+                Ok::<_, anyhow::Error>(Arc::new(q))
+            })
+            .await?;
+        Ok(q.clone())
     }
 
     pub async fn handle(self: &Arc<Self>, msg: ServerMsg, tx: mpsc::Sender<OutFrame>) {
@@ -251,6 +355,35 @@ impl PtyManager {
             // exhaustive. If we somehow see it here, log and drop.
             ServerMsg::UpdateAgent { request_id, .. } => {
                 tracing::warn!(%request_id, "UpdateAgent reached PtyManager; should be handled in ws");
+            }
+            ServerMsg::WorkspacePullStart {
+                session_id,
+                account,
+                workspace,
+                file_count,
+            } => {
+                self.workspace_pull_start(session_id, account, workspace, file_count, tx)
+                    .await;
+            }
+            ServerMsg::WorkspaceFile {
+                session_id,
+                path,
+                content,
+                is_last,
+            } => {
+                self.workspace_file(session_id, path, content, is_last, tx)
+                    .await;
+            }
+            ServerMsg::WorkspaceFileAck {
+                session_id,
+                path,
+                ok,
+                error,
+            } => {
+                self.workspace_file_ack(session_id, path, ok, error).await;
+            }
+            ServerMsg::WorkspaceCleanup { items } => {
+                self.workspace_cleanup(items).await;
             }
             ServerMsg::Welcome { .. } | ServerMsg::Rejected { .. } | ServerMsg::Ping => {}
         }
@@ -540,11 +673,27 @@ impl PtyManager {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
         let jsonl = crate::jsonl::spawn(session_id, cwd.clone(), home, tx.clone());
 
+        // Spin up the workspace sync engine for this session. Failure
+        // is non-fatal: the PTY still works, just without bidirectional
+        // sync (any local edits won't reach the hub). We log a warning
+        // and skip — better than refusing the open entirely.
+        let sync = self
+            .start_session_sync(session_id, &account, &workspace, tx.clone())
+            .await;
+        if let Err(e) = sync.as_ref() {
+            tracing::warn!(
+                session = %session_id,
+                error = %e,
+                "workspace sync engine failed to start; session running without sync"
+            );
+        }
+
         let master = Arc::new(Mutex::new(pair.master));
         let handle = Arc::new(PtyHandle {
             master,
             writer: Mutex::new(writer),
             _jsonl: jsonl,
+            _sync: sync.ok(),
         });
         self.sessions.insert(session_id, handle.clone());
 
@@ -590,8 +739,15 @@ impl PtyManager {
 
     async fn close(&self, session_id: Uuid, tx: mpsc::Sender<OutFrame>) {
         // Drop the handle; the reader thread will see read=0 and exit; tmux
-        // session stays alive on the OS.
+        // session stays alive on the OS. Dropping the handle also drops
+        // the SessionSync which fires the push worker's shutdown branch.
         self.sessions.remove(&session_id);
+        // Stop routing acks for a session that's going away. Any
+        // in-flight rows stay in the durable queue for the next open.
+        self.ack_routes.remove(&session_id);
+        // Same with any half-finished pull. Hub treats a missing ack
+        // as a failure and won't reuse the session_id.
+        self.pulls.remove(&session_id);
         let _ = tx
             .send(OutFrame::Text(ClientMsg::PtyClosed {
                 session_id,
@@ -807,6 +963,275 @@ impl PtyManager {
                 error,
             }))
             .await;
+    }
+
+    // -----------------------------------------------------------------
+    // v1.13 hub-managed workspace sync
+    // -----------------------------------------------------------------
+
+    /// Hub announces a pull. Wipe any stale workspace dir for
+    /// `(account, workspace)` and start tracking the inbound stream.
+    /// If `file_count == 0`, the hub still sends one sentinel
+    /// `WorkspaceFile { is_last: true, path: "" }` so the agent can
+    /// ack — see `workspace_file`.
+    pub async fn workspace_pull_start(
+        self: &Arc<Self>,
+        session_id: Uuid,
+        account: String,
+        workspace: String,
+        file_count: u64,
+        tx: mpsc::Sender<OutFrame>,
+    ) {
+        if let Err(e) =
+            validate_name(&account, "account").and_then(|_| validate_name(&workspace, "workspace"))
+        {
+            let _ = tx
+                .send(OutFrame::Text(ClientMsg::WorkspacePullAck {
+                    session_id,
+                    ok: false,
+                    error: Some(e),
+                }))
+                .await;
+            return;
+        }
+        let dir = self.workspace_root().join(&account).join(&workspace);
+        // Fresh slate: blow away whatever was there before, then
+        // recreate. We do this synchronously in a tokio blocking task
+        // so the WS read loop isn't stalled.
+        let dir_for_io = dir.clone();
+        let wipe = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            if dir_for_io.exists() {
+                std::fs::remove_dir_all(&dir_for_io)?;
+            }
+            std::fs::create_dir_all(&dir_for_io)?;
+            Ok(())
+        })
+        .await;
+        if let Err(e) = wipe.unwrap_or_else(|e| Err(std::io::Error::other(e))) {
+            let _ = tx
+                .send(OutFrame::Text(ClientMsg::WorkspacePullAck {
+                    session_id,
+                    ok: false,
+                    error: Some(format!("wipe workspace dir: {}", e)),
+                }))
+                .await;
+            return;
+        }
+
+        self.pulls.insert(
+            session_id,
+            PullState {
+                account,
+                workspace,
+                expected: file_count,
+                received: 0,
+            },
+        );
+
+        // Empty workspace: ack right away. The hub will still send the
+        // sentinel WorkspaceFile (is_last=true, empty path) but
+        // `workspace_file` handles the double-ack idempotently because
+        // the pull entry is already gone.
+        if file_count == 0 {
+            self.pulls.remove(&session_id);
+            let _ = tx
+                .send(OutFrame::Text(ClientMsg::WorkspacePullAck {
+                    session_id,
+                    ok: true,
+                    error: None,
+                }))
+                .await;
+        }
+    }
+
+    /// One file from a pull stream. The agent buffers nothing — every
+    /// frame writes straight to disk so a huge workspace doesn't
+    /// balloon agent RAM.
+    pub async fn workspace_file(
+        self: &Arc<Self>,
+        session_id: Uuid,
+        path: String,
+        content: Vec<u8>,
+        is_last: bool,
+        tx: mpsc::Sender<OutFrame>,
+    ) {
+        // Snapshot the destination dir before mutating pull state. If
+        // the entry is gone we silently drop the frame — pull was
+        // already acked (file_count == 0 case) or the agent restarted.
+        let dest_root = {
+            let Some(p) = self.pulls.get(&session_id) else {
+                if is_last {
+                    tracing::debug!(%session_id, "WorkspaceFile after pull acked; ignoring");
+                }
+                return;
+            };
+            self.workspace_root().join(&p.account).join(&p.workspace)
+        };
+
+        // Sentinel "empty stream" frame on an empty workspace: path is
+        // blank, is_last is true, nothing to write. Just ack.
+        let nonempty_path = !path.is_empty();
+        if nonempty_path {
+            if let Err(e) = write_pull_file(&dest_root, &path, &content).await {
+                tracing::warn!(%session_id, %path, error = %e, "workspace pull: write failed");
+                self.pulls.remove(&session_id);
+                let _ = tx
+                    .send(OutFrame::Text(ClientMsg::WorkspacePullAck {
+                        session_id,
+                        ok: false,
+                        error: Some(format!("write {}: {}", path, e)),
+                    }))
+                    .await;
+                return;
+            }
+        }
+
+        // Bump the counter. We do this even for empty-path frames so
+        // file_count == 0 ack-once semantics work uniformly.
+        if let Some(mut p) = self.pulls.get_mut(&session_id) {
+            if nonempty_path {
+                p.received += 1;
+            }
+        }
+
+        if is_last {
+            // Drop pull state and ack — order matters so a fast follow
+            // up PtyOpen doesn't double-ack.
+            if let Some((_, p)) = self.pulls.remove(&session_id) {
+                if p.received != p.expected {
+                    tracing::warn!(
+                        %session_id,
+                        account = %p.account,
+                        workspace = %p.workspace,
+                        expected = p.expected,
+                        received = p.received,
+                        "workspace pull: file count mismatch (still acking as ok=true since hub flagged is_last)"
+                    );
+                } else {
+                    tracing::debug!(
+                        %session_id,
+                        files = p.received,
+                        "workspace pull: complete"
+                    );
+                }
+            }
+            let _ = tx
+                .send(OutFrame::Text(ClientMsg::WorkspacePullAck {
+                    session_id,
+                    ok: true,
+                    error: None,
+                }))
+                .await;
+        }
+    }
+
+    /// Hub's reply to a `WorkspacePushFile` / `WorkspaceDeleteFile`.
+    /// Look up the session's ack channel and forward — the push worker
+    /// dequeues on `ok = true` or backs off on `ok = false`.
+    pub async fn workspace_file_ack(
+        &self,
+        session_id: Uuid,
+        path: String,
+        ok: bool,
+        error: Option<String>,
+    ) {
+        let Some(route) = self.ack_routes.get(&session_id) else {
+            tracing::debug!(%session_id, %path, "WorkspaceFileAck for unknown session");
+            return;
+        };
+        // Best-effort: worker may have just shut down.
+        let _ = route.send(AckMsg { path, ok, error }).await;
+    }
+
+    /// Hub-driven garbage collection of stale local workspaces. Each
+    /// item is `(account, workspace)`; we `rm -rf` the matching dir
+    /// under `workspace_root`.
+    pub async fn workspace_cleanup(&self, items: Vec<(String, String)>) {
+        let root = self.workspace_root();
+        let mut cleared = 0usize;
+        let mut failed = 0usize;
+        for (account, workspace) in items {
+            if validate_name(&account, "account").is_err()
+                || validate_name(&workspace, "workspace").is_err()
+            {
+                tracing::warn!(%account, %workspace, "workspace cleanup: invalid name; skipping");
+                failed += 1;
+                continue;
+            }
+            let dir = root.join(&account).join(&workspace);
+            if !dir.exists() {
+                continue;
+            }
+            // Kill the per-workspace tmux server first, otherwise the
+            // wrapper process keeps the cwd open and the rm becomes a
+            // race against ongoing writes from the resumed tool.
+            let _ = std::process::Command::new(&self.tmux.executable)
+                .args([
+                    "-L",
+                    &format!("cc-{}-{}", account, workspace),
+                    "kill-server",
+                ])
+                .output();
+            match tokio::fs::remove_dir_all(&dir).await {
+                Ok(()) => {
+                    cleared += 1;
+                    tracing::info!(%account, %workspace, "workspace cleanup: removed");
+                }
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!(%account, %workspace, error = %e, "workspace cleanup: remove failed");
+                }
+            }
+        }
+        if cleared > 0 || failed > 0 {
+            tracing::info!(cleared, failed, "workspace cleanup: done");
+        }
+    }
+
+    /// Internal: bring the watcher + push worker online for a session
+    /// that just opened. Returns the [`SessionSync`] handle the
+    /// PtyHandle holds for the lifetime of the session.
+    async fn start_session_sync(
+        self: &Arc<Self>,
+        session_id: Uuid,
+        account: &str,
+        workspace: &str,
+        tx: mpsc::Sender<OutFrame>,
+    ) -> Result<SessionSync> {
+        let queue = self.push_queue().await?;
+        let cwd = self.workspace_root().join(account).join(workspace);
+        let filter = IgnoreFilter::new(&cwd).context("build ignore filter")?;
+
+        // Channels: watcher -> worker, ws read loop -> worker (acks),
+        // PtyHandle::Drop -> worker (shutdown).
+        let (watch_tx, watch_rx) = mpsc::channel(256);
+        let (ack_tx, ack_rx) = mpsc::channel(64);
+        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+
+        let watcher = WorkspaceWatcher::start(cwd.clone(), filter, watch_tx)
+            .context("start workspace watcher")?;
+
+        self.ack_routes.insert(session_id, ack_tx);
+
+        let worker = PushWorker {
+            session_id,
+            account: account.to_string(),
+            workspace: workspace.to_string(),
+            workspace_root: self.workspace_root(),
+            queue,
+            watch_rx,
+            ack_rx,
+            shutdown_rx,
+            tx,
+        };
+        tokio::spawn(async move {
+            run_push_worker(worker).await;
+        });
+
+        Ok(SessionSync {
+            _watcher: watcher,
+            shutdown_tx,
+        })
     }
 
     fn workspace_root(&self) -> PathBuf {
@@ -1042,6 +1467,35 @@ fn expand_path(p: &Path) -> PathBuf {
     p.to_path_buf()
 }
 
+/// Write one workspace file under `root`, refusing any path that
+/// would escape the workspace. The hub validates this too, but the
+/// agent is the one with FS write access — defence in depth.
+async fn write_pull_file(root: &Path, rel: &str, content: &[u8]) -> std::io::Result<()> {
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "absolute path",
+        ));
+    }
+    for c in rel_path.components() {
+        match c {
+            std::path::Component::Normal(_) => {}
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "non-normal path component",
+                ));
+            }
+        }
+    }
+    let abs = root.join(rel_path);
+    if let Some(parent) = abs.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(&abs, content).await
+}
+
 /// Quick liveness probe for the per-workspace tmux server we spawn
 /// with `-L cc-<account>-<workspace>`. We avoid running tmux itself
 /// (that would *create* a fresh server if one isn't around). Instead
@@ -1112,6 +1566,322 @@ mod tests {
         for bad in ['/', '\\', '*', '$', '`', ';', '|', '&', '"', '\''] {
             let n = format!("ws{}bad", bad);
             assert!(validate_name(&n, "workspace").is_err(), "expected reject: {:?}", n);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // v1.13 workspace pull / cleanup / push worker
+    //
+    // These tests mock the wire as channels and verify the agent's
+    // pull bookkeeping + cleanup side-effects + push worker matching
+    // hub acks to queue dequeues. They never touch tmux.
+    // -----------------------------------------------------------------
+
+    use tokio::time::{timeout, Duration};
+
+    /// Helper: collect every outbound text frame matching the predicate
+    /// until either (a) we get one, or (b) the wait window elapses.
+    async fn wait_for<F>(
+        rx: &mut mpsc::Receiver<OutFrame>,
+        mut pred: F,
+    ) -> Option<ClientMsg>
+    where
+        F: FnMut(&ClientMsg) -> bool,
+    {
+        let dl = tokio::time::sleep(Duration::from_secs(2));
+        tokio::pin!(dl);
+        loop {
+            tokio::select! {
+                _ = &mut dl => return None,
+                frame = rx.recv() => match frame {
+                    Some(OutFrame::Text(m)) if pred(&m) => return Some(m),
+                    Some(_) => continue,
+                    None => return None,
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_zero_files_acks_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = Arc::new(PtyManager::for_test(dir.path().to_path_buf()));
+        let (tx, mut rx) = mpsc::channel(64);
+        let sid = Uuid::new_v4();
+
+        mgr.workspace_pull_start(
+            sid,
+            "alice".into(),
+            "ws1".into(),
+            0,
+            tx.clone(),
+        )
+        .await;
+
+        // First reply must be PullAck ok=true.
+        let ack = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("PullAck within 1s")
+            .expect("channel open");
+        match ack {
+            OutFrame::Text(ClientMsg::WorkspacePullAck { session_id, ok, error }) => {
+                assert_eq!(session_id, sid);
+                assert!(ok);
+                assert!(error.is_none());
+            }
+            other => panic!("expected PullAck, got {:?}", text_kind(&other)),
+        }
+        // Workspace dir exists and is empty.
+        let ws_dir = dir.path().join("alice").join("ws1");
+        assert!(ws_dir.exists() && ws_dir.is_dir());
+        assert!(std::fs::read_dir(&ws_dir).unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn pull_n_files_writes_all_and_acks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = Arc::new(PtyManager::for_test(dir.path().to_path_buf()));
+        let (tx, mut rx) = mpsc::channel(64);
+        let sid = Uuid::new_v4();
+
+        mgr.workspace_pull_start(
+            sid,
+            "alice".into(),
+            "ws1".into(),
+            3,
+            tx.clone(),
+        )
+        .await;
+        // No ack yet — file_count > 0.
+        assert!(timeout(Duration::from_millis(50), rx.recv()).await.is_err());
+
+        for (i, (path, body)) in [
+            ("README.md", &b"# hi"[..]),
+            ("src/main.rs", &b"fn main() {}"[..]),
+            ("sub/dir/file.txt", &b"deep"[..]),
+        ]
+        .iter()
+        .enumerate()
+        {
+            mgr.workspace_file(
+                sid,
+                path.to_string(),
+                body.to_vec(),
+                i == 2,
+                tx.clone(),
+            )
+            .await;
+        }
+
+        let ack = wait_for(&mut rx, |m| matches!(m, ClientMsg::WorkspacePullAck { .. }))
+            .await
+            .expect("PullAck");
+        match ack {
+            ClientMsg::WorkspacePullAck { ok, .. } => assert!(ok),
+            _ => unreachable!(),
+        }
+        let ws_dir = dir.path().join("alice").join("ws1");
+        assert_eq!(std::fs::read(ws_dir.join("README.md")).unwrap(), b"# hi");
+        assert_eq!(
+            std::fs::read(ws_dir.join("src/main.rs")).unwrap(),
+            b"fn main() {}"
+        );
+        assert_eq!(
+            std::fs::read(ws_dir.join("sub/dir/file.txt")).unwrap(),
+            b"deep"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_rejects_absolute_and_traversal_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = Arc::new(PtyManager::for_test(dir.path().to_path_buf()));
+        let (tx, mut rx) = mpsc::channel(64);
+        let sid = Uuid::new_v4();
+
+        mgr.workspace_pull_start(sid, "alice".into(), "ws1".into(), 1, tx.clone())
+            .await;
+        // Try to escape with "../etc/passwd". The agent must fail the ack.
+        mgr.workspace_file(
+            sid,
+            "../leak".into(),
+            b"oops".to_vec(),
+            true,
+            tx.clone(),
+        )
+        .await;
+        let ack = wait_for(&mut rx, |m| matches!(m, ClientMsg::WorkspacePullAck { .. }))
+            .await
+            .expect("PullAck");
+        match ack {
+            ClientMsg::WorkspacePullAck { ok, error, .. } => {
+                assert!(!ok);
+                assert!(error.is_some());
+            }
+            _ => unreachable!(),
+        }
+        // Nothing escaped to the parent.
+        assert!(!dir.path().join("leak").exists());
+    }
+
+    #[tokio::test]
+    async fn workspace_cleanup_removes_listed_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = Arc::new(PtyManager::for_test(dir.path().to_path_buf()));
+
+        // Lay down three workspaces.
+        for (acct, ws) in [
+            ("alice", "ws1"),
+            ("alice", "ws2"),
+            ("bob", "ws1"),
+        ] {
+            let p = dir.path().join(acct).join(ws);
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("f.txt"), b"x").unwrap();
+        }
+
+        mgr.workspace_cleanup(vec![
+            ("alice".into(), "ws1".into()),
+            ("bob".into(), "ws1".into()),
+            // Non-existent: must not error.
+            ("alice".into(), "missing".into()),
+        ])
+        .await;
+
+        assert!(!dir.path().join("alice/ws1").exists());
+        assert!(dir.path().join("alice/ws2").exists());
+        assert!(!dir.path().join("bob/ws1").exists());
+    }
+
+    #[tokio::test]
+    async fn workspace_cleanup_rejects_invalid_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = Arc::new(PtyManager::for_test(dir.path().to_path_buf()));
+        std::fs::create_dir_all(dir.path().join("alice/ws1")).unwrap();
+        // Even if the dir happens to exist on disk, an invalid name
+        // must be ignored — the FS-layer's already shielded by name
+        // validation, but this is the only second-chance check.
+        mgr.workspace_cleanup(vec![("../escape".into(), "ws".into())])
+            .await;
+        assert!(dir.path().join("alice/ws1").exists());
+    }
+
+    #[tokio::test]
+    async fn push_worker_drains_queue_on_ack() {
+        use crate::sync::push_queue::PushQueue;
+        use crate::sync::runtime::{run_push_worker, AckMsg, PushWorker};
+        use crate::sync::QueueOp;
+
+        let qdir = tempfile::tempdir().unwrap();
+        let wsdir = tempfile::tempdir().unwrap();
+        let queue = Arc::new(PushQueue::open(&qdir.path().join("q.db")).await.unwrap());
+        queue
+            .enqueue(QueueOp::PushFile {
+                account: "alice".into(),
+                workspace: "ws1".into(),
+                path: "a.rs".into(),
+                content: b"v1".to_vec(),
+            })
+            .await
+            .unwrap();
+        queue
+            .enqueue(QueueOp::DeleteFile {
+                account: "alice".into(),
+                workspace: "ws1".into(),
+                path: "b.rs".into(),
+            })
+            .await
+            .unwrap();
+        // Another session's row — must NOT be touched.
+        queue
+            .enqueue(QueueOp::PushFile {
+                account: "bob".into(),
+                workspace: "ws1".into(),
+                path: "c.rs".into(),
+                content: b"keep".to_vec(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(queue.len().await.unwrap(), 3);
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let (_watch_tx, watch_rx) = mpsc::channel(16);
+        let (ack_tx, ack_rx) = mpsc::channel(16);
+        let (_shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        let sid = Uuid::new_v4();
+
+        let worker = PushWorker {
+            session_id: sid,
+            account: "alice".into(),
+            workspace: "ws1".into(),
+            workspace_root: wsdir.path().to_path_buf(),
+            queue: queue.clone(),
+            watch_rx,
+            ack_rx,
+            shutdown_rx,
+            tx: tx.clone(),
+        };
+        let handle = tokio::spawn(async move { run_push_worker(worker).await });
+
+        // Two pushes should hit the wire (PushFile + DeleteFile).
+        let mut seen_paths: Vec<String> = Vec::new();
+        for _ in 0..2 {
+            let frame = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("push frame")
+                .expect("channel open");
+            match frame {
+                OutFrame::Text(ClientMsg::WorkspacePushFile { path, content, .. }) => {
+                    assert_eq!(path, "a.rs");
+                    assert_eq!(content, b"v1");
+                    seen_paths.push(path);
+                }
+                OutFrame::Text(ClientMsg::WorkspaceDeleteFile { path, .. }) => {
+                    assert_eq!(path, "b.rs");
+                    seen_paths.push(path);
+                }
+                other => panic!("unexpected frame: {:?}", text_kind(&other)),
+            }
+        }
+        assert_eq!(seen_paths.len(), 2);
+
+        // Ack both. The worker should dequeue each.
+        ack_tx
+            .send(AckMsg {
+                path: "a.rs".into(),
+                ok: true,
+                error: None,
+            })
+            .await
+            .unwrap();
+        ack_tx
+            .send(AckMsg {
+                path: "b.rs".into(),
+                ok: true,
+                error: None,
+            })
+            .await
+            .unwrap();
+
+        // Wait until the queue shrinks to just bob's row.
+        let mut depth = queue.len().await.unwrap();
+        for _ in 0..40 {
+            if depth == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            depth = queue.len().await.unwrap();
+        }
+        assert_eq!(depth, 1, "expected only bob's row to remain");
+
+        drop(_shutdown_tx);
+        let _ = timeout(Duration::from_secs(2), handle).await;
+    }
+
+    fn text_kind(f: &OutFrame) -> &'static str {
+        match f {
+            OutFrame::Text(_) => "text",
+            OutFrame::Binary(_) => "binary",
         }
     }
 }

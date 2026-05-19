@@ -34,6 +34,7 @@ portable-pty = "0.8"
 which = "6"
 notify.workspace = true
 ignore = "0.4"
+serde_bytes.workspace = true
 sqlx.workspace = true
 flate2 = "1"
 tar = "0.4"

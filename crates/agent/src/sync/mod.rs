@@ -17,18 +17,19 @@
 //! - [`watcher`] bridges `notify` into a tokio mpsc, applying the ignore
 //!   filter and a short coalescing window before emitting events.
 //!
-//! Nothing here is wired into the PtyOpen flow yet; that integration is
-//! the next sub-agent's job. Until then the entire subtree is
-//! technically dead code from the binary's perspective — silence the
-//! linter so the build stays quiet without papering over real issues
-//! once wiring lands. Drop this attribute once `pty` or `ws` spawns a
-//! [`WorkspaceWatcher`] / [`PushQueue`].
-#![allow(dead_code, unused_imports)]
+//! As of v1.13 Round 2 the engine is wired into the PtyOpen flow: when
+//! the hub announces a workspace pull, [`crate::pty::PtyManager`] writes
+//! the canonical files to disk, then spawns a [`WorkspaceWatcher`] plus
+//! a per-session [`runtime::run_push_worker`] task that drains pushes
+//! through the shared [`PushQueue`].
+#![allow(unused_imports)]
 
 pub mod ignore_filter;
 pub mod push_queue;
+pub mod runtime;
 pub mod watcher;
 
 pub use ignore_filter::IgnoreFilter;
 pub use push_queue::{PushQueue, QueueOp};
+pub use runtime::{run_push_worker, AckMsg, PushWorker};
 pub use watcher::{WatchEvent, WorkspaceWatcher};

@@ -219,18 +219,25 @@ fn classify(frame: &ClientMsg) -> Routing {
     match frame {
         ClientMsg::PtyOpened { session_id, .. }
         | ClientMsg::PtyClosed { session_id, .. }
-        | ClientMsg::PtyError { session_id, .. } => Routing::Session(*session_id),
+        | ClientMsg::PtyError { session_id, .. }
+        // WorkspacePullAck is routed via the session channel so the
+        // OpenSession orchestrator (which already owns the session's
+        // PtyEvent rx) can await it inline with the rest of the open
+        // handshake.
+        | ClientMsg::WorkspacePullAck { session_id, .. } => Routing::Session(*session_id),
         ClientMsg::WorkspaceListResult { request_id, .. }
         | ClientMsg::WorkspaceCreateResult { request_id, .. }
         | ClientMsg::WorkspaceDeleteResult { request_id, .. }
         | ClientMsg::WorkspaceResetResult { request_id, .. }
         | ClientMsg::WorkspaceListAllResult { request_id, .. }
         | ClientMsg::UpdateAgentResult { request_id, .. } => Routing::Workspace(*request_id),
-        ClientMsg::Hello { .. } | ClientMsg::Pong | ClientMsg::Message { .. } => {
-            // Message frames are intercepted upstream in ws_handler and
-            // persisted to the admin db directly — they never reach
-            // here under normal operation. Discard defensively.
-            Routing::Discard
-        }
+        ClientMsg::Hello { .. }
+        | ClientMsg::Pong
+        | ClientMsg::Message { .. }
+        // WorkspacePushFile / WorkspaceDeleteFile are intercepted in
+        // ws_handler before they ever reach `classify` — they hit the
+        // hub's canonical store rather than any per-session channel.
+        | ClientMsg::WorkspacePushFile { .. }
+        | ClientMsg::WorkspaceDeleteFile { .. } => Routing::Discard,
     }
 }

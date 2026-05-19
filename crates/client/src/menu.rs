@@ -1,12 +1,12 @@
 //! Interactive TUI menu shown before opening a PTY.
 //!
-//! Two stages:
-//!   1. Pick an agent (arrow keys + Enter).
-//!   2. Pick a workspace (arrow keys + Enter); `c` creates a new one (text
-//!      input prompt), `d` deletes the highlighted one (confirm prompt),
-//!      `Esc` goes back to the agent picker.
+//! v1.13 flow — workspace-first, agent-second:
+//!   1. Pick a workspace (per-account, hub-canonical). `c` creates, `d`
+//!      deletes, `r` resets. Esc / `q` quits.
+//!   2. Pick an agent (list of online agents). Esc goes back to stage 1.
 //!
-//! Esc / `q` at the agent picker quits cloudcode.
+//! The remembered workspace (`last_workspace_path`) and agent are stored in
+//! the state dir so subsequent launches pre-select the same pair.
 
 use crate::input::{parse_keys, ByteRx, MenuKey};
 use crate::proto::{ClientToHub, HubToClient};
@@ -25,25 +25,20 @@ use ratatui::Terminal;
 use std::io::stdout;
 
 pub enum MenuOutcome {
-    OpenWorkspace { agent: String, workspace: String },
-    /// User quit the menu. `from_agent_picker` is true when the quit
-    /// happened on the stage-1 agent picker (so the caller can clear
-    /// the remembered last_agent and bring the user back to the
-    /// agent picker on the next launch). False means they quit deeper
-    /// in (workspace picker), and the caller should preserve any
-    /// last_agent so a subsequent launch lands on the workspace
-    /// picker for the same agent.
-    Quit { from_agent_picker: bool },
+    OpenWorkspace { workspace: String, agent: String },
+    /// User quit the menu. `from_workspace_picker` is true when the quit
+    /// happened on the stage-1 workspace picker (so the caller can clear
+    /// the remembered workspace). False means they quit from the agent
+    /// picker; the caller should preserve the workspace for next launch.
+    Quit { from_workspace_picker: bool },
 }
 
-/// How the menu should enter. After claude exits the caller passes
-/// `WorkspacePicker { agent }` so the user lands back where they were
-/// (the workspace picker for that agent) instead of starting from
-/// the agent picker. Falls back to AgentPicker on any mismatch
-/// (agent offline, no longer in the ACL, hub rejects).
+/// Where the menu should enter.
+/// After claude exits the caller passes `AgentPicker { workspace }` so
+/// the user lands on the agent picker for the same workspace they used.
 pub enum MenuStart {
-    AgentPicker,
-    WorkspacePicker { agent: String },
+    WorkspacePicker,
+    AgentPicker { workspace: String },
 }
 
 pub async fn run(
@@ -90,142 +85,68 @@ async fn run_inner<B: ratatui::backend::Backend>(
     account: &str,
     start: MenuStart,
 ) -> Result<MenuOutcome> {
-    // Pending fast-path target. Consumed on the next outer iteration
-    // so that an Esc back from stage 2 doesn't keep re-entering it.
-    let mut pending_fast_agent: Option<String> = match start {
-        MenuStart::WorkspacePicker { agent } => Some(agent),
-        MenuStart::AgentPicker => None,
+    // Fast-path: if we know the workspace to land on (e.g. after claude exits),
+    // skip straight to the agent picker for that workspace.
+    let mut pending_fast_ws: Option<String> = match start {
+        MenuStart::AgentPicker { workspace } => Some(workspace),
+        MenuStart::WorkspacePicker => None,
     };
 
     'outer: loop {
-        // ---- stage 1 (with optional fast-path skip) ----
-        // Try fast-path first; on miss, fall through to the normal
-        // agent picker.
-        let mut bound: Option<String> = if let Some(target) = pending_fast_agent.take() {
-            fast_bind(wire, &target).await
-        } else {
-            None
-        };
-        let agent = if let Some(a) = bound.take() {
-            crate::write_last_agent(&a);
-            a
-        } else {
-            match pick_agent_stage(term, wire, bytes, keys, account).await? {
-                Some(a) => a,
-                None => return Ok(MenuOutcome::Quit { from_agent_picker: true }),
-            }
+        // ---- stage 1: workspace picker ----
+        let fast_ws = pending_fast_ws.take();
+        let workspace = match pick_workspace_stage(term, wire, bytes, keys, account, fast_ws).await? {
+            Some(ws) => ws,
+            None => return Ok(MenuOutcome::Quit { from_workspace_picker: true }),
         };
 
-        // ---- stage 2: workspace picker (loop until pick or Esc back) ----
-        let last_ws = crate::read_last_workspace(&agent);
-        let mut w_state = ListState::default();
-        // After a successful `c`reate, prefer the just-created workspace
-        // for the next selection — even over the previously-saved
-        // last-used one.
-        let mut pending_select: Option<String> = None;
+        // ---- stage 2: agent picker (loop until pick or Esc back) ----
+        let last_agent = crate::read_last_agent();
+        let mut a_state = ListState::default();
         loop {
-            let workspaces = list_workspaces(wire).await?;
-            let workspace_rows: Vec<PickerRow> = workspaces
+            let agents = list_agents(wire).await?;
+            if agents.is_empty() {
+                show_message(term, "no agents online", bytes, keys).await?;
+                continue 'outer;
+            }
+            let agent_rows: Vec<PickerRow> = agents
                 .iter()
-                .map(|w| PickerRow {
-                    name: w.name.clone(),
-                    badge: if w.has_client {
-                        Some(Badge::active())
-                    } else if w.tmux_alive {
-                        Some(Badge::saved())
-                    } else {
-                        None
-                    },
+                .map(|n| PickerRow {
+                    name: n.clone(),
+                    badge: None,
                 })
                 .collect();
-            let preferred = pending_select.take().or_else(|| last_ws.clone());
-            let initial = preferred
-                .as_deref()
-                .and_then(|n| workspaces.iter().position(|w| w.name == n))
-                .unwrap_or(0);
-            if w_state.selected().is_none() {
-                w_state.select(Some(initial.min(workspaces.len().saturating_sub(1))));
+            if a_state.selected().is_none() {
+                let initial = last_agent
+                    .as_deref()
+                    .and_then(|n| agents.iter().position(|a| a == n))
+                    .unwrap_or(0);
+                a_state.select(Some(initial.min(agents.len().saturating_sub(1))));
             }
+            let title = format!("Open '{}' with agent", workspace);
+            let hint = "↑↓ Enter pick · Esc back · q quit";
             term.draw(|f| {
-                draw_layout(
-                    f,
-                    account,
-                    &format!("Select workspace on {}", agent),
-                    &workspace_rows,
-                    &mut w_state,
-                    "↑↓ Enter · c create · r reset · d delete · Esc back · q quit",
-                    false,
-                )
+                draw_layout(f, account, &title, &agent_rows, &mut a_state, hint, false)
             })?;
             let Some(k) = keys.next(bytes).await else {
-                return Ok(MenuOutcome::Quit { from_agent_picker: false });
+                return Ok(MenuOutcome::Quit { from_workspace_picker: false });
             };
             match k {
                 MenuKey::Escape => continue 'outer,
-                MenuKey::Char('q') => return Ok(MenuOutcome::Quit { from_agent_picker: false }),
-                MenuKey::Char('c') => {
-                    if let Some(name) =
-                        prompt_input(term, bytes, keys, "create workspace", "").await?
-                    {
-                        let name = name.trim().to_string();
-                        if !name.is_empty() {
-                            create_workspace(wire, &name).await?;
-                            pending_select = Some(name);
-                            w_state.select(None);
-                        }
-                    }
-                }
-                MenuKey::Char('d') => {
-                    if let Some(sel) = w_state.selected() {
-                        if let Some(ws) = workspaces.get(sel) {
-                            let confirmed = prompt_confirm(
-                                term,
-                                bytes,
-                                keys,
-                                &format!("delete workspace '{}'?", ws.name),
-                            )
-                            .await?;
-                            if confirmed {
-                                delete_workspace(wire, &ws.name).await?;
-                                w_state.select(None);
-                            }
-                        }
-                    }
-                }
-                MenuKey::Char('r') => {
-                    if let Some(sel) = w_state.selected() {
-                        if let Some(ws) = workspaces.get(sel) {
-                            let confirmed = prompt_confirm(
-                                term,
-                                bytes,
-                                keys,
-                                &format!(
-                                    "reset session for '{}'? Files stay; tmux + conversation history cleared.",
-                                    ws.name
-                                ),
-                            )
-                            .await?;
-                            if confirmed {
-                                reset_workspace(wire, &ws.name).await?;
-                                w_state.select(None);
-                            }
-                        }
-                    }
-                }
-                _ => match handle_list_key(k, &mut w_state, workspaces.len()) {
+                MenuKey::Char('q') => return Ok(MenuOutcome::Quit { from_workspace_picker: false }),
+                _ => match handle_list_key(k, &mut a_state, agents.len()) {
                     ListAction::Pick => {
-                        if let Some(sel) = w_state.selected() {
-                            if let Some(ws) = workspaces.get(sel).cloned() {
-                                let title = format!("Select workspace on {}", agent);
-                                let hint = "↑↓ Enter · c create · r reset · d delete · Esc back · q quit";
+                        if let Some(sel) = a_state.selected() {
+                            if let Some(agent) = agents.get(sel).cloned() {
+                                let title2 = format!("Open '{}' with agent", workspace);
                                 let mut redraw = |pressed: bool| -> Result<()> {
                                     term.draw(|f| {
                                         draw_layout(
                                             f,
                                             account,
-                                            &title,
-                                            &workspace_rows,
-                                            &mut w_state,
+                                            &title2,
+                                            &agent_rows,
+                                            &mut a_state,
                                             hint,
                                             pressed,
                                         )
@@ -236,17 +157,149 @@ async fn run_inner<B: ratatui::backend::Backend>(
                                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                                 redraw(false)?;
                                 tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-                                return Ok(MenuOutcome::OpenWorkspace {
-                                    agent,
-                                    workspace: ws.name,
-                                });
+                                crate::write_last_agent(&agent);
+                                return Ok(MenuOutcome::OpenWorkspace { workspace, agent });
                             }
                         }
                     }
-                    ListAction::Quit => return Ok(MenuOutcome::Quit { from_agent_picker: false }),
+                    ListAction::Quit => {
+                        return Ok(MenuOutcome::Quit { from_workspace_picker: false })
+                    }
                     ListAction::Pass => {}
                 },
             }
+        }
+    }
+}
+
+/// Stage 1: workspace picker. Returns the chosen workspace name, or None if
+/// the user quit. `fast_ws` is a pre-selected workspace name (skips initial
+/// selection UI but still shows the list for orientation).
+async fn pick_workspace_stage<B: ratatui::backend::Backend>(
+    term: &mut Terminal<B>,
+    wire: &mut Wire,
+    bytes: &mut ByteRx,
+    keys: &mut MenuKeyQueue,
+    account: &str,
+    fast_ws: Option<String>,
+) -> Result<Option<String>> {
+    let last_ws = crate::read_last_workspace_global();
+    let mut w_state = ListState::default();
+    let mut pending_select: Option<String> = fast_ws.or(last_ws);
+    loop {
+        let workspaces = list_workspaces(wire).await?;
+        let workspace_rows: Vec<PickerRow> = workspaces
+            .iter()
+            .map(|w| PickerRow {
+                name: w.name.clone(),
+                badge: w.locked_by_agent.as_ref().map(|a| Badge::locked(a)),
+            })
+            .collect();
+        let preferred = pending_select.take();
+        let initial = preferred
+            .as_deref()
+            .and_then(|n| workspaces.iter().position(|w| w.name == n))
+            .unwrap_or(0);
+        if w_state.selected().is_none() || preferred.is_none() {
+            w_state.select(Some(initial.min(workspaces.len().saturating_sub(1))));
+        }
+        term.draw(|f| {
+            draw_layout(
+                f,
+                account,
+                "Select workspace",
+                &workspace_rows,
+                &mut w_state,
+                "↑↓ Enter · c create · r reset · d delete · q quit",
+                false,
+            )
+        })?;
+        let Some(k) = keys.next(bytes).await else {
+            return Ok(None);
+        };
+        match k {
+            MenuKey::Escape | MenuKey::Char('q') => return Ok(None),
+            MenuKey::Char('c') => {
+                if let Some(name) =
+                    prompt_input(term, bytes, keys, "create workspace", "").await?
+                {
+                    let name = name.trim().to_string();
+                    if !name.is_empty() {
+                        create_workspace(wire, &name).await?;
+                        pending_select = Some(name);
+                        w_state.select(None);
+                    }
+                }
+            }
+            MenuKey::Char('d') => {
+                if let Some(sel) = w_state.selected() {
+                    if let Some(ws) = workspaces.get(sel) {
+                        let confirmed = prompt_confirm(
+                            term,
+                            bytes,
+                            keys,
+                            &format!("delete workspace '{}'?", ws.name),
+                        )
+                        .await?;
+                        if confirmed {
+                            delete_workspace(wire, &ws.name).await?;
+                            w_state.select(None);
+                        }
+                    }
+                }
+            }
+            MenuKey::Char('r') => {
+                if let Some(sel) = w_state.selected() {
+                    if let Some(ws) = workspaces.get(sel) {
+                        let confirmed = prompt_confirm(
+                            term,
+                            bytes,
+                            keys,
+                            &format!(
+                                "reset session for '{}'? Files stay; session history cleared.",
+                                ws.name
+                            ),
+                        )
+                        .await?;
+                        if confirmed {
+                            reset_workspace(wire, &ws.name).await?;
+                            w_state.select(None);
+                        }
+                    }
+                }
+            }
+            _ => match handle_list_key(k, &mut w_state, workspaces.len()) {
+                ListAction::Pick => {
+                    if let Some(sel) = w_state.selected() {
+                        if let Some(ws) = workspaces.get(sel).cloned() {
+                            let title = "Select workspace";
+                            let hint = "↑↓ Enter · c create · r reset · d delete · q quit";
+                            let mut redraw = |pressed: bool| -> Result<()> {
+                                term.draw(|f| {
+                                    draw_layout(
+                                        f,
+                                        account,
+                                        title,
+                                        &workspace_rows,
+                                        &mut w_state,
+                                        hint,
+                                        pressed,
+                                    )
+                                })?;
+                                Ok(())
+                            };
+                            redraw(true)?;
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            redraw(false)?;
+                            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                            crate::write_last_workspace_global(&ws.name);
+                            return Ok(Some(ws.name));
+                        }
+                    }
+                }
+                ListAction::Quit => return Ok(None),
+                ListAction::Pass => {}
+            },
         }
     }
 }
@@ -444,7 +497,7 @@ fn draw_layout(
 
     let label_w = items
         .iter()
-        .map(|r| r.name.chars().count() + r.badge.map(|b| b.width() + 1).unwrap_or(0))
+        .map(|r| r.name.chars().count() + r.badge.as_ref().map(|b| b.width() + 1).unwrap_or(0))
         .max()
         .unwrap_or(0);
     let want_w = ((label_w + 18)
@@ -527,54 +580,47 @@ fn draw_layout(
     hint_bar(f, hint);
 }
 
-/// What the picker draws for one row. The agent picker passes
-/// `badge: None` for every entry; the workspace picker fills it in
-/// from `WorkspaceInfo`.
+/// What the picker draws for one row. Agent picker passes `badge: None`;
+/// workspace picker fills it from `WorkspaceInfo`.
 #[derive(Clone)]
 pub struct PickerRow {
     pub name: String,
     pub badge: Option<Badge>,
 }
 
-#[derive(Clone, Copy)]
+/// A badge shown next to a workspace name in the picker.
+/// Unlike the old static `active`/`saved` pair, the lock badge carries a
+/// dynamic label (the agent name) so we use `String` here.
+#[derive(Clone)]
 pub struct Badge {
-    pub glyph: &'static str, // "●" or "·"
-    pub label: &'static str, // " active" or " saved"
+    pub glyph: &'static str,
+    pub label: String,
     pub color: Color,
 }
 
 impl Badge {
-    pub fn active() -> Self {
+    /// Workspace is locked by the given agent.
+    pub fn locked(agent: &str) -> Self {
         Badge {
             glyph: "●",
-            label: " active",
-            color: Color::Red,
-        }
-    }
-    pub fn saved() -> Self {
-        Badge {
-            glyph: "·",
-            label: " saved",
+            label: format!(" {}", agent),
             color: Color::Yellow,
         }
     }
 
     fn width(&self) -> usize {
-        // glyph counts as 1 cell; label already starts with a leading space.
         self.glyph.chars().count() + self.label.chars().count()
     }
 }
 
-/// Build one list row, baking highlight + optional badge directly
-/// into the line so we don't have to rely on ratatui's
-/// `highlight_style` (which would clobber the badge colour).
+/// Build one list row, baking highlight + optional badge directly into the
+/// line so we don't rely on ratatui's `highlight_style`.
 ///
-/// Right margin: we reserve 1 cell of trailing padding so the badge's
-/// right edge lines up with the `[account]` label one row up in the
-/// title bar (that one also has a trailing space).
+/// Right margin: 1 cell of trailing padding so the badge's right edge lines
+/// up with the `[account]` label one row up in the title bar.
 fn build_row(i: usize, row: &PickerRow, list_w: usize, selected: Option<usize>) -> ListItem<'static> {
     let prefix = format!("  {:>2}  ", i + 1);
-    let badge_w = row.badge.map(|b| b.width()).unwrap_or(0);
+    let badge_w = row.badge.as_ref().map(|b| b.width()).unwrap_or(0);
     let gutter = if row.badge.is_some() { 1 } else { 0 };
     let right_margin = 1usize;
     let used = prefix.chars().count() + row.name.chars().count() + gutter + badge_w + right_margin;
@@ -594,7 +640,7 @@ fn build_row(i: usize, row: &PickerRow, list_w: usize, selected: Option<usize>) 
             Span::styled(row.name.clone(), body_style),
             Span::styled(" ".repeat(pad + gutter), body_style),
         ];
-        if let Some(b) = row.badge {
+        if let Some(b) = &row.badge {
             spans.push(Span::styled(
                 b.glyph,
                 Style::default()
@@ -603,7 +649,7 @@ fn build_row(i: usize, row: &PickerRow, list_w: usize, selected: Option<usize>) 
                     .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::styled(
-                b.label,
+                b.label.clone(),
                 Style::default().bg(HILITE_BG).fg(HILITE_FG),
             ));
         }
@@ -625,7 +671,7 @@ fn build_row(i: usize, row: &PickerRow, list_w: usize, selected: Option<usize>) 
         ),
         Span::styled(" ".repeat(pad + gutter), Style::default().bg(DIALOG_BG)),
     ];
-    if let Some(b) = row.badge {
+    if let Some(b) = &row.badge {
         spans.push(Span::styled(
             b.glyph,
             Style::default()
@@ -634,7 +680,7 @@ fn build_row(i: usize, row: &PickerRow, list_w: usize, selected: Option<usize>) 
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
-            b.label,
+            b.label.clone(),
             Style::default().bg(DIALOG_BG).fg(Color::DarkGray),
         ));
     }
@@ -815,129 +861,6 @@ async fn prompt_confirm<B: ratatui::backend::Backend>(
 // ---------------------------------------------------------------------------
 // Hub queries (text-only; menu doesn't expect binary frames)
 // ---------------------------------------------------------------------------
-
-/// Render the agent picker and return the chosen agent's name. Reads
-/// `crate::read_last_agent()` lazily so an Esc-back from stage 2
-/// highlights the agent the user just stepped away from, even within
-/// the same `menu::run` invocation.
-async fn pick_agent_stage<B: ratatui::backend::Backend>(
-    term: &mut Terminal<B>,
-    wire: &mut Wire,
-    bytes: &mut ByteRx,
-    keys: &mut MenuKeyQueue,
-    account: &str,
-) -> Result<Option<String>> {
-    loop {
-        let agents = list_agents(wire).await?;
-        if agents.is_empty() {
-            show_message(term, "no agents online", bytes, keys).await?;
-            return Ok(None);
-        }
-        let mut a_state = ListState::default();
-        // Read the last-used agent now (not when menu::run started)
-        // so the highlight tracks the most recent selection.
-        let initial = crate::read_last_agent()
-            .as_deref()
-            .and_then(|n| agents.iter().position(|a| a == n))
-            .unwrap_or(0);
-        a_state.select(Some(initial));
-
-        let agent_rows: Vec<PickerRow> = agents
-            .iter()
-            .map(|n| PickerRow {
-                name: n.clone(),
-                badge: None,
-            })
-            .collect();
-        let picked = loop {
-            term.draw(|f| {
-                draw_layout(
-                    f,
-                    account,
-                    "Select agent",
-                    &agent_rows,
-                    &mut a_state,
-                    "↑↓ move · Enter pick · Esc/q quit",
-                    false,
-                )
-            })?;
-            let Some(k) = keys.next(bytes).await else {
-                return Ok(None);
-            };
-            match handle_list_key(k, &mut a_state, agents.len()) {
-                ListAction::Pick => {
-                    let p = agents[a_state.selected().unwrap_or(0)].clone();
-                    let mut redraw = |pressed: bool| -> Result<()> {
-                        term.draw(|f| {
-                            draw_layout(
-                                f,
-                                account,
-                                "Select agent",
-                                &agent_rows,
-                                &mut a_state,
-                                "↑↓ move · Enter pick · Esc/q quit",
-                                pressed,
-                            )
-                        })?;
-                        Ok(())
-                    };
-                    redraw(true)?;
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    redraw(false)?;
-                    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-                    break p;
-                }
-                ListAction::Quit => return Ok(None),
-                ListAction::Pass => {}
-            }
-        };
-        // bind to the chosen agent
-        wire.out_tx
-            .send(OutFrame::Text(ClientToHub::SelectAgent {
-                agent: Some(picked.clone()),
-            }))
-            .await
-            .map_err(|_| anyhow!("hub disconnected"))?;
-        match expect_text(wire).await? {
-            HubToClient::AgentSelected { .. } => {
-                crate::write_last_agent(&picked);
-                return Ok(Some(picked));
-            }
-            HubToClient::SessionError { message } => {
-                show_message(term, &format!("error: {}", message), bytes, keys).await?;
-                // retry the picker (agent may have just gone offline)
-                continue;
-            }
-            _ => continue,
-        }
-    }
-}
-
-/// Fast-path bind: ask the hub to select `target` directly, no UI.
-/// Returns Some(target) on success, None on any miss so the caller
-/// can fall back to the normal agent picker. Used after claude exits
-/// to land the user back in the workspace picker for the agent they
-/// were using.
-async fn fast_bind(wire: &mut Wire, target: &str) -> Option<String> {
-    // Sanity-check against the hub's view first: if the agent isn't
-    // in the allow-listed online set, don't even attempt the bind
-    // (otherwise we'd spam a SessionError that the caller would
-    // immediately have to swallow).
-    let agents = list_agents(wire).await.ok()?;
-    if !agents.iter().any(|a| a == target) {
-        return None;
-    }
-    wire.out_tx
-        .send(OutFrame::Text(ClientToHub::SelectAgent {
-            agent: Some(target.to_string()),
-        }))
-        .await
-        .ok()?;
-    match expect_text(wire).await.ok()? {
-        HubToClient::AgentSelected { .. } => Some(target.to_string()),
-        _ => None,
-    }
-}
 
 async fn list_agents(wire: &mut Wire) -> Result<Vec<String>> {
     wire.out_tx

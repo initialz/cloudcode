@@ -11,6 +11,7 @@ license = "MIT"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_bytes = "0.11"
 toml = "0.8"
 toml_edit = "0.22"
 anyhow = "1"

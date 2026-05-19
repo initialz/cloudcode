@@ -255,21 +255,13 @@ export default function AgentTree({
 // ── WorkspaceRow ─────────────────────────────────────────────────────────────
 
 function WorkspaceBadge({ ws, isLive }: { ws: WorkspaceItem; isLive: boolean }) {
-  // Live > active (tracked by an open tab in this UI) takes priority
-  // over hub-reported has_client, so the dot turns green the moment
-  // you click open even before the hub's workspace_list refresh
-  // arrives.
-  if (isLive || ws.has_client) {
+  // v1.13: use locked_by_agent to infer "has active holder".
+  // isLive (open tab in this browser session) takes priority so the dot
+  // turns green the moment you click open, before workspace_list refreshes.
+  if (isLive || ws.locked_by_agent !== null) {
     return (
       <span className="text-emerald-500 font-bold" title="live">
         ●
-      </span>
-    );
-  }
-  if (ws.tmux_alive) {
-    return (
-      <span className="text-amber-500" title="saved">
-        ·
       </span>
     );
   }

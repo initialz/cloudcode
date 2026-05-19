@@ -207,6 +207,21 @@ pub fn write_last_workspace(agent: &str, workspace: &str) {
     }
 }
 
+fn last_workspace_global_path() -> Result<PathBuf> {
+    Ok(state_dir()?.join("last_workspace_global"))
+}
+
+/// v1.13: workspace is no longer scoped to an agent.
+pub fn read_last_workspace_global() -> Option<String> {
+    read_text_file(&last_workspace_global_path().ok()?)
+}
+
+pub fn write_last_workspace_global(workspace: &str) {
+    if let Ok(p) = last_workspace_global_path() {
+        write_text_file(&p, workspace);
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -289,9 +304,9 @@ token   = "cc_PASTE_TOKEN_HERE"
 }
 
 async fn run_chat(
-    agent_flag: Option<String>,
+    _agent_flag: Option<String>,
     claude_args: Vec<String>,
-    tool: Option<String>,
+    _tool: Option<String>,
     config_override: Option<&PathBuf>,
     cli_hub_url: Option<String>,
     cli_token: Option<String>,
@@ -308,29 +323,29 @@ async fn run_chat(
     };
 
     let mut bytes = input::spawn_byte_reader();
-    // First-launch entry: if --agent or a remembered last_agent
-    // exists, jump straight to that agent's workspace picker. The
-    // menu falls back to the agent picker on any miss (agent offline
-    // / no ACL / hub rejects).
-    let mut next_start: menu::MenuStart = match agent_flag.or_else(read_last_agent) {
-        Some(agent) => menu::MenuStart::WorkspacePicker { agent },
-        None => menu::MenuStart::AgentPicker,
+    // v1.13 flow: workspace-first. If a remembered last_workspace exists,
+    // jump straight to the agent picker for that workspace. Otherwise start
+    // at the workspace picker.
+    let mut next_start: menu::MenuStart = match read_last_workspace_global() {
+        Some(workspace) => menu::MenuStart::AgentPicker { workspace },
+        None => menu::MenuStart::WorkspacePicker,
     };
 
     loop {
         let outcome = menu::run(&mut wire, &mut bytes, &account_name, next_start).await?;
         // Default for the next iteration; overridden after a successful PTY.
-        next_start = menu::MenuStart::AgentPicker;
+        next_start = menu::MenuStart::WorkspacePicker;
         match outcome {
-            menu::MenuOutcome::OpenWorkspace { agent, workspace } => {
+            menu::MenuOutcome::OpenWorkspace { workspace, agent } => {
                 let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
                 wire.out_tx
                     .send(OutFrame::Text(ClientToHub::OpenSession {
                         workspace: workspace.clone(),
+                        agent: agent.clone(),
+                        force: false,
                         cols,
                         rows,
                         claude_args: claude_args.clone(),
-                        tool: tool.clone(),
                     }))
                     .await
                     .map_err(|_| anyhow!("hub disconnected"))?;
@@ -355,20 +370,19 @@ async fn run_chat(
                 if !opened {
                     continue;
                 }
-                write_last_workspace(&agent, &workspace);
+                write_last_workspace_global(&workspace);
+                write_last_agent(&agent);
                 relay::run(&mut wire, &mut bytes).await.ok();
-                // Back to menu — land on the same agent's workspace
-                // picker, not the top-level agent picker.
-                next_start = menu::MenuStart::WorkspacePicker { agent };
+                // Back to menu — land on the agent picker for the same workspace.
+                next_start = menu::MenuStart::AgentPicker { workspace };
             }
-            menu::MenuOutcome::Quit { from_agent_picker } => {
-                // Quitting at the agent picker == "I'm done with the
-                // CLI, not just this workspace" — clear the
-                // remembered agent so the next launch lands on the
-                // agent picker again instead of auto-jumping into
-                // the last agent's workspace picker.
-                if from_agent_picker {
-                    clear_last_agent();
+            menu::MenuOutcome::Quit { from_workspace_picker } => {
+                // Quitting at the workspace picker == "done with the CLI" —
+                // clear the remembered workspace so next launch starts fresh.
+                if from_workspace_picker {
+                    if let Ok(p) = last_workspace_global_path() {
+                        let _ = std::fs::remove_file(p);
+                    }
                 }
                 let _ = wire.out_tx.send(OutFrame::Text(ClientToHub::Close)).await;
                 return Ok(());

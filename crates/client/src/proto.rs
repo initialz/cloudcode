@@ -12,16 +12,19 @@ pub enum ClientToHub {
         token: String,
         version: String,
     },
-    /// Pre-session: bind this client connection to an agent. `None` lets the
-    /// hub pick the first online agent (alphabetically). All subsequent
-    /// workspace ops + the eventual OpenSession use this agent.
+    /// Pre-session: bind this client connection to an agent. `None` lets
+    /// the hub pick the first online agent (alphabetically). Becomes
+    /// semi-redundant in v1.13 — `OpenSession` carries an explicit
+    /// `agent` — but the CLI menu uses AgentList/SelectAgent to render
+    /// the picker, so we keep them.
     SelectAgent {
         #[serde(default)]
         agent: Option<String>,
     },
     /// Pre-session: list online agents.
     ListAgents,
-    /// Pre-session (or in-session): list workspaces on the selected agent.
+    /// List workspaces visible to this account. Hub-canonical and
+    /// per-account in v1.13 — no agent in scope.
     ListWorkspaces,
     CreateWorkspace {
         name: String,
@@ -37,22 +40,20 @@ pub enum ClientToHub {
     ResetWorkspace {
         name: String,
     },
-    /// Open a PTY session in the given workspace on the selected agent.
-    /// `claude_args` is forwarded verbatim to `claude`'s argv when the
-    /// session is first created (tmux ignores it on re-attach, so it
-    /// only affects the very first spawn for this workspace).
+    /// Open a PTY session in the given workspace on the given agent.
+    /// v1.13: hub streams canonical bytes to the agent then issues
+    /// PtyOpen. `force=true` wrests the workspace lock from whichever
+    /// agent currently holds it (the previous holder's local copy is
+    /// queued for cleanup).
     OpenSession {
         workspace: String,
+        agent: String,
+        #[serde(default)]
+        force: bool,
         cols: u16,
         rows: u16,
         #[serde(default)]
         claude_args: Vec<String>,
-        /// Which tool to run inside the workspace. As of v1.13 this
-        /// is effectively claude-only; `None` lets the agent fall
-        /// back to its configured default (`[tools].default` in
-        /// agent.toml).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        tool: Option<String>,
     },
     /// In-session: terminal-size change (SIGWINCH).
     Resize {
@@ -125,13 +126,15 @@ pub struct AgentInfo {
     pub tools: Vec<String>,
 }
 
-/// Per-workspace status badge data, returned alongside the workspace
-/// name in HubToClient::WorkspaceList.
+/// Per-workspace state row carried in HubToClient::WorkspaceList.
+/// v1.13: hub-canonical, per-account. Mirror of `pty_proto::WorkspaceInfo`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct WorkspaceInfo {
     pub name: String,
     #[serde(default)]
-    pub tmux_alive: bool,
+    pub locked_by_agent: Option<String>,
     #[serde(default)]
-    pub has_client: bool,
+    pub last_sync_at: Option<i64>,
+    #[serde(default)]
+    pub size_bytes: u64,
 }

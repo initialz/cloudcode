@@ -133,6 +133,40 @@ pub enum ClientMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+
+    // -- v1.13 hub-managed workspace sync -------------------------------------
+    //
+    // The hub owns the canonical bytes of every workspace; the agent holds a
+    // read-write cache populated on PtyOpen via WorkspacePullStart +
+    // WorkspaceFile, and ships local edits back via the WorkspacePushFile /
+    // WorkspaceDeleteFile pair. WorkspaceFileAck closes the loop on each push.
+
+    /// Acknowledges the agent has finished writing every file from a
+    /// WorkspacePullStart stream to disk. Sent exactly once per pull.
+    /// `ok = false` means the agent gave up before consuming the full
+    /// stream (out-of-disk, write error, etc.); hub treats that as a
+    /// failed PtyOpen.
+    WorkspacePullAck {
+        session_id: Uuid,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// One file edit captured by the watcher. The hub replies with
+    /// WorkspaceFileAck once the write has been durably persisted; the
+    /// agent uses that to dequeue the matching push_queue row.
+    WorkspacePushFile {
+        session_id: Uuid,
+        path: String,
+        #[serde(with = "serde_bytes")]
+        content: Vec<u8>,
+    },
+    /// One file deletion captured by the watcher. Same ack semantics as
+    /// WorkspacePushFile.
+    WorkspaceDeleteFile {
+        session_id: Uuid,
+        path: String,
+    },
 }
 
 /// One row in a WorkspaceListResult. `tmux_alive` lets the picker
@@ -238,6 +272,48 @@ pub enum ServerMsg {
         download_url: String,
         /// `.sha256` manifest URL covering the same asset.
         sha256_url: String,
+    },
+
+    // -- v1.13 hub-managed workspace sync -------------------------------------
+
+    /// Announces that the hub is about to stream `file_count` files for
+    /// the given `(account, workspace)`. The agent wipes the local
+    /// workspace dir (fresh slate per pull) and prepares to receive
+    /// subsequent WorkspaceFile frames. Sent just before PtyOpen during
+    /// the open handshake.
+    WorkspacePullStart {
+        session_id: Uuid,
+        account: String,
+        workspace: String,
+        file_count: u64,
+    },
+    /// One file from the pull stream. `is_last = true` flags the end of
+    /// the stream — for an empty workspace the hub still sends one
+    /// sentinel frame with `path = ""` and `is_last = true` so the
+    /// agent can ack.
+    WorkspaceFile {
+        session_id: Uuid,
+        path: String,
+        #[serde(with = "serde_bytes")]
+        content: Vec<u8>,
+        is_last: bool,
+    },
+    /// Hub's reply to a single WorkspacePushFile / WorkspaceDeleteFile.
+    /// `ok = true` -> agent dequeues that op; `ok = false` -> agent
+    /// leaves the row in the push queue for retry.
+    WorkspaceFileAck {
+        session_id: Uuid,
+        path: String,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Sent right after Welcome. Each `(account, workspace)` pair names a
+    /// directory under workspace_root that the hub no longer considers
+    /// canonical — the agent should `rm -rf` it so the next pull starts
+    /// from a clean slate. Empty list = nothing to do.
+    WorkspaceCleanup {
+        items: Vec<(String, String)>,
     },
 }
 
