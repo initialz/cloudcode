@@ -5,6 +5,12 @@ import { useState } from 'react';
 import { KNOWN_TOOLS, type Tool } from '@/lib/tools';
 import { argsToText, textToArgs, type Preferences } from '@/lib/preferences';
 
+// Tools whose default args we expose in this dialog. KNOWN_TOOLS stays
+// the source of truth for "can be launched"; this is a narrower set —
+// codex args are hidden until we have a clear UX for codex-specific
+// flags.
+const CONFIGURABLE_TOOLS: Tool[] = KNOWN_TOOLS.filter((t) => t !== 'codex');
+
 type Props = {
   onClose: () => void;
   /** Called whenever the theme is changed so callers can react (e.g. update terminals). */
@@ -27,7 +33,7 @@ export default function SettingsDialog({
   // and sync from props only at mount).
   const [argsText, setArgsText] = useState<Record<Tool, string>>(() =>
     Object.fromEntries(
-      KNOWN_TOOLS.map((t) => [t, argsToText(preferences.toolArgs[t] ?? [])]),
+      CONFIGURABLE_TOOLS.map((t) => [t, argsToText(preferences.toolArgs[t] ?? [])]),
     ) as Record<Tool, string>,
   );
 
@@ -88,7 +94,7 @@ export default function SettingsDialog({
             Whitespace-separated; quoted args aren&apos;t supported.
           </p>
           <div className="space-y-2">
-            {KNOWN_TOOLS.map((tool) => (
+            {CONFIGURABLE_TOOLS.map((tool) => (
               <label key={tool} className="flex items-center gap-3">
                 <span className="w-16 shrink-0 text-xs font-mono text-zinc-700 dark:text-zinc-300 capitalize">
                   {tool}
