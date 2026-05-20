@@ -1028,6 +1028,44 @@ impl PtyManager {
             .await;
     }
 
+    /// Walk the workspace root and produce `"<account>/<name>"`
+    /// strings for every valid workspace dir we find. Used by the
+    /// agent's Hello frame to seed hub's workspace registry on
+    /// first connect — see `tunnel.rs::ClientMsg::Hello.workspaces`.
+    /// Empty / non-existent / unreadable root yields an empty list
+    /// rather than an error, because losing this seed is non-fatal
+    /// (the user can recreate via the new flow).
+    pub fn list_workspace_paths(&self) -> Vec<String> {
+        let root = self.workspace_root();
+        let Ok(rd) = std::fs::read_dir(&root) else {
+            return Vec::new();
+        };
+        let mut accounts: Vec<String> = rd
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| !n.starts_with('.') && validate_name(n, "account").is_ok())
+            .collect();
+        accounts.sort();
+        let mut out = Vec::new();
+        for account in &accounts {
+            let Ok(rd2) = std::fs::read_dir(root.join(account)) else {
+                continue;
+            };
+            let mut workspaces: Vec<String> = rd2
+                .flatten()
+                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| !n.starts_with('.') && validate_name(n, "workspace").is_ok())
+                .collect();
+            workspaces.sort();
+            for name in workspaces {
+                out.push(format!("{}/{}", account, name));
+            }
+        }
+        out
+    }
+
     fn workspace_root(&self) -> PathBuf {
         expand_path(&self.claude.workspace_root)
     }

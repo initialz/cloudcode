@@ -9,6 +9,7 @@ export function Workspaces() {
   const [err, setErr] = useState<string | null>(null);
   const [agentFilter, setAgentFilter] = useState<string>(ALL);
   const [accountFilter, setAccountFilter] = useState<string>(ALL);
+  const [deletingKey, setDeletingKey] = useState<string | null>(null);
 
   async function reload() {
     try {
@@ -16,6 +17,28 @@ export function Workspaces() {
       setRows(list);
     } catch (e: any) {
       setErr(e?.message ?? 'failed to load workspaces');
+    }
+  }
+
+  async function handleDelete(r: WorkspaceRowDto) {
+    const label = `${r.workspace}@${r.agent} (${r.account})`;
+    if (!confirm(`Delete workspace ${label}? This removes it from the agent's disk and from the hub binding.`)) {
+      return;
+    }
+    const key = `${r.agent}|${r.account}|${r.workspace}`;
+    setDeletingKey(key);
+    setErr(null);
+    try {
+      await apiClient.workspaces.delete({
+        agent: r.agent,
+        account: r.account,
+        workspace: r.workspace,
+      });
+      await reload();
+    } catch (e: any) {
+      setErr(e?.message ?? `failed to delete ${label}`);
+    } finally {
+      setDeletingKey(null);
     }
   }
 
@@ -111,49 +134,68 @@ export function Workspaces() {
           <table className="w-full text-sm">
             <thead className="bg-zinc-50 dark:bg-zinc-900/50 text-xs uppercase tracking-wide text-zinc-500">
               <tr>
+                <th className="px-3 py-2 text-left">Workspace</th>
                 <th className="px-3 py-2 text-left">Agent</th>
                 <th className="px-3 py-2 text-left">Account</th>
-                <th className="px-3 py-2 text-left">Workspace</th>
                 <th className="px-3 py-2 text-left">Status</th>
                 <th className="px-3 py-2 text-left">Last started</th>
+                <th className="px-3 py-2 text-right"></th>
               </tr>
             </thead>
             <tbody className="divide-y divide-zinc-200 dark:divide-zinc-800 bg-white dark:bg-zinc-900">
               {filtered.length === 0 ? (
                 <tr>
                   <td
-                    colSpan={5}
+                    colSpan={6}
                     className="px-3 py-6 text-center text-zinc-500"
                   >
                     No workspaces match the current filter.
                   </td>
                 </tr>
               ) : (
-                filtered.map((r) => (
-                  <tr key={`${r.agent}|${r.account}|${r.workspace}`}>
-                    <td className="px-3 py-2 font-mono">
-                      {r.agent}
-                      {!r.agent_online && (
-                        <span
-                          className="ml-2 text-xs px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-500"
-                          title="agent is not currently connected"
+                filtered.map((r) => {
+                  const rowKey = `${r.agent}|${r.account}|${r.workspace}`;
+                  const isDeleting = deletingKey === rowKey;
+                  return (
+                    <tr key={rowKey}>
+                      <td className="px-3 py-2 font-mono">{r.workspace}</td>
+                      <td className="px-3 py-2 font-mono">
+                        {r.agent}
+                        {!r.agent_online && (
+                          <span
+                            className="ml-2 text-xs px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-500"
+                            title="agent is not currently connected"
+                          >
+                            offline
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2 font-mono">{r.account}</td>
+                      <td className="px-3 py-2">
+                        <StatusBadge status={r.status} />
+                      </td>
+                      <td className="px-3 py-2 text-zinc-500">
+                        {r.last_started_at
+                          ? formatRelative(r.last_started_at)
+                          : '—'}
+                      </td>
+                      <td className="px-3 py-2 text-right">
+                        <button
+                          onClick={() => handleDelete(r)}
+                          disabled={isDeleting || r.status === 'active'}
+                          title={
+                            r.status === 'active'
+                              ? 'cannot delete a workspace that has an active client'
+                              : 'delete this workspace'
+                          }
+                          className="px-2 py-1 text-xs rounded border border-red-300 dark:border-red-800 text-red-700 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/30 disabled:opacity-40 disabled:cursor-not-allowed"
                         >
-                          offline
-                        </span>
-                      )}
-                    </td>
-                    <td className="px-3 py-2 font-mono">{r.account}</td>
-                    <td className="px-3 py-2 font-mono">{r.workspace}</td>
-                    <td className="px-3 py-2">
-                      <StatusBadge status={r.status} />
-                    </td>
-                    <td className="px-3 py-2 text-zinc-500">
-                      {r.last_started_at
-                        ? formatRelative(r.last_started_at)
-                        : '—'}
-                    </td>
-                  </tr>
-                ))
+                          {isDeleting ? 'Deleting…' : 'Delete'}
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })
               )}
             </tbody>
           </table>

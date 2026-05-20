@@ -1,85 +1,56 @@
-// Left sidebar tree: agents -> workspaces.
-// Expanded agents fetch workspaces via the control WS (handled by parent).
+// Flat workspace list — one row per workspace, sorted online-first then
+// agent↑ name↑. When two workspaces share a name across agents the display
+// label becomes "name@agent" (matches cloudcode CLI menu.rs convention).
 
-import { useState, useEffect } from 'react';
-import type { AgentItem, WorkspaceItem } from '@/lib/wire';
+import { useState, useEffect, useMemo } from 'react';
+import type { WorkspaceItem } from '@/lib/wire';
 import { KNOWN_TOOLS } from '@/lib/tools';
 
-type WorkspaceState =
-  | { status: 'idle' }
-  | { status: 'loading' }
-  | { status: 'loaded'; items: WorkspaceItem[] };
-
-export type AgentWorkspaceCache = Map<string, WorkspaceState>;
-
 type Props = {
-  agents: AgentItem[];
+  workspaces: WorkspaceItem[];
   loading: boolean;
-  cache: AgentWorkspaceCache;
-  /** "agent::workspace" keys that already have a tab — used so a
-   *  second click switches tabs instead of opening a duplicate. */
+  /** "agent::workspace" keys that already have a tab. */
   openTabKeys: Set<string>;
-  /** Key of the workspace whose tab is currently in focus (right pane).
-   *  Only this row gets the selected-row background. */
+  /** Key of the workspace whose tab is currently in focus. */
   activeTabKey: string | null;
-  onExpandAgent: (agent: string) => void;
   onOpenWorkspace: (agent: string, workspace: string, tool?: string) => void;
   onResetWorkspace: (agent: string, workspace: string) => void;
   onDeleteWorkspace: (agent: string, workspace: string) => void;
-  /** Triggered by the right-click context menu on an agent row,
-   *  pre-filling the "create workspace" dialog with this agent. */
-  onCreateWorkspaceFor: (agent: string) => void;
 };
 
-type AgentMenu = { x: number; y: number; agent: string };
 type WorkspaceMenu = { x: number; y: number; agent: string; workspace: string };
 
 export default function AgentTree({
-  agents,
+  workspaces,
   loading,
-  cache,
   openTabKeys,
   activeTabKey,
-  onExpandAgent,
   onOpenWorkspace,
   onResetWorkspace,
   onDeleteWorkspace,
-  onCreateWorkspaceFor,
 }: Props) {
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  const [agentMenu, setAgentMenu] = useState<AgentMenu | null>(null);
   const [wsMenu, setWsMenu] = useState<WorkspaceMenu | null>(null);
 
-  const hasAnyMenu = agentMenu !== null || wsMenu !== null;
-
-  // Close menus on Escape.
+  // Close menu on Escape.
   useEffect(() => {
-    if (!hasAnyMenu) return;
+    if (!wsMenu) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        setAgentMenu(null);
-        setWsMenu(null);
-      }
+      if (e.key === 'Escape') setWsMenu(null);
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [hasAnyMenu]);
+  }, [wsMenu]);
 
-  function closeAllMenus() {
-    setAgentMenu(null);
-    setWsMenu(null);
-  }
-
-  function toggleAgent(name: string) {
-    const next = new Set(expanded);
-    if (next.has(name)) {
-      next.delete(name);
-    } else {
-      next.add(name);
-      onExpandAgent(name);
-    }
-    setExpanded(next);
-  }
+  // Sorted list: online first, then by agent asc, then by name asc.
+  const sorted = useMemo(() => {
+    return [...workspaces].sort((a, b) => {
+      const onlineDiff =
+        (b.agent_online ? 1 : 0) - (a.agent_online ? 1 : 0);
+      if (onlineDiff !== 0) return onlineDiff;
+      if (a.agent !== b.agent) return a.agent.localeCompare(b.agent);
+      return a.name.localeCompare(b.name);
+    });
+  }, [workspaces]);
 
   if (loading) {
     return (
@@ -89,43 +60,23 @@ export default function AgentTree({
     );
   }
 
-  if (agents.length === 0) {
+  if (sorted.length === 0) {
     return (
-      <div className="px-3 py-2 text-xs text-zinc-400 dark:text-zinc-500">
-        No agents available.
+      <div className="px-3 py-2 text-xs text-zinc-400 dark:text-zinc-500 italic">
+        No workspaces yet.
       </div>
     );
   }
 
   return (
     <div className="flex-1 overflow-y-auto relative">
-      {/* Global backdrop for all context menus */}
-      {hasAnyMenu && (
+      {/* Global backdrop */}
+      {wsMenu && (
         <div
           className="fixed inset-0 z-40"
-          onClick={closeAllMenus}
-          onContextMenu={(e) => { e.preventDefault(); closeAllMenus(); }}
+          onClick={() => setWsMenu(null)}
+          onContextMenu={(e) => { e.preventDefault(); setWsMenu(null); }}
         />
-      )}
-
-      {/* Agent right-click context menu */}
-      {agentMenu && (
-        <div
-          className="fixed z-50 min-w-[10rem] bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-md shadow-lg py-1 text-xs font-mono"
-          style={{ left: agentMenu.x, top: agentMenu.y }}
-        >
-          <button
-            type="button"
-            onClick={() => {
-              const a = agentMenu.agent;
-              closeAllMenus();
-              onCreateWorkspaceFor(a);
-            }}
-            className="block w-full text-left px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200"
-          >
-            Create workspace…
-          </button>
-        </div>
       )}
 
       {/* Workspace right-click context menu */}
@@ -140,7 +91,7 @@ export default function AgentTree({
               type="button"
               onClick={() => {
                 const { agent, workspace } = wsMenu;
-                closeAllMenus();
+                setWsMenu(null);
                 onOpenWorkspace(agent, workspace, tool);
               }}
               className="block w-full text-left px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200"
@@ -153,10 +104,21 @@ export default function AgentTree({
             type="button"
             onClick={() => {
               const { agent, workspace } = wsMenu;
-              closeAllMenus();
+              setWsMenu(null);
+              // offline check: reset disallowed when agent is offline.
+              const item = workspaces.find(
+                (w) => w.agent === agent && w.name === workspace,
+              );
+              if (!item?.agent_online) return;
               onResetWorkspace(agent, workspace);
             }}
-            className="block w-full text-left px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200"
+            className={`block w-full text-left px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 ${
+              workspaces.find(
+                (w) => w.agent === wsMenu.agent && w.name === wsMenu.workspace,
+              )?.agent_online
+                ? 'text-zinc-700 dark:text-zinc-200'
+                : 'text-zinc-400 dark:text-zinc-600 cursor-not-allowed'
+            }`}
           >
             Reset
           </button>
@@ -164,7 +126,7 @@ export default function AgentTree({
             type="button"
             onClick={() => {
               const { agent, workspace } = wsMenu;
-              closeAllMenus();
+              setWsMenu(null);
               onDeleteWorkspace(agent, workspace);
             }}
             className="block w-full text-left px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-red-600 dark:text-red-400"
@@ -174,77 +136,33 @@ export default function AgentTree({
         </div>
       )}
 
-      {agents.map((agent) => {
-        const isExpanded = expanded.has(agent.name);
-        const wsState: WorkspaceState = cache.get(agent.name) ?? { status: 'idle' };
+      {sorted.map((ws) => {
+        const label = `${ws.name}@${ws.agent}`;
+        const key = `${ws.agent}::${ws.name}`;
+        const isLive = openTabKeys.has(key);
+        const isActive = activeTabKey === key;
 
         return (
-          <div key={agent.name}>
-            {/* Agent row */}
-            <button
-              type="button"
-              onClick={() => toggleAgent(agent.name)}
-              onContextMenu={(e) => {
-                e.preventDefault();
-                closeAllMenus();
-                setAgentMenu({ x: e.clientX, y: e.clientY, agent: agent.name });
-              }}
-              className={`w-full flex items-center gap-1.5 px-2 py-1 text-left text-xs font-mono transition-colors ${
-                agent.current === false
-                  ? 'text-zinc-400 dark:text-zinc-600 cursor-default'
-                  : agentMenu?.agent === agent.name
-                    ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100'
-                    : 'text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800'
-              }`}
-              aria-expanded={isExpanded}
-            >
-              {/* Chevron */}
-              <span
-                className={`shrink-0 transition-transform duration-150 ${isExpanded ? 'rotate-90' : ''}`}
-              >
-                <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
-                  <path d="M3 2L7 5L3 8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-              </span>
-              <span className="flex-1 truncate font-semibold">{agent.name}</span>
-            </button>
-
-            {/* Workspace list */}
-            {isExpanded && (
-              <div>
-                {wsState.status === 'loading' && (
-                  <div className="pl-7 pr-2 py-0.5 text-xs text-zinc-400 dark:text-zinc-500">
-                    ...
-                  </div>
-                )}
-                {wsState.status === 'loaded' && wsState.items.length === 0 && (
-                  <div className="pl-7 pr-2 py-0.5 text-xs text-zinc-400 dark:text-zinc-500 italic">
-                    no workspaces
-                  </div>
-                )}
-                {wsState.status === 'loaded' &&
-                  wsState.items.map((ws) => {
-                    const key = `${agent.name}::${ws.name}`;
-                    return (
-                      <WorkspaceRow
-                        key={ws.name}
-                        workspace={ws}
-                        isLive={openTabKeys.has(key)}
-                        isActive={activeTabKey === key}
-                        onOpen={() => onOpenWorkspace(agent.name, ws.name)}
-                        onOpenWithTool={(tool) => onOpenWorkspace(agent.name, ws.name, tool)}
-                        onReset={() => onResetWorkspace(agent.name, ws.name)}
-                        onDelete={() => onDeleteWorkspace(agent.name, ws.name)}
-                        onContextMenu={(x, y) => {
-                          closeAllMenus();
-                          setWsMenu({ x, y, agent: agent.name, workspace: ws.name });
-                        }}
-                      />
-                    );
-                  })}
-              </div>
-            )}
-          </div>
+          <WorkspaceRow
+            key={key}
+            workspace={ws}
+            label={label}
+            isLive={isLive}
+            isActive={isActive}
+            onOpen={() => {
+              if (!ws.agent_online) return;
+              onOpenWorkspace(ws.agent, ws.name);
+            }}
+            onOpenWithTool={(tool) => {
+              if (!ws.agent_online) return;
+              onOpenWorkspace(ws.agent, ws.name, tool);
+            }}
+            onReset={() => onResetWorkspace(ws.agent, ws.name)}
+            onDelete={() => onDeleteWorkspace(ws.agent, ws.name)}
+            onContextMenu={(x, y) => {
+              setWsMenu({ x, y, agent: ws.agent, workspace: ws.name });
+            }}
+          />
         );
       })}
     </div>
@@ -254,10 +172,6 @@ export default function AgentTree({
 // ── WorkspaceRow ─────────────────────────────────────────────────────────────
 
 function WorkspaceBadge({ ws, isLive }: { ws: WorkspaceItem; isLive: boolean }) {
-  // Live > active (tracked by an open tab in this UI) takes priority
-  // over hub-reported has_client, so the dot turns green the moment
-  // you click open even before the hub's workspace_list refresh
-  // arrives.
   if (isLive || ws.has_client) {
     return (
       <span className="text-emerald-500 font-bold" title="live">
@@ -281,6 +195,7 @@ function WorkspaceBadge({ ws, isLive }: { ws: WorkspaceItem; isLive: boolean }) 
 
 function WorkspaceRow({
   workspace,
+  label,
   isLive,
   isActive,
   onOpen,
@@ -290,9 +205,8 @@ function WorkspaceRow({
   onContextMenu,
 }: {
   workspace: WorkspaceItem;
-  /** This workspace has an open tab somewhere (= "live"). */
+  label: string;
   isLive: boolean;
-  /** This workspace's tab is the one currently in the right pane. */
   isActive: boolean;
   onOpen: () => void;
   onOpenWithTool: (tool: string) => void;
@@ -303,8 +217,11 @@ function WorkspaceRow({
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [dropdownPos, setDropdownPos] = useState<{ x: number; y: number } | null>(null);
 
+  const offline = !workspace.agent_online;
+
   function handleChevronClick(e: React.MouseEvent) {
     e.stopPropagation();
+    if (offline) return;
     if (dropdownOpen) {
       setDropdownOpen(false);
       setDropdownPos(null);
@@ -347,45 +264,60 @@ function WorkspaceRow({
       )}
 
       <div
-        className={`group flex items-center gap-1 pl-6 pr-1.5 py-0.5 text-xs font-mono cursor-pointer transition-colors ${
-          isActive
-            ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100'
-            : 'text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-zinc-900 dark:hover:text-zinc-100'
+        className={`group flex items-center gap-1 px-2 py-0.5 text-xs font-mono transition-colors ${
+          offline
+            ? 'text-zinc-400 dark:text-zinc-600 cursor-not-allowed'
+            : isActive
+              ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100 cursor-pointer'
+              : 'text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-zinc-900 dark:hover:text-zinc-100 cursor-pointer'
         }`}
         onClick={onOpen}
+        title={offline ? `agent '${workspace.agent}' is offline` : undefined}
         onContextMenu={(e) => {
           e.preventDefault();
           onContextMenu(e.clientX, e.clientY);
         }}
       >
-        {/* Status badge — fixed width for alignment */}
+        {/* Status badge */}
         <span className="w-3 text-center shrink-0">
           <WorkspaceBadge ws={workspace} isLive={isLive} />
         </span>
-        <span className="flex-1 truncate">{workspace.name}</span>
+        <span className="flex-1 truncate">{label}</span>
 
         {/* Action buttons — hover-visible */}
         <span className="shrink-0 flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-          {/* Tool selector chevron */}
+          {/* Tool selector chevron — disabled when offline */}
           <button
             onClick={handleChevronClick}
-            className="p-0.5 rounded text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors"
-            title="Open with tool..."
+            className={`p-0.5 rounded transition-colors ${
+              offline
+                ? 'text-zinc-300 dark:text-zinc-700 cursor-not-allowed'
+                : 'text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 hover:bg-zinc-200 dark:hover:bg-zinc-700'
+            }`}
+            title={offline ? 'Agent is offline' : 'Open with tool...'}
             aria-label={`Open ${workspace.name} with specific tool`}
+            disabled={offline}
           >
             <ChevronDownIcon />
           </button>
+          {/* Reset — disabled when offline */}
           <button
             onClick={(e) => {
               e.stopPropagation();
-              onReset();
+              if (!offline) onReset();
             }}
-            className="p-0.5 rounded text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors"
-            title={`Reset ${workspace.name}`}
+            className={`p-0.5 rounded transition-colors ${
+              offline
+                ? 'text-zinc-300 dark:text-zinc-700 cursor-not-allowed'
+                : 'text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 hover:bg-zinc-200 dark:hover:bg-zinc-700'
+            }`}
+            title={offline ? 'Agent is offline' : `Reset ${workspace.name}`}
             aria-label={`Reset workspace ${workspace.name}`}
+            disabled={offline}
           >
             <ResetIcon />
           </button>
+          {/* Delete — always enabled */}
           <button
             onClick={(e) => {
               e.stopPropagation();
@@ -404,8 +336,6 @@ function WorkspaceRow({
 }
 
 // ── Icons ────────────────────────────────────────────────────────────────────
-// Inline so they inherit currentColor and don't need a separate
-// icon-pack dependency. Sized to sit on a one-line tree row.
 
 function ChevronDownIcon() {
   return (
@@ -426,10 +356,6 @@ function ChevronDownIcon() {
 }
 
 function ResetIcon() {
-  // Lucide-style rotate-ccw: the arc has a real gap before its ends,
-  // and the arrow sits in that gap pointing back into the loop, so
-  // the head and tail aren't crammed together the way they were on
-  // the previous open-ended arc.
   return (
     <svg
       width="12"

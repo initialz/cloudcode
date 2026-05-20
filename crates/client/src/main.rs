@@ -197,6 +197,20 @@ pub fn clear_last_agent() {
     }
 }
 
+/// New single-stage menu's cursor restore. Stored as `<agent>|<name>`
+/// in one file so the picker can position the highlight on the
+/// previously-picked workspace regardless of which agent it lived on.
+pub fn read_last_workspace_global() -> Option<String> {
+    read_text_file(&state_dir().ok()?.join("last_workspace_global"))
+}
+
+pub fn write_last_workspace_global(agent: &str, name: &str) {
+    if let Ok(dir) = state_dir() {
+        let path = dir.join("last_workspace_global");
+        write_text_file(&path, &format!("{}|{}", agent, name));
+    }
+}
+
 pub fn read_last_workspace(agent: &str) -> Option<String> {
     read_text_file(&last_workspace_path(agent).ok()?)
 }
@@ -308,25 +322,22 @@ async fn run_chat(
     };
 
     let mut bytes = input::spawn_byte_reader();
-    // First-launch entry: if --agent or a remembered last_agent
-    // exists, jump straight to that agent's workspace picker. The
-    // menu falls back to the agent picker on any miss (agent offline
-    // / no ACL / hub rejects).
-    let mut next_start: menu::MenuStart = match agent_flag.or_else(read_last_agent) {
-        Some(agent) => menu::MenuStart::WorkspacePicker { agent },
-        None => menu::MenuStart::AgentPicker,
-    };
-
+    // v1.13: single-stage menu. The picker always shows every
+    // workspace bound to this account (across all agents), the
+    // cursor restores from `last_workspace_global`, and Enter
+    // routes directly into the bound agent. `--agent` and the
+    // legacy `last_agent` files are silently ignored — workspace
+    // identity now includes the agent.
+    let _ = agent_flag;
     loop {
-        let outcome = menu::run(&mut wire, &mut bytes, &account_name, next_start).await?;
-        // Default for the next iteration; overridden after a successful PTY.
-        next_start = menu::MenuStart::AgentPicker;
+        let outcome = menu::run(&mut wire, &mut bytes, &account_name).await?;
         match outcome {
             menu::MenuOutcome::OpenWorkspace { agent, workspace } => {
                 let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
                 wire.out_tx
                     .send(OutFrame::Text(ClientToHub::OpenSession {
                         workspace: workspace.clone(),
+                        agent: agent.clone(),
                         cols,
                         rows,
                         claude_args: claude_args.clone(),
@@ -355,21 +366,10 @@ async fn run_chat(
                 if !opened {
                     continue;
                 }
-                write_last_workspace(&agent, &workspace);
+                write_last_workspace_global(&agent, &workspace);
                 relay::run(&mut wire, &mut bytes).await.ok();
-                // Back to menu — land on the same agent's workspace
-                // picker, not the top-level agent picker.
-                next_start = menu::MenuStart::WorkspacePicker { agent };
             }
-            menu::MenuOutcome::Quit { from_agent_picker } => {
-                // Quitting at the agent picker == "I'm done with the
-                // CLI, not just this workspace" — clear the
-                // remembered agent so the next launch lands on the
-                // agent picker again instead of auto-jumping into
-                // the last agent's workspace picker.
-                if from_agent_picker {
-                    clear_last_agent();
-                }
+            menu::MenuOutcome::Quit => {
                 let _ = wire.out_tx.send(OutFrame::Text(ClientToHub::Close)).await;
                 return Ok(());
             }

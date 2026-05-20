@@ -394,92 +394,147 @@ where
             true
         }
         ClientToHub::ListWorkspaces => {
-            let Some(conn) = ctx.selected_agent.clone() else {
-                let _ = send_client(
-                    sink,
-                    &HubToClient::SessionError {
-                        message: "no agent selected".into(),
-                    },
-                )
-                .await;
-                return true;
-            };
-            let request_id = Uuid::new_v4();
-            let (tx, rx) = oneshot::channel();
-            conn.register_workspace_request(request_id, tx);
-            if conn
-                .send(ServerMsg::WorkspaceList {
-                    request_id,
-                    account: ctx.account_name.clone(),
-                })
+            // v1.13: workspaces are bound to agents in hub's `workspaces`
+            // table at create time. Listing reads straight from the DB
+            // — no longer per-agent — and decorates each row with
+            // whether the bound agent is currently registered + whether
+            // a client is already attached. `tmux_alive` is left false
+            // here; without a round-trip to each agent we can't tell,
+            // and the picker doesn't surface it anyway in the new flow.
+            let bindings = match ctx
+                .state
+                .db
+                .list_workspaces_for_account(&ctx.account_name)
                 .await
-                .is_err()
             {
-                let _ = send_client(
-                    sink,
-                    &HubToClient::SessionError {
-                        message: "agent disconnected".into(),
-                    },
-                )
-                .await;
-                return true;
-            }
-            match tokio::time::timeout(WORKSPACE_REQUEST_TIMEOUT, rx).await {
-                Ok(Ok(ClientMsg::WorkspaceListResult { items, error, .. })) => match error {
-                    Some(e) => {
-                        let _ = send_client(sink, &HubToClient::SessionError { message: e }).await;
-                    }
-                    None => {
-                        // Decorate each item with whether a cloudcode
-                        // client is currently attached (look it up in
-                        // the global workspace mutex). tmux_alive came
-                        // straight from the agent.
-                        let agent_name = conn.name.clone();
-                        let account = ctx.account_name.clone();
-                        let infos: Vec<crate::pty_proto::WorkspaceInfo> = items
-                            .into_iter()
-                            .map(|it| {
-                                let key =
-                                    (agent_name.clone(), account.clone(), it.name.clone());
-                                let has_client =
-                                    ctx.state.workspaces.contains_key(&key);
-                                crate::pty_proto::WorkspaceInfo {
-                                    name: it.name,
-                                    tmux_alive: it.tmux_alive,
-                                    has_client,
-                                }
-                            })
-                            .collect();
-                        let _ = send_client(
-                            sink,
-                            &HubToClient::WorkspaceList { items: infos },
-                        )
-                        .await;
-                    }
-                },
-                _ => {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(error = %e, "list_workspaces_for_account failed");
                     let _ = send_client(
                         sink,
                         &HubToClient::SessionError {
-                            message: "workspace list timed out".into(),
+                            message: "could not list workspaces".into(),
                         },
                     )
                     .await;
+                    return true;
                 }
-            }
+            };
+            // Filter to the ACL — if an admin revoked the account's
+            // access to an agent after a workspace was created on it,
+            // the picker shouldn't keep advertising that workspace.
+            let allowed = match ctx
+                .state
+                .db
+                .list_allowed_agents(&ctx.account_name)
+                .await
+            {
+                Ok(v) => v.into_iter().collect::<std::collections::HashSet<_>>(),
+                Err(_) => Default::default(),
+            };
+            let infos: Vec<crate::pty_proto::WorkspaceInfo> = bindings
+                .into_iter()
+                .filter(|b| allowed.contains(&b.agent))
+                .map(|b| {
+                    let agent_online = ctx.state.registry.get(&b.agent).is_some();
+                    let key = (
+                        b.agent.clone(),
+                        ctx.account_name.clone(),
+                        b.name.clone(),
+                    );
+                    let has_client = ctx.state.workspaces.contains_key(&key);
+                    crate::pty_proto::WorkspaceInfo {
+                        name: b.name,
+                        agent: b.agent,
+                        agent_online,
+                        tmux_alive: false,
+                        has_client,
+                    }
+                })
+                .collect();
+            let _ = send_client(sink, &HubToClient::WorkspaceList { items: infos }).await;
             true
         }
-        ClientToHub::CreateWorkspace { name } => {
-            let Some(conn) = ctx.selected_agent.clone() else {
+        ClientToHub::CreateWorkspace { name, agent } => {
+            // v1.13: client picks the owning agent at creation time
+            // and carries it on the wire. Hub validates the ACL,
+            // inserts the binding (UNIQUE on (account, agent, name)
+            // → duplicate gives a clean SessionError), then asks the
+            // agent to mkdir its on-disk slot.
+            if name.trim().is_empty() || agent.trim().is_empty() {
                 let _ = send_client(
                     sink,
                     &HubToClient::SessionError {
-                        message: "no agent selected".into(),
+                        message: "workspace name and agent are required".into(),
+                    },
+                )
+                .await;
+                return true;
+            }
+            match ctx
+                .state
+                .db
+                .is_agent_allowed(&ctx.account_name, &agent)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    let _ = send_client(
+                        sink,
+                        &HubToClient::SessionError {
+                            message: format!(
+                                "account '{}' is not allowed to use agent '{}'",
+                                ctx.account_name, agent
+                            ),
+                        },
+                    )
+                    .await;
+                    return true;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "is_agent_allowed failed during CreateWorkspace");
+                    let _ = send_client(
+                        sink,
+                        &HubToClient::SessionError {
+                            message: "internal error".into(),
+                        },
+                    )
+                    .await;
+                    return true;
+                }
+            }
+            let Some(conn) = ctx.state.registry.get(&agent) else {
+                let _ = send_client(
+                    sink,
+                    &HubToClient::SessionError {
+                        message: format!("agent '{}' is offline", agent),
                     },
                 )
                 .await;
                 return true;
             };
+            // Record the binding first. If the agent then fails to
+            // create the dir we rollback below — better than a
+            // half-created state with the agent owning a dir nobody
+            // can find.
+            if let Err(e) = ctx
+                .state
+                .db
+                .insert_workspace_binding(&ctx.account_name, &agent, &name)
+                .await
+            {
+                let msg = e.to_string();
+                let display = if msg.contains("UNIQUE") {
+                    format!(
+                        "workspace '{}' already exists on agent '{}'",
+                        name, agent
+                    )
+                } else {
+                    format!("could not record workspace binding: {msg}")
+                };
+                let _ = send_client(sink, &HubToClient::SessionError { message: display }).await;
+                return true;
+            }
             let request_id = Uuid::new_v4();
             let (tx, rx) = oneshot::channel();
             conn.register_workspace_request(request_id, tx);
@@ -492,6 +547,13 @@ where
                 .await
                 .is_err()
             {
+                // Rollback the binding so the user can retry on a
+                // different agent / after the offending one reconnects.
+                let _ = ctx
+                    .state
+                    .db
+                    .delete_workspace_binding(&ctx.account_name, &agent, &name)
+                    .await;
                 let _ = send_client(
                     sink,
                     &HubToClient::SessionError {
@@ -504,6 +566,11 @@ where
             match tokio::time::timeout(WORKSPACE_REQUEST_TIMEOUT, rx).await {
                 Ok(Ok(ClientMsg::WorkspaceCreateResult { error, .. })) => match error {
                     Some(e) => {
+                        let _ = ctx
+                            .state
+                            .db
+                            .delete_workspace_binding(&ctx.account_name, &agent, &name)
+                            .await;
                         let _ = send_client(sink, &HubToClient::SessionError { message: e }).await;
                     }
                     None => {
@@ -511,6 +578,11 @@ where
                     }
                 },
                 _ => {
+                    let _ = ctx
+                        .state
+                        .db
+                        .delete_workspace_binding(&ctx.account_name, &agent, &name)
+                        .await;
                     let _ = send_client(
                         sink,
                         &HubToClient::SessionError {
@@ -522,142 +594,17 @@ where
             }
             true
         }
-        ClientToHub::DeleteWorkspace { name } => {
-            let Some(conn) = ctx.selected_agent.clone() else {
-                let _ = send_client(
-                    sink,
-                    &HubToClient::SessionError {
-                        message: "no agent selected".into(),
-                    },
-                )
-                .await;
-                return true;
-            };
-            if ctx.state.workspaces.contains_key(&(
-                conn.name.clone(),
-                ctx.account_name.clone(),
-                name.clone(),
-            )) {
-                let _ = send_client(
-                    sink,
-                    &HubToClient::SessionError {
-                        message: format!("workspace '{}' is currently in use", name),
-                    },
-                )
-                .await;
-                return true;
-            }
-            let request_id = Uuid::new_v4();
-            let (tx, rx) = oneshot::channel();
-            conn.register_workspace_request(request_id, tx);
-            if conn
-                .send(ServerMsg::WorkspaceDelete {
-                    request_id,
-                    account: ctx.account_name.clone(),
-                    name: name.clone(),
-                })
-                .await
-                .is_err()
-            {
-                let _ = send_client(
-                    sink,
-                    &HubToClient::SessionError {
-                        message: "agent disconnected".into(),
-                    },
-                )
-                .await;
-                return true;
-            }
-            match tokio::time::timeout(WORKSPACE_REQUEST_TIMEOUT, rx).await {
-                Ok(Ok(ClientMsg::WorkspaceDeleteResult { error, .. })) => match error {
-                    Some(e) => {
-                        let _ = send_client(sink, &HubToClient::SessionError { message: e }).await;
-                    }
-                    None => {
-                        let _ = send_client(sink, &HubToClient::WorkspaceDeleted { name }).await;
-                    }
-                },
-                _ => {
-                    let _ = send_client(
-                        sink,
-                        &HubToClient::SessionError {
-                            message: "workspace delete timed out".into(),
-                        },
-                    )
-                    .await;
-                }
-            }
+        ClientToHub::DeleteWorkspace { name, agent } => {
+            handle_workspace_op(ctx, sink, &name, &agent, WorkspaceOp::Delete).await;
             true
         }
-        ClientToHub::ResetWorkspace { name } => {
-            let Some(conn) = ctx.selected_agent.clone() else {
-                let _ = send_client(
-                    sink,
-                    &HubToClient::SessionError {
-                        message: "no agent selected".into(),
-                    },
-                )
-                .await;
-                return true;
-            };
-            if ctx.state.workspaces.contains_key(&(
-                conn.name.clone(),
-                ctx.account_name.clone(),
-                name.clone(),
-            )) {
-                let _ = send_client(
-                    sink,
-                    &HubToClient::SessionError {
-                        message: format!("workspace '{}' is currently in use", name),
-                    },
-                )
-                .await;
-                return true;
-            }
-            let request_id = Uuid::new_v4();
-            let (tx, rx) = oneshot::channel();
-            conn.register_workspace_request(request_id, tx);
-            if conn
-                .send(ServerMsg::WorkspaceReset {
-                    request_id,
-                    account: ctx.account_name.clone(),
-                    name: name.clone(),
-                })
-                .await
-                .is_err()
-            {
-                let _ = send_client(
-                    sink,
-                    &HubToClient::SessionError {
-                        message: "agent disconnected".into(),
-                    },
-                )
-                .await;
-                return true;
-            }
-            match tokio::time::timeout(WORKSPACE_REQUEST_TIMEOUT, rx).await {
-                Ok(Ok(ClientMsg::WorkspaceResetResult { error, .. })) => match error {
-                    Some(e) => {
-                        let _ = send_client(sink, &HubToClient::SessionError { message: e }).await;
-                    }
-                    None => {
-                        let _ = send_client(sink, &HubToClient::WorkspaceReset { name }).await;
-                    }
-                },
-                _ => {
-                    let _ = send_client(
-                        sink,
-                        &HubToClient::SessionError {
-                            message: "workspace reset timed out".into(),
-                        },
-                    )
-                    .await;
-                }
-            }
+        ClientToHub::ResetWorkspace { name, agent } => {
+            handle_workspace_op(ctx, sink, &name, &agent, WorkspaceOp::Reset).await;
             true
         }
         ClientToHub::OpenSession {
             workspace,
+            agent,
             cols,
             rows,
             claude_args,
@@ -673,16 +620,88 @@ where
                 .await;
                 return true;
             }
-            let Some(conn) = ctx.selected_agent.clone() else {
+            // v1.13: route by the workspace's bound agent — no
+            // separate SelectAgent step required. Verify the
+            // binding exists, the account is ACL'd for the agent,
+            // and the agent is online.
+            match ctx
+                .state
+                .db
+                .get_workspace_agent(&ctx.account_name, &agent, &workspace)
+                .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    let _ = send_client(
+                        sink,
+                        &HubToClient::SessionError {
+                            message: format!(
+                                "workspace '{}' on agent '{}' does not exist",
+                                workspace, agent
+                            ),
+                        },
+                    )
+                    .await;
+                    return true;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "get_workspace_agent during OpenSession");
+                    let _ = send_client(
+                        sink,
+                        &HubToClient::SessionError {
+                            message: "internal error".into(),
+                        },
+                    )
+                    .await;
+                    return true;
+                }
+            }
+            match ctx
+                .state
+                .db
+                .is_agent_allowed(&ctx.account_name, &agent)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    let _ = send_client(
+                        sink,
+                        &HubToClient::SessionError {
+                            message: format!(
+                                "account '{}' is not allowed to use agent '{}'",
+                                ctx.account_name, agent
+                            ),
+                        },
+                    )
+                    .await;
+                    return true;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "is_agent_allowed during OpenSession");
+                    let _ = send_client(
+                        sink,
+                        &HubToClient::SessionError {
+                            message: "internal error".into(),
+                        },
+                    )
+                    .await;
+                    return true;
+                }
+            }
+            let Some(conn) = ctx.state.registry.get(&agent) else {
                 let _ = send_client(
                     sink,
                     &HubToClient::SessionError {
-                        message: "no agent selected".into(),
+                        message: format!("agent '{}' is offline", agent),
                     },
                 )
                 .await;
                 return true;
             };
+            // Cache the connection on ctx so subsequent in-session
+            // ops (Resize, Close) still find it via the existing
+            // selected_agent path.
+            ctx.selected_agent = Some(conn.clone());
             let session_id = Uuid::new_v4();
             let key = (
                 conn.name.clone(),
@@ -939,6 +958,222 @@ where
 
 /// Read the user's webterm preferences blob for `account` and pull
 /// out the default args for `tool`. The blob is opaque JSON owned by
+#[derive(Clone, Copy)]
+enum WorkspaceOp {
+    Delete,
+    Reset,
+}
+
+/// Shared body of Delete / Reset — they only differ in the wire
+/// frame they send the agent and the success reply they send the
+/// client. Both:
+///   1. Verify the (account, agent, name) binding exists in the DB.
+///   2. Refuse if the workspace is currently in use (`state.workspaces`
+///      contains the (agent, account, name) tuple — set during
+///      OpenSession, cleared on close).
+///   3. Look up the live agent conn; bail if it's offline.
+///   4. Forward the op via the existing WorkspaceRequest plumbing.
+///   5. On Delete success, drop the DB binding too.
+async fn handle_workspace_op<S>(
+    ctx: &mut ConnCtx,
+    sink: &mut S,
+    name: &str,
+    agent: &str,
+    op: WorkspaceOp,
+) where
+    S: SinkExt<Message, Error = axum::Error> + Unpin,
+{
+    let label = match op {
+        WorkspaceOp::Delete => "delete",
+        WorkspaceOp::Reset => "reset",
+    };
+    match ctx
+        .state
+        .db
+        .get_workspace_agent(&ctx.account_name, agent, name)
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let _ = send_client(
+                sink,
+                &HubToClient::SessionError {
+                    message: format!(
+                        "workspace '{}' on agent '{}' does not exist",
+                        name, agent
+                    ),
+                },
+            )
+            .await;
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "get_workspace_agent failed");
+            let _ = send_client(
+                sink,
+                &HubToClient::SessionError {
+                    message: "internal error".into(),
+                },
+            )
+            .await;
+            return;
+        }
+    }
+    if ctx.state.workspaces.contains_key(&(
+        agent.to_string(),
+        ctx.account_name.clone(),
+        name.to_string(),
+    )) {
+        let _ = send_client(
+            sink,
+            &HubToClient::SessionError {
+                message: format!("workspace '{}' is currently in use", name),
+            },
+        )
+        .await;
+        return;
+    }
+    let conn = match ctx.state.registry.get(agent) {
+        Some(c) => c,
+        None => {
+            // Agent offline. Reset needs the agent (tmux state lives
+            // there), so we still bail. Delete can degrade gracefully:
+            // drop the hub-side binding so the row stops haunting the
+            // picker. The on-disk dir on the dead agent stays put —
+            // when/if that agent comes back the Hello re-seed will
+            // re-create the binding, which matches the user's mental
+            // model ("workspace came back when the agent did").
+            match op {
+                WorkspaceOp::Delete => {
+                    if let Err(e) = ctx
+                        .state
+                        .db
+                        .delete_workspace_binding(&ctx.account_name, agent, name)
+                        .await
+                    {
+                        tracing::warn!(error = %e, "delete_workspace_binding (offline path)");
+                        let _ = send_client(
+                            sink,
+                            &HubToClient::SessionError {
+                                message: "could not delete binding".into(),
+                            },
+                        )
+                        .await;
+                        return;
+                    }
+                    tracing::info!(
+                        agent = %agent,
+                        account = %ctx.account_name,
+                        workspace = %name,
+                        "user deleted workspace binding while agent offline"
+                    );
+                    let _ = send_client(
+                        sink,
+                        &HubToClient::WorkspaceDeleted {
+                            name: name.to_string(),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+                WorkspaceOp::Reset => {
+                    let _ = send_client(
+                        sink,
+                        &HubToClient::SessionError {
+                            message: format!("agent '{}' is offline", agent),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+    };
+    let request_id = Uuid::new_v4();
+    let (tx, rx) = oneshot::channel();
+    conn.register_workspace_request(request_id, tx);
+    let send_result = match op {
+        WorkspaceOp::Delete => {
+            conn.send(ServerMsg::WorkspaceDelete {
+                request_id,
+                account: ctx.account_name.clone(),
+                name: name.to_string(),
+            })
+            .await
+        }
+        WorkspaceOp::Reset => {
+            conn.send(ServerMsg::WorkspaceReset {
+                request_id,
+                account: ctx.account_name.clone(),
+                name: name.to_string(),
+            })
+            .await
+        }
+    };
+    if send_result.is_err() {
+        let _ = send_client(
+            sink,
+            &HubToClient::SessionError {
+                message: "agent disconnected".into(),
+            },
+        )
+        .await;
+        return;
+    }
+    let response = tokio::time::timeout(WORKSPACE_REQUEST_TIMEOUT, rx).await;
+    match (op, response) {
+        (WorkspaceOp::Delete, Ok(Ok(ClientMsg::WorkspaceDeleteResult { error, .. }))) => {
+            match error {
+                Some(e) => {
+                    let _ = send_client(sink, &HubToClient::SessionError { message: e }).await;
+                }
+                None => {
+                    if let Err(e) = ctx
+                        .state
+                        .db
+                        .delete_workspace_binding(&ctx.account_name, agent, name)
+                        .await
+                    {
+                        tracing::warn!(error = %e, "delete_workspace_binding (post-agent-ack)");
+                    }
+                    let _ = send_client(
+                        sink,
+                        &HubToClient::WorkspaceDeleted {
+                            name: name.to_string(),
+                        },
+                    )
+                    .await;
+                }
+            }
+        }
+        (WorkspaceOp::Reset, Ok(Ok(ClientMsg::WorkspaceResetResult { error, .. }))) => {
+            match error {
+                Some(e) => {
+                    let _ = send_client(sink, &HubToClient::SessionError { message: e }).await;
+                }
+                None => {
+                    let _ = send_client(
+                        sink,
+                        &HubToClient::WorkspaceReset {
+                            name: name.to_string(),
+                        },
+                    )
+                    .await;
+                }
+            }
+        }
+        _ => {
+            let _ = send_client(
+                sink,
+                &HubToClient::SessionError {
+                    message: format!("workspace {label} timed out"),
+                },
+            )
+            .await;
+        }
+    }
+}
+
 /// webterm; we know its current shape is `{tool_args: {<tool>:
 /// [String, ...]}}`. Any deviation (missing row, bad JSON, wrong
 /// shape, unknown tool) maps to an empty argv — matching webterm's

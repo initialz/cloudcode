@@ -20,10 +20,14 @@ export type ClientMsg =
   | { type: 'list_agents' }
   | { type: 'select_agent'; agent: string | null }
   | { type: 'list_workspaces' }
-  | { type: 'create_workspace'; name: string }
-  | { type: 'delete_workspace'; name: string }
-  | { type: 'reset_workspace'; name: string }
-  | { type: 'open_session'; workspace: string; cols: number; rows: number; claude_args?: string[]; tool?: string }
+  // v1.13: every workspace-targeting frame carries an explicit
+  // `agent`. The owning agent is locked in at create time and the
+  // UI propagates it through every subsequent op so the hub never
+  // has to guess.
+  | { type: 'create_workspace'; name: string; agent: string }
+  | { type: 'delete_workspace'; name: string; agent: string }
+  | { type: 'reset_workspace'; name: string; agent: string }
+  | { type: 'open_session'; workspace: string; agent: string; cols: number; rows: number; claude_args?: string[]; tool?: string }
   | { type: 'split_pane'; tool: string; direction: SplitDirection; args?: string[] }
   | { type: 'change_layout'; layout: PaneLayout }
   | { type: 'resize'; cols: number; rows: number }
@@ -33,7 +37,16 @@ export type ClientMsg =
 // ── Hub → Client ────────────────────────────────────────────────────────────
 
 export type AgentItem = { name: string; current: boolean };
-export type WorkspaceItem = { name: string; tmux_alive: boolean; has_client: boolean };
+// `agent` + `agent_online` are required as of v1.13. Older hubs may
+// omit them; consumers should treat missing `agent_online` as false
+// (i.e. don't allow opening).
+export type WorkspaceItem = {
+  name: string;
+  agent: string;
+  agent_online: boolean;
+  tmux_alive: boolean;
+  has_client: boolean;
+};
 
 export type HubMsg =
   | { type: 'welcome'; account: string }

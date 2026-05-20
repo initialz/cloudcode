@@ -188,6 +188,10 @@ pub fn router(state: AdminState) -> Router {
             get(api::workspaces_list).route_layer(gate.clone()),
         )
         .route(
+            "/admin/api/workspaces/delete",
+            post(api::workspace_delete).route_layer(gate.clone()),
+        )
+        .route(
             "/admin/api/audit",
             get(api::audit_list).route_layer(gate.clone()),
         )

@@ -53,6 +53,16 @@ pub enum ClientMsg {
         /// Used by the hub to pick the right release asset on self-update.
         #[serde(default)]
         target_triple: Option<String>,
+        /// Workspaces the agent has on local disk, formatted as
+        /// `"<account>/<name>"`. Hub uses this on connect to seed
+        /// its `workspaces` table for any name it hasn't seen before
+        /// (one-time migration from the pre-v1.13 per-agent model).
+        /// New rows are inserted with `INSERT OR IGNORE` so we don't
+        /// stomp on existing bindings — first agent to report a
+        /// given `(account, name)` wins. Older agents simply omit
+        /// this field; hub treats them as if they had no workspaces.
+        #[serde(default)]
+        workspaces: Vec<String>,
     },
     Pong,
 

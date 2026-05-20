@@ -1,19 +1,18 @@
-// Left sidebar: agent/workspace tree + create workspace + account footer.
+// Left sidebar: flat workspace list + "+ New workspace" button + account footer.
 
 import { useState } from 'react';
 import Logo from '@/components/Logo';
-import AgentTree, { AgentWorkspaceCache } from '@/components/AgentTree';
+import AgentTree from '@/components/AgentTree';
 import ConfirmDialog from '@/components/ConfirmDialog';
-import type { AgentItem } from '@/lib/wire';
+import type { AgentItem, WorkspaceItem } from '@/lib/wire';
 
 type Props = {
   account: string;
   agents: AgentItem[];
   agentsLoading: boolean;
-  cache: AgentWorkspaceCache;
+  workspaces: WorkspaceItem[];
   openTabKeys: Set<string>;
   activeTabKey: string | null;
-  onExpandAgent: (agent: string) => void;
   onOpenWorkspace: (agent: string, workspace: string, tool?: string) => void;
   onCreateWorkspace: (agent: string, name: string) => void;
   onResetWorkspace: (agent: string, workspace: string) => void;
@@ -34,10 +33,9 @@ export default function Sidebar({
   account,
   agents,
   agentsLoading,
-  cache,
+  workspaces,
   openTabKeys,
   activeTabKey,
-  onExpandAgent,
   onOpenWorkspace,
   onCreateWorkspace,
   onResetWorkspace,
@@ -48,24 +46,37 @@ export default function Sidebar({
   const [showCreate, setShowCreate] = useState(false);
   const [createAgent, setCreateAgent] = useState('');
   const [createName, setCreateName] = useState('');
+  const [createError, setCreateError] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<ConfirmState | null>(null);
 
-  function openCreate(forAgent?: string) {
-    // Pre-select the agent the caller named (right-click flow), else
-    // fall back to the first available one (the "+ create workspace"
-    // button at the bottom of the sidebar).
-    if (forAgent) setCreateAgent(forAgent);
-    else if (agents.length > 0) setCreateAgent(agents[0].name);
+  function openCreate() {
+    // Default to the first available agent.
+    if (agents.length > 0) setCreateAgent(agents[0].name);
     setCreateName('');
+    setCreateError(null);
     setShowCreate(true);
   }
 
   function submitCreate() {
     const name = createName.trim();
     if (!name || !createAgent) return;
+    // Same-agent uniqueness: catch the collision client-side so we
+    // can keep the modal open with an inline error instead of letting
+    // the hub bounce back a SessionError toast that closes the
+    // dialog and forces a retry from scratch.
+    const clash = workspaces.some(
+      (w) => w.agent === createAgent && w.name === name,
+    );
+    if (clash) {
+      setCreateError(
+        `Workspace "${name}" already exists on agent "${createAgent}".`,
+      );
+      return;
+    }
     onCreateWorkspace(createAgent, name);
     setShowCreate(false);
     setCreateName('');
+    setCreateError(null);
   }
 
   function askReset(agent: string, workspace: string) {
@@ -105,19 +116,29 @@ export default function Sidebar({
           </span>
         </div>
 
-        {/* Tree */}
+        {/* "+ New workspace" button — pinned below header */}
+        <div className="shrink-0 px-2 pt-2 pb-1">
+          <button
+            type="button"
+            onClick={openCreate}
+            disabled={agents.length === 0}
+            className="w-full flex items-center gap-1.5 px-2 py-1.5 rounded-md text-xs font-mono font-medium text-zinc-600 dark:text-zinc-300 bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-700 hover:text-zinc-900 dark:hover:text-zinc-100 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+          >
+            <PlusIcon />
+            New workspace
+          </button>
+        </div>
+
+        {/* Flat workspace list */}
         <div className="flex-1 overflow-y-auto py-1">
           <AgentTree
-            agents={agents}
+            workspaces={workspaces}
             loading={agentsLoading}
-            cache={cache}
             openTabKeys={openTabKeys}
             activeTabKey={activeTabKey}
-            onExpandAgent={onExpandAgent}
             onOpenWorkspace={onOpenWorkspace}
             onResetWorkspace={askReset}
             onDeleteWorkspace={askDelete}
-            onCreateWorkspaceFor={openCreate}
           />
         </div>
 
@@ -154,11 +175,32 @@ export default function Sidebar({
 
             <div className="mb-3">
               <label className="block text-xs font-medium text-zinc-500 dark:text-zinc-400 mb-1 uppercase tracking-wide">
+                Name
+              </label>
+              <input
+                type="text"
+                placeholder="workspace name"
+                value={createName}
+                onChange={(e) => {
+                  setCreateName(e.target.value);
+                  if (createError) setCreateError(null);
+                }}
+                onKeyDown={(e) => e.key === 'Enter' && submitCreate()}
+                autoFocus
+                className="w-full rounded-lg border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-800 px-3 py-2 text-sm text-zinc-900 dark:text-zinc-100 placeholder-zinc-400 focus:outline-none focus:ring-2 focus:ring-zinc-500 font-mono"
+              />
+            </div>
+
+            <div className="mb-4">
+              <label className="block text-xs font-medium text-zinc-500 dark:text-zinc-400 mb-1 uppercase tracking-wide">
                 Agent
               </label>
               <select
                 value={createAgent}
-                onChange={(e) => setCreateAgent(e.target.value)}
+                onChange={(e) => {
+                  setCreateAgent(e.target.value);
+                  if (createError) setCreateError(null);
+                }}
                 className="w-full rounded-lg border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-800 px-3 py-2 text-sm text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-zinc-500 font-mono"
               >
                 {agents.map((a) => (
@@ -169,20 +211,11 @@ export default function Sidebar({
               </select>
             </div>
 
-            <div className="mb-4">
-              <label className="block text-xs font-medium text-zinc-500 dark:text-zinc-400 mb-1 uppercase tracking-wide">
-                Name
-              </label>
-              <input
-                type="text"
-                placeholder="workspace name"
-                value={createName}
-                onChange={(e) => setCreateName(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && submitCreate()}
-                autoFocus
-                className="w-full rounded-lg border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-800 px-3 py-2 text-sm text-zinc-900 dark:text-zinc-100 placeholder-zinc-400 focus:outline-none focus:ring-2 focus:ring-zinc-500 font-mono"
-              />
-            </div>
+            {createError && (
+              <div className="mb-3 rounded-md border-l-2 border-red-500 bg-red-50 dark:bg-red-950/30 px-3 py-2 text-xs text-red-700 dark:text-red-300">
+                {createError}
+              </div>
+            )}
 
             <div className="flex gap-2 justify-end">
               <button
@@ -215,5 +248,25 @@ export default function Sidebar({
         />
       )}
     </>
+  );
+}
+
+// ── Icons ────────────────────────────────────────────────────────────────────
+
+function PlusIcon() {
+  return (
+    <svg
+      width="12"
+      height="12"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <path d="M12 5v14M5 12h14" />
+    </svg>
   );
 }

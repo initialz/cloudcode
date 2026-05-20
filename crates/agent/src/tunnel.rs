@@ -53,6 +53,12 @@ pub enum ClientMsg {
         /// Used by the hub to pick the right release asset on self-update.
         #[serde(default)]
         target_triple: Option<String>,
+        /// Workspaces that exist on the agent's local disk, formatted
+        /// as `"<account>/<name>"`. Hub seeds its workspaces table
+        /// with these on first sighting (one-time migration so users
+        /// don't lose access to pre-v1.13 dirs).
+        #[serde(default)]
+        workspaces: Vec<String>,
     },
     Pong,
 

@@ -34,6 +34,17 @@ pub struct DbAccount {
     pub sandbox_enabled: bool,
 }
 
+/// One row in the hub-managed workspace registry. The actual files
+/// still live on the agent's disk; this is just the (account, agent,
+/// name) binding the menu + OpenSession routing rely on.
+#[derive(Debug, Clone)]
+pub struct WorkspaceBinding {
+    pub account: String,
+    pub agent: String,
+    pub name: String,
+    pub created_at: i64,
+}
+
 impl Db {
     pub async fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -58,6 +69,32 @@ impl Db {
     }
 
     async fn run_migrations(&self) -> Result<()> {
+        // Pre-step: drop any stale `workspaces` table left over from
+        // the abandoned hub-canonical experiment on the feature
+        // branch. Its schema didn't have the `agent` column, so the
+        // CREATE INDEX statements below would fail with
+        // "no such column: agent" on dbs that touched that branch.
+        // The new shape is purely a name→agent binding (no canonical
+        // file content), so the old rows wouldn't be meaningful here
+        // anyway — agent Hello reseeds the table on connect.
+        let cols = sqlx::query("PRAGMA table_info(workspaces)")
+            .fetch_all(&self.pool)
+            .await
+            .ok()
+            .unwrap_or_default();
+        let table_exists = !cols.is_empty();
+        let has_agent_col = cols.iter().any(|r| {
+            let name: String = r.try_get("name").unwrap_or_default();
+            name == "agent"
+        });
+        if table_exists && !has_agent_col {
+            tracing::info!("dropping legacy workspaces table (schema predates v1.13 binding model)");
+            sqlx::query("DROP TABLE workspaces")
+                .execute(&self.pool)
+                .await
+                .context("drop legacy workspaces table")?;
+        }
+
         // No external migration tool — hub owns its schema. Each statement
         // is idempotent (`IF NOT EXISTS`) so an existing db just gets the
         // new objects on upgrade.
@@ -169,6 +206,24 @@ impl Db {
                 expires_at INTEGER NOT NULL
             )",
             "CREATE INDEX IF NOT EXISTS idx_user_sessions_expires ON user_sessions(expires_at)",
+            // Hub-managed binding of workspace name → owning agent.
+            // The actual workspace files still live on the agent's
+            // disk (v1.12 model); this table just records "user X's
+            // workspace Y belongs to agent Z" so the menu can show
+            // one cross-agent list and the open path knows which
+            // agent to route to. PK is (account, agent, name) so
+            // two agents can each have a workspace called "proj" —
+            // the UI disambiguates by showing the agent suffix
+            // when the bare name would collide.
+            "CREATE TABLE IF NOT EXISTS workspaces (
+                account    TEXT NOT NULL,
+                agent      TEXT NOT NULL,
+                name       TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (account, agent, name)
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_workspaces_account ON workspaces(account)",
+            "CREATE INDEX IF NOT EXISTS idx_workspaces_agent ON workspaces(agent)",
             // Compat for deployments that already ran the unguarded
             // seed (pre-v1.8.x): if the ACL table is non-empty, assume
             // the seed has logically happened and lock the marker in,
@@ -384,6 +439,135 @@ impl Db {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    // ---- workspaces (hub-managed binding) -----------------------------
+
+    /// Record that `account`'s `name` workspace lives on `agent`.
+    /// `INSERT OR IGNORE` semantics: a duplicate `(account, agent,
+    /// name)` is a no-op (used by the agent-Hello seeding path).
+    /// Returns true if a new row was inserted, false if the binding
+    /// already existed.
+    pub async fn upsert_workspace_binding(
+        &self,
+        account: &str,
+        agent: &str,
+        name: &str,
+    ) -> Result<bool> {
+        let r = sqlx::query(
+            "INSERT OR IGNORE INTO workspaces (account, agent, name, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(account)
+        .bind(agent)
+        .bind(name)
+        .bind(chrono::Utc::now().timestamp())
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Strict insert — fails if the same `(account, agent, name)`
+    /// already exists. Use for user-driven create flows so a UI
+    /// typo doesn't silently no-op.
+    pub async fn insert_workspace_binding(
+        &self,
+        account: &str,
+        agent: &str,
+        name: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO workspaces (account, agent, name, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(account)
+        .bind(agent)
+        .bind(name)
+        .bind(chrono::Utc::now().timestamp())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_workspace_binding(
+        &self,
+        account: &str,
+        agent: &str,
+        name: &str,
+    ) -> Result<u64> {
+        let r = sqlx::query(
+            "DELETE FROM workspaces WHERE account = ?1 AND agent = ?2 AND name = ?3",
+        )
+        .bind(account)
+        .bind(agent)
+        .bind(name)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// Every workspace this account owns, across all agents. Order
+    /// is `(agent, name)` so the picker's grouping stays predictable
+    /// across redraws.
+    pub async fn list_workspaces_for_account(
+        &self,
+        account: &str,
+    ) -> Result<Vec<WorkspaceBinding>> {
+        let rows = sqlx::query(
+            "SELECT account, agent, name, created_at
+               FROM workspaces
+              WHERE account = ?1
+              ORDER BY agent, name",
+        )
+        .bind(account)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| WorkspaceBinding {
+                account: r.get("account"),
+                agent: r.get("agent"),
+                name: r.get("name"),
+                created_at: r.get("created_at"),
+            })
+            .collect())
+    }
+
+    /// Look up the owning agent for a given workspace name. Used by
+    /// OpenSession to route to the right agent without the client
+    /// having to specify it on every call. Returns `Ok(None)` if no
+    /// such binding exists (e.g. the workspace was deleted between
+    /// the menu render and the user pressing Enter).
+    pub async fn get_workspace_agent(
+        &self,
+        account: &str,
+        agent: &str,
+        name: &str,
+    ) -> Result<Option<String>> {
+        let row = sqlx::query(
+            "SELECT agent FROM workspaces
+              WHERE account = ?1 AND agent = ?2 AND name = ?3",
+        )
+        .bind(account)
+        .bind(agent)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get("agent")))
+    }
+
+    /// Drop every workspace binding for `agent`. Called when an
+    /// admin deletes the agent so we don't leave dangling rows that
+    /// reference a name that will never come back online.
+    pub async fn delete_workspace_bindings_for_agent(
+        &self,
+        agent: &str,
+    ) -> Result<u64> {
+        let r = sqlx::query("DELETE FROM workspaces WHERE agent = ?1")
+            .bind(agent)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
     }
 
     // ---- account → agent whitelist ------------------------------------

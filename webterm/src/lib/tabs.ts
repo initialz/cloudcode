@@ -30,8 +30,6 @@ export function tabKey(agent: string, workspace: string): string {
 
 /** Human-readable label shown in the tab bar. */
 export function tabLabel(tab: Pick<Tab, 'agent' | 'workspace' | 'tool'>): string {
-  if (tab.tool) {
-    return `${tab.agent}·${tab.workspace}·${tab.tool}`;
-  }
-  return `${tab.agent}·${tab.workspace}`;
+  const base = `${tab.workspace}@${tab.agent}`;
+  return tab.tool ? `${base}·${tab.tool}` : base;
 }

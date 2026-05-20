@@ -1133,6 +1133,105 @@ struct WorkspaceRowDto {
 
 const WORKSPACES_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
+#[derive(Deserialize)]
+pub struct WorkspaceDeleteRequest {
+    pub agent: String,
+    pub account: String,
+    pub workspace: String,
+}
+
+/// `POST /admin/api/workspaces/delete`
+///
+/// Admin-driven workspace removal: route a `WorkspaceDelete` to the
+/// owning agent (mirroring what the user-facing client would do),
+/// then drop the hub-side binding so the picker stops advertising
+/// it. If the agent is offline we still drop the binding — the
+/// admin's intent is "stop tracking this", and the dir on the dead
+/// agent's disk would be cleaned up either by re-onboarding or by
+/// the agent operator manually. We refuse if a client is currently
+/// attached so the admin doesn't yank a workspace out from under a
+/// live claude session.
+pub async fn workspace_delete(
+    State(state): State<AdminState>,
+    Json(req): Json<WorkspaceDeleteRequest>,
+) -> Response {
+    use crate::tunnel::{ClientMsg, ServerMsg};
+    let key = (req.agent.clone(), req.account.clone(), req.workspace.clone());
+    if state.app.workspaces.contains_key(&key) {
+        return err(
+            StatusCode::CONFLICT,
+            "in_use",
+            format!(
+                "workspace '{}' on agent '{}' is currently in use",
+                req.workspace, req.agent
+            ),
+        );
+    }
+    let agent_conn = state.app.registry.get(&req.agent);
+    if let Some(conn) = agent_conn {
+        let request_id = uuid::Uuid::new_v4();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        conn.register_workspace_request(request_id, tx);
+        if conn
+            .send(ServerMsg::WorkspaceDelete {
+                request_id,
+                account: req.account.clone(),
+                name: req.workspace.clone(),
+            })
+            .await
+            .is_err()
+        {
+            return err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "agent_disconnected",
+                "agent disconnected before delete acked",
+            );
+        }
+        match tokio::time::timeout(WORKSPACES_REQUEST_TIMEOUT, rx).await {
+            Ok(Ok(ClientMsg::WorkspaceDeleteResult { error, .. })) => {
+                if let Some(e) = error {
+                    return err(StatusCode::BAD_GATEWAY, "agent_error", e);
+                }
+            }
+            _ => {
+                return err(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "agent_timeout",
+                    "agent did not ack the delete in time",
+                );
+            }
+        }
+    } else {
+        tracing::info!(
+            agent = %req.agent,
+            account = %req.account,
+            workspace = %req.workspace,
+            "workspace_delete: agent offline; dropping DB binding only"
+        );
+    }
+    if let Err(e) = state
+        .app
+        .db
+        .delete_workspace_binding(&req.account, &req.agent, &req.workspace)
+        .await
+    {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "db_error",
+            format!("delete binding: {e}"),
+        );
+    }
+    state.app.audit.write(crate::audit::AuditEvent {
+        account: Some(req.account.clone()),
+        agent: Some(req.agent.clone()),
+        workspace: Some(req.workspace.clone()),
+        status: Some(200),
+        reason: Some("admin deleted workspace".into()),
+        ..crate::audit::AuditEvent::new("workspace_deleted_admin")
+    });
+    (StatusCode::NO_CONTENT).into_response()
+}
+
 pub async fn workspaces_list(State(state): State<AdminState>) -> Response {
     use crate::registry::AgentConn;
     use crate::tunnel::{ClientMsg, ServerMsg};

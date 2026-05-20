@@ -20,6 +20,7 @@ import { apiClient } from '@/lib/api';
 import {
   WireSocket,
   type AgentItem,
+  type WorkspaceItem,
   type HubMsg,
   type PaneLayout,
   type SplitDirection,
@@ -37,7 +38,6 @@ import { DEFAULT_TOOL, KNOWN_TOOLS } from '@/lib/tools';
 import Sidebar from '@/components/Sidebar';
 import TabBar from '@/components/TabBar';
 import SettingsDialog from '@/components/SettingsDialog';
-import type { AgentWorkspaceCache } from '@/components/AgentTree';
 
 // ── xterm theme helpers ──────────────────────────────────────────────────────
 
@@ -89,7 +89,7 @@ export default function Workbench() {
   // Agent tree data
   const [agents, setAgents] = useState<AgentItem[]>([]);
   const [agentsLoading, setAgentsLoading] = useState(true);
-  const [wsCache, setWsCache] = useState<AgentWorkspaceCache>(new Map());
+  const [workspaces, setWorkspaces] = useState<WorkspaceItem[]>([]);
 
   // Currently "selected" agent on the control connection (needed for create/list)
   const ctrlAgentRef = useRef<string | null>(null);
@@ -183,23 +183,18 @@ export default function Workbench() {
 
   // ── Control WS helpers ─────────────────────────────────────────────────────
 
-  const refreshWorkspaces = useCallback((agent: string) => {
+  // v1.13: list_workspaces returns ALL workspaces across agents in
+  // one frame. No more select_agent dance — we just ask the hub
+  // and group by item.agent client-side for the tree UI.
+  const refreshWorkspaces = useCallback(() => {
     if (!ctrlWsRef.current?.connected) return;
-    // If control ws is already on this agent, just list; otherwise switch first.
-    if (ctrlAgentRef.current === agent) {
-      ctrlWsRef.current.send({ type: 'list_workspaces' });
-    } else {
-      ctrlWsRef.current.send({ type: 'select_agent', agent });
-    }
+    ctrlWsRef.current.send({ type: 'list_workspaces' });
   }, []);
 
   const schedulePoll = useCallback(() => {
     if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
     pollTimerRef.current = setTimeout(() => {
-      // Re-fetch all currently expanded agents
-      if (ctrlAgentRef.current) {
-        refreshWorkspaces(ctrlAgentRef.current);
-      }
+      refreshWorkspaces();
       schedulePoll();
     }, 30_000);
   }, [refreshWorkspaces]);
@@ -212,6 +207,7 @@ export default function Workbench() {
         case 'welcome':
           setCtrlReady(true);
           ctrlWsRef.current?.send({ type: 'list_agents' });
+          ctrlWsRef.current?.send({ type: 'list_workspaces' });
           break;
 
         case 'agent_list':
@@ -220,36 +216,24 @@ export default function Workbench() {
           break;
 
         case 'agent_selected':
+          // Legacy frame; we no longer drive the picker via
+          // select_agent. Tabs may still trigger one via the
+          // session-open path (line ~561). Keep ctrlAgentRef in
+          // sync for any code that still reads it, but don't
+          // re-fetch — the cross-agent list is already up to date.
           ctrlAgentRef.current = msg.agent;
-          // Mark as loading in cache
-          setWsCache((prev) => {
-            const next = new Map(prev);
-            if (!next.has(msg.agent) || next.get(msg.agent)?.status === 'idle') {
-              next.set(msg.agent, { status: 'loading' });
-            }
-            return next;
-          });
-          ctrlWsRef.current?.send({ type: 'list_workspaces' });
           break;
 
         case 'workspace_list':
-          if (ctrlAgentRef.current) {
-            const agent = ctrlAgentRef.current;
-            setWsCache((prev) => {
-              const next = new Map(prev);
-              next.set(agent, { status: 'loaded', items: msg.items });
-              return next;
-            });
-          }
+          // v1.13: flat cross-agent list — pass through directly.
+          setWorkspaces(msg.items);
           break;
 
         case 'workspace_created':
         case 'workspace_deleted':
         case 'workspace_reset':
-          // Refresh the current agent's list
-          if (ctrlAgentRef.current) {
-            ctrlWsRef.current?.send({ type: 'list_workspaces' });
-          }
+          // Single round-trip refresh; no agent context needed.
+          ctrlWsRef.current?.send({ type: 'list_workspaces' });
           break;
 
         case 'rejected':
@@ -296,37 +280,9 @@ export default function Workbench() {
 
   // ── Sidebar callbacks ──────────────────────────────────────────────────────
 
-  function handleExpandAgent(agent: string) {
-    // Mark as loading if first time
-    setWsCache((prev) => {
-      const next = new Map(prev);
-      if (!next.has(agent)) {
-        next.set(agent, { status: 'loading' });
-      }
-      return next;
-    });
-
-    if (!ctrlWsRef.current?.connected) return;
-
-    if (ctrlAgentRef.current === agent) {
-      // Already selected — just refresh
-      ctrlWsRef.current.send({ type: 'list_workspaces' });
-    } else {
-      // Switch agent on control ws (triggers agent_selected → list_workspaces)
-      ctrlWsRef.current.send({ type: 'select_agent', agent });
-    }
-  }
-
   function handleCreateWorkspace(agent: string, name: string) {
     if (!ctrlWsRef.current?.connected) return;
-    if (ctrlAgentRef.current !== agent) {
-      // Switch then create — create_workspace fires after agent_selected
-      // We need to queue the create; simplest: switch and rely on the
-      // agent_selected handler, but we don't have a queue mechanism.
-      // Instead switch synchronously and immediately send create.
-      ctrlWsRef.current.send({ type: 'select_agent', agent });
-    }
-    ctrlWsRef.current.send({ type: 'create_workspace', name });
+    ctrlWsRef.current.send({ type: 'create_workspace', name, agent });
   }
 
   // The hub holds a per-workspace mutex: as long as some session is
@@ -358,20 +314,14 @@ export default function Workbench() {
   function handleResetWorkspace(agent: string, workspace: string) {
     if (!ctrlWsRef.current?.connected) return;
     withTabClosed(agent, workspace, () => {
-      if (ctrlAgentRef.current !== agent) {
-        ctrlWsRef.current?.send({ type: 'select_agent', agent });
-      }
-      ctrlWsRef.current?.send({ type: 'reset_workspace', name: workspace });
+      ctrlWsRef.current?.send({ type: 'reset_workspace', name: workspace, agent });
     });
   }
 
   function handleDeleteWorkspace(agent: string, workspace: string) {
     if (!ctrlWsRef.current?.connected) return;
     withTabClosed(agent, workspace, () => {
-      if (ctrlAgentRef.current !== agent) {
-        ctrlWsRef.current?.send({ type: 'select_agent', agent });
-      }
-      ctrlWsRef.current?.send({ type: 'delete_workspace', name: workspace });
+      ctrlWsRef.current?.send({ type: 'delete_workspace', name: workspace, agent });
     });
   }
 
@@ -554,15 +504,10 @@ export default function Workbench() {
   ) {
     switch (msg.type) {
       case 'welcome': {
+        // v1.13: skip select_agent. open_session carries the
+        // workspace's bound `agent` directly so the hub routes
+        // without an extra round-trip.
         dispatchTabs({ type: 'UPDATE', id: tabId, patch: { status: 'opening' } });
-        // Select agent, then open session
-        const tab = tabsRef.current.find((t) => t.id === tabId);
-        if (!tab) break;
-        tab.ws.send({ type: 'select_agent', agent });
-        break;
-      }
-      case 'agent_selected': {
-        // Now open session. Get current fit dimensions.
         const tab = tabsRef.current.find((t) => t.id === tabId);
         if (!tab) break;
         let cols = 80;
@@ -591,6 +536,7 @@ export default function Workbench() {
         const openMsg: Parameters<typeof tab.ws.send>[0] = {
           type: 'open_session',
           workspace,
+          agent,
           cols,
           rows,
           ...(tool ? { tool } : {}),
@@ -614,10 +560,9 @@ export default function Workbench() {
           if (tab.id === activeTabIdRef.current) {
             tab.term.focus();
           }
-          // Refresh workspace list to show active dot
-          if (ctrlAgentRef.current === agent) {
-            ctrlWsRef.current?.send({ type: 'list_workspaces' });
-          }
+          // Refresh the cross-agent list so the new "active" badge
+          // shows up on the row that just opened.
+          ctrlWsRef.current?.send({ type: 'list_workspaces' });
         }, 50);
         break;
       }
@@ -628,9 +573,7 @@ export default function Workbench() {
         // closing the tab here would discard a live conversation just
         // because Split with codex (or similar) failed.
         addToast(msg.message || 'Session error');
-        if (ctrlAgentRef.current === agent) {
-          ctrlWsRef.current?.send({ type: 'list_workspaces' });
-        }
+        ctrlWsRef.current?.send({ type: 'list_workspaces' });
         break;
       case 'session_closed':
         // claude exited (/exit, Ctrl+C, crash) — collapse the tab so
@@ -836,10 +779,9 @@ export default function Workbench() {
         account={account}
         agents={agents}
         agentsLoading={agentsLoading}
-        cache={wsCache}
+        workspaces={workspaces}
         openTabKeys={openTabKeys}
         activeTabKey={activeTabKey}
-        onExpandAgent={handleExpandAgent}
         onOpenWorkspace={openTab}
         onCreateWorkspace={handleCreateWorkspace}
         onResetWorkspace={handleResetWorkspace}

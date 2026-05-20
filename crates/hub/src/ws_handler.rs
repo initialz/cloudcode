@@ -28,7 +28,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 version,
                 agent_version,
                 target_triple,
-            }) => (name, secret, version, agent_version, target_triple),
+                workspaces,
+            }) => (name, secret, version, agent_version, target_triple, workspaces),
             _ => {
                 let _ = send_rejected(&mut sink, RejectReason::AuthFailed).await;
                 return;
@@ -37,7 +38,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         _ => return,
     };
 
-    let (name, secret, version, agent_version, target_triple) = hello;
+    let (name, secret, version, agent_version, target_triple, agent_workspaces) = hello;
 
     if version != PROTOCOL_VERSION {
         let _ = send_rejected(&mut sink, RejectReason::VersionMismatch).await;
@@ -67,6 +68,44 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     }
 
     tracing::info!(agent = %name, "agent connected");
+
+    // One-time migration: seed hub's `workspaces` table with anything
+    // this agent already has on local disk. Each entry comes in as
+    // "<account>/<name>"; we INSERT OR IGNORE so a name already
+    // owned by another agent (or by a previous run of this agent)
+    // is left alone. First-come-first-served if two agents happen
+    // to report the same `(account, name)`.
+    let mut seeded = 0usize;
+    for slash in &agent_workspaces {
+        let Some((account, ws_name)) = slash.split_once('/') else {
+            continue;
+        };
+        if account.is_empty() || ws_name.is_empty() {
+            continue;
+        }
+        match state
+            .db
+            .upsert_workspace_binding(account, &name, ws_name)
+            .await
+        {
+            Ok(true) => seeded += 1,
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                agent = %name,
+                account = %account,
+                workspace = %ws_name,
+                error = %e,
+                "could not seed workspace binding"
+            ),
+        }
+    }
+    if seeded > 0 {
+        tracing::info!(
+            agent = %name,
+            count = seeded,
+            "seeded workspace bindings from agent Hello"
+        );
+    }
 
     let writer = tokio::spawn(async move {
         let mut ping = tokio::time::interval(PING_INTERVAL);

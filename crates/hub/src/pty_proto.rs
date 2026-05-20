@@ -22,25 +22,43 @@ pub enum ClientToHub {
     },
     /// Pre-session: list online agents.
     ListAgents,
-    /// Pre-session (or in-session): list workspaces on the selected agent.
+    /// List every workspace bound to this account across all agents
+    /// it's allowed to use. Each item carries its owning agent name +
+    /// whether that agent is currently online. The picker uses this
+    /// to render one cross-agent list — no more separate "pick agent
+    /// then pick workspace" stages.
     ListWorkspaces,
+    /// Create workspace `name` bound to `agent`. Both fields are
+    /// required: a workspace's owning agent is locked in at creation
+    /// time and never changes. Same-named workspaces on different
+    /// agents are allowed (UI shows them disambiguated as
+    /// `name@agent`); same `(account, agent, name)` triple is a
+    /// hard error.
     CreateWorkspace {
         name: String,
+        agent: String,
     },
+    /// Delete a workspace binding (and ask the owning agent to nuke
+    /// the on-disk dir).
     DeleteWorkspace {
         name: String,
+        agent: String,
     },
     /// Clear the saved session for a workspace (kill its tmux server,
-    /// wipe claude conversation history) without removing the workspace
-    /// directory itself.
+    /// wipe claude conversation history) without removing the
+    /// workspace directory itself. Routed to the bound agent.
     ResetWorkspace {
         name: String,
+        agent: String,
     },
-    /// Open a PTY session in the given workspace on the selected agent.
-    /// `claude_args` is forwarded verbatim to `claude`'s argv when the
-    /// session is first created (tmux ignores it on re-attach).
+    /// Open a PTY session in the given workspace. The owning agent
+    /// is part of the workspace identity (the UI carries it forward
+    /// from the workspace picker). `claude_args` is forwarded
+    /// verbatim to `claude`'s argv when the session is first created
+    /// (tmux ignores it on re-attach).
     OpenSession {
         workspace: String,
+        agent: String,
         cols: u16,
         rows: u16,
         #[serde(default)]
@@ -163,6 +181,11 @@ pub struct AgentInfo {
 
 /// Workspace status row carried in HubToClient::WorkspaceList.
 ///
+/// - `agent` = the agent that owns this workspace (bound at create
+///   time, immutable).
+/// - `agent_online` = whether the bound agent is currently
+///   registered + reachable on the hub. Opening an offline-agent
+///   workspace is rejected client-side without bothering the hub.
 /// - `tmux_alive` = agent has a live tmux server for this workspace
 ///   (so the previous claude state is still recoverable).
 /// - `has_client` = some cloudcode client is currently attached to it.
@@ -170,6 +193,14 @@ pub struct AgentInfo {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct WorkspaceInfo {
     pub name: String,
+    /// Bound agent's name. Required as of v1.13 — older hubs that
+    /// returned WorkspaceInfo without this field shouldn't talk to
+    /// this client, but `#[serde(default)]` keeps us crash-free if
+    /// they do.
+    #[serde(default)]
+    pub agent: String,
+    #[serde(default)]
+    pub agent_online: bool,
     #[serde(default)]
     pub tmux_alive: bool,
     #[serde(default)]

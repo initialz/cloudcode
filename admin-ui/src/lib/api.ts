@@ -156,6 +156,12 @@ export const apiClient = {
   },
   workspaces: {
     list: () => api<WorkspaceRowDto[]>('/workspaces'),
+    delete: (body: { agent: string; account: string; workspace: string }) =>
+      api<void>('/workspaces/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }),
   },
   stats: {
     leaderboard: (window: '7d' | '30d', group: 'account' | 'agent') =>

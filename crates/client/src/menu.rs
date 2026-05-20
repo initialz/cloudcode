@@ -1,12 +1,19 @@
 //! Interactive TUI menu shown before opening a PTY.
 //!
-//! Two stages:
-//!   1. Pick an agent (arrow keys + Enter).
-//!   2. Pick a workspace (arrow keys + Enter); `c` creates a new one (text
-//!      input prompt), `d` deletes the highlighted one (confirm prompt),
-//!      `Esc` goes back to the agent picker.
+//! v1.13 flow — single-stage workspace picker. Every workspace is
+//! bound to an owning agent at create time, so the picker shows
+//! one cross-agent list and Enter on a row routes directly to that
+//! workspace's agent. Workspaces whose agent is offline render
+//! greyed out and refuse to open with a toast.
 //!
-//! Esc / `q` at the agent picker quits cloudcode.
+//! Keys on the picker:
+//!   ↑↓ / j k / g G   move
+//!   Enter            open the selected workspace
+//!   c                create a workspace (prompts for name, then
+//!                    picks an online agent)
+//!   d                delete (confirm prompt)
+//!   r                reset (kills the saved tmux + claude history)
+//!   q / Esc          quit cloudcode
 
 use crate::input::{parse_keys, ByteRx, MenuKey};
 use crate::proto::{ClientToHub, HubToClient};
@@ -25,32 +32,17 @@ use ratatui::Terminal;
 use std::io::stdout;
 
 pub enum MenuOutcome {
+    /// User picked a workspace + its bound agent. Caller opens a
+    /// session via OpenSession { workspace, agent, ... }.
     OpenWorkspace { agent: String, workspace: String },
-    /// User quit the menu. `from_agent_picker` is true when the quit
-    /// happened on the stage-1 agent picker (so the caller can clear
-    /// the remembered last_agent and bring the user back to the
-    /// agent picker on the next launch). False means they quit deeper
-    /// in (workspace picker), and the caller should preserve any
-    /// last_agent so a subsequent launch lands on the workspace
-    /// picker for the same agent.
-    Quit { from_agent_picker: bool },
-}
-
-/// How the menu should enter. After claude exits the caller passes
-/// `WorkspacePicker { agent }` so the user lands back where they were
-/// (the workspace picker for that agent) instead of starting from
-/// the agent picker. Falls back to AgentPicker on any mismatch
-/// (agent offline, no longer in the ACL, hub rejects).
-pub enum MenuStart {
-    AgentPicker,
-    WorkspacePicker { agent: String },
+    /// User pressed q / Esc at the workspace picker.
+    Quit,
 }
 
 pub async fn run(
     wire: &mut Wire,
     bytes: &mut ByteRx,
     account: &str,
-    start: MenuStart,
 ) -> Result<MenuOutcome> {
     enable_raw_mode()?;
     let mut out = stdout();
@@ -58,7 +50,7 @@ pub async fn run(
     let backend = CrosstermBackend::new(out);
     let mut term = Terminal::new(backend)?;
     let mut keys = MenuKeyQueue::default();
-    let result = run_inner(&mut term, wire, bytes, &mut keys, account, start).await;
+    let result = run_inner(&mut term, wire, bytes, &mut keys, account).await;
     disable_raw_mode().ok();
     execute!(term.backend_mut(), LeaveAlternateScreen).ok();
     term.show_cursor().ok();
@@ -88,167 +80,207 @@ async fn run_inner<B: ratatui::backend::Backend>(
     bytes: &mut ByteRx,
     keys: &mut MenuKeyQueue,
     account: &str,
-    start: MenuStart,
 ) -> Result<MenuOutcome> {
-    // Pending fast-path target. Consumed on the next outer iteration
-    // so that an Esc back from stage 2 doesn't keep re-entering it.
-    let mut pending_fast_agent: Option<String> = match start {
-        MenuStart::WorkspacePicker { agent } => Some(agent),
-        MenuStart::AgentPicker => None,
-    };
-
-    'outer: loop {
-        // ---- stage 1 (with optional fast-path skip) ----
-        // Try fast-path first; on miss, fall through to the normal
-        // agent picker.
-        let mut bound: Option<String> = if let Some(target) = pending_fast_agent.take() {
-            fast_bind(wire, &target).await
-        } else {
-            None
-        };
-        let agent = if let Some(a) = bound.take() {
-            crate::write_last_agent(&a);
-            a
-        } else {
-            match pick_agent_stage(term, wire, bytes, keys, account).await? {
-                Some(a) => a,
-                None => return Ok(MenuOutcome::Quit { from_agent_picker: true }),
-            }
-        };
-
-        // ---- stage 2: workspace picker (loop until pick or Esc back) ----
-        let last_ws = crate::read_last_workspace(&agent);
-        let mut w_state = ListState::default();
-        // After a successful `c`reate, prefer the just-created workspace
-        // for the next selection — even over the previously-saved
-        // last-used one.
-        let mut pending_select: Option<String> = None;
-        loop {
-            let workspaces = list_workspaces(wire).await?;
-            let workspace_rows: Vec<PickerRow> = workspaces
-                .iter()
-                .map(|w| PickerRow {
-                    name: w.name.clone(),
-                    badge: if w.has_client {
+    // After a successful `c`reate the just-created workspace is
+    // pinned as the next cursor target so the user can hit Enter
+    // immediately to enter claude.
+    let mut pending_select: Option<(String, String)> = None;
+    let mut w_state = ListState::default();
+    let title = "Select workspace";
+    let hint = "↑↓ Enter · c create · r reset · d delete · q quit";
+    loop {
+        let workspaces = list_workspaces(wire).await?;
+        // Disambiguate names that exist on more than one agent —
+        // bare "proj" when unique, "proj@agentA" / "proj@agentB"
+        // when colliding within the list.
+        let mut name_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for w in &workspaces {
+            *name_counts.entry(w.name.as_str()).or_insert(0) += 1;
+        }
+        let workspace_rows: Vec<PickerRow> = workspaces
+            .iter()
+            .map(|w| {
+                let display = if name_counts.get(w.name.as_str()).copied().unwrap_or(0) > 1 {
+                    format!("{}@{}", w.name, w.agent)
+                } else {
+                    w.name.clone()
+                };
+                PickerRow {
+                    name: display,
+                    badge: if !w.agent_online {
+                        Some(Badge::offline(&w.agent))
+                    } else if w.has_client {
                         Some(Badge::active())
                     } else if w.tmux_alive {
                         Some(Badge::saved())
                     } else {
-                        None
+                        Some(Badge::agent(&w.agent))
                     },
-                })
-                .collect();
-            let preferred = pending_select.take().or_else(|| last_ws.clone());
-            let initial = preferred
-                .as_deref()
-                .and_then(|n| workspaces.iter().position(|w| w.name == n))
-                .unwrap_or(0);
-            if w_state.selected().is_none() {
-                w_state.select(Some(initial.min(workspaces.len().saturating_sub(1))));
+                }
+            })
+            .collect();
+        let preferred = pending_select.take().or_else(|| {
+            crate::read_last_workspace_global()
+                .and_then(|s| s.split_once('|').map(|(a, n)| (a.to_string(), n.to_string())))
+        });
+        let initial = preferred
+            .as_ref()
+            .and_then(|(a, n)| {
+                workspaces
+                    .iter()
+                    .position(|w| &w.agent == a && &w.name == n)
+            })
+            .unwrap_or(0);
+        if w_state.selected().is_none() && !workspaces.is_empty() {
+            w_state.select(Some(initial.min(workspaces.len() - 1)));
+        }
+        term.draw(|f| {
+            draw_layout(
+                f,
+                account,
+                title,
+                &workspace_rows,
+                &mut w_state,
+                hint,
+                false,
+            )
+        })?;
+        let Some(k) = keys.next(bytes).await else {
+            return Ok(MenuOutcome::Quit);
+        };
+        match k {
+            MenuKey::Char('q') | MenuKey::Escape => return Ok(MenuOutcome::Quit),
+            MenuKey::Char('c') => {
+                if let Some((agent, name)) =
+                    prompt_create_workspace(term, wire, bytes, keys).await?
+                {
+                    pending_select = Some((agent, name));
+                    w_state.select(None);
+                }
             }
-            term.draw(|f| {
-                draw_layout(
-                    f,
-                    account,
-                    &format!("Select workspace on {}", agent),
-                    &workspace_rows,
-                    &mut w_state,
-                    "↑↓ Enter · c create · r reset · d delete · Esc back · q quit",
-                    false,
-                )
-            })?;
-            let Some(k) = keys.next(bytes).await else {
-                return Ok(MenuOutcome::Quit { from_agent_picker: false });
-            };
-            match k {
-                MenuKey::Escape => continue 'outer,
-                MenuKey::Char('q') => return Ok(MenuOutcome::Quit { from_agent_picker: false }),
-                MenuKey::Char('c') => {
-                    if let Some(name) =
-                        prompt_input(term, bytes, keys, "create workspace", "").await?
-                    {
-                        let name = name.trim().to_string();
-                        if !name.is_empty() {
-                            create_workspace(wire, &name).await?;
-                            pending_select = Some(name);
+            MenuKey::Char('d') => {
+                if let Some(sel) = w_state.selected() {
+                    if let Some(ws) = workspaces.get(sel).cloned() {
+                        let confirmed = prompt_confirm(
+                            term,
+                            bytes,
+                            keys,
+                            &format!("delete workspace '{}' on agent '{}'?", ws.name, ws.agent),
+                        )
+                        .await?;
+                        if confirmed {
+                            if let Some(err) =
+                                delete_workspace(wire, &ws.name, &ws.agent).await?
+                            {
+                                show_message(term, &err, bytes, keys).await?;
+                            }
                             w_state.select(None);
                         }
                     }
                 }
-                MenuKey::Char('d') => {
-                    if let Some(sel) = w_state.selected() {
-                        if let Some(ws) = workspaces.get(sel) {
-                            let confirmed = prompt_confirm(
-                                term,
-                                bytes,
-                                keys,
-                                &format!("delete workspace '{}'?", ws.name),
-                            )
-                            .await?;
-                            if confirmed {
-                                delete_workspace(wire, &ws.name).await?;
-                                w_state.select(None);
-                            }
-                        }
-                    }
-                }
-                MenuKey::Char('r') => {
-                    if let Some(sel) = w_state.selected() {
-                        if let Some(ws) = workspaces.get(sel) {
-                            let confirmed = prompt_confirm(
-                                term,
-                                bytes,
-                                keys,
-                                &format!(
-                                    "reset session for '{}'? Files stay; tmux + conversation history cleared.",
-                                    ws.name
-                                ),
-                            )
-                            .await?;
-                            if confirmed {
-                                reset_workspace(wire, &ws.name).await?;
-                                w_state.select(None);
-                            }
-                        }
-                    }
-                }
-                _ => match handle_list_key(k, &mut w_state, workspaces.len()) {
-                    ListAction::Pick => {
-                        if let Some(sel) = w_state.selected() {
-                            if let Some(ws) = workspaces.get(sel).cloned() {
-                                let title = format!("Select workspace on {}", agent);
-                                let hint = "↑↓ Enter · c create · r reset · d delete · Esc back · q quit";
-                                let mut redraw = |pressed: bool| -> Result<()> {
-                                    term.draw(|f| {
-                                        draw_layout(
-                                            f,
-                                            account,
-                                            &title,
-                                            &workspace_rows,
-                                            &mut w_state,
-                                            hint,
-                                            pressed,
-                                        )
-                                    })?;
-                                    Ok(())
-                                };
-                                redraw(true)?;
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                redraw(false)?;
-                                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-                                return Ok(MenuOutcome::OpenWorkspace {
-                                    agent,
-                                    workspace: ws.name,
-                                });
-                            }
-                        }
-                    }
-                    ListAction::Quit => return Ok(MenuOutcome::Quit { from_agent_picker: false }),
-                    ListAction::Pass => {}
-                },
             }
+            MenuKey::Char('r') => {
+                if let Some(sel) = w_state.selected() {
+                    if let Some(ws) = workspaces.get(sel).cloned() {
+                        let confirmed = prompt_confirm(
+                            term,
+                            bytes,
+                            keys,
+                            &format!(
+                                "reset session for '{}' on '{}'? Files stay; tmux + conversation history cleared.",
+                                ws.name, ws.agent
+                            ),
+                        )
+                        .await?;
+                        if confirmed {
+                            if let Some(err) = reset_workspace(wire, &ws.name, &ws.agent).await? {
+                                show_message(term, &err, bytes, keys).await?;
+                            }
+                            w_state.select(None);
+                        }
+                    }
+                }
+            }
+            _ => match handle_list_key(k, &mut w_state, workspaces.len()) {
+                ListAction::Pick => {
+                    if let Some(sel) = w_state.selected() {
+                        if let Some(ws) = workspaces.get(sel).cloned() {
+                            if !ws.agent_online {
+                                show_message(
+                                    term,
+                                    &format!(
+                                        "agent '{}' is offline; can't open '{}'",
+                                        ws.agent, ws.name
+                                    ),
+                                    bytes,
+                                    keys,
+                                )
+                                .await?;
+                                continue;
+                            }
+                            let mut redraw = |pressed: bool| -> Result<()> {
+                                term.draw(|f| {
+                                    draw_layout(
+                                        f,
+                                        account,
+                                        title,
+                                        &workspace_rows,
+                                        &mut w_state,
+                                        hint,
+                                        pressed,
+                                    )
+                                })?;
+                                Ok(())
+                            };
+                            redraw(true)?;
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            redraw(false)?;
+                            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                            crate::write_last_workspace_global(&ws.agent, &ws.name);
+                            return Ok(MenuOutcome::OpenWorkspace {
+                                agent: ws.agent,
+                                workspace: ws.name,
+                            });
+                        }
+                    }
+                }
+                ListAction::Quit => return Ok(MenuOutcome::Quit),
+                ListAction::Pass => {}
+            },
         }
     }
+}
+
+/// `c` create flow: prompts for name, then opens an inline agent
+/// picker showing only online agents from the account's ACL.
+/// Returns `(agent, name)` on success.
+async fn prompt_create_workspace<B: ratatui::backend::Backend>(
+    term: &mut Terminal<B>,
+    wire: &mut Wire,
+    bytes: &mut ByteRx,
+    keys: &mut MenuKeyQueue,
+) -> Result<Option<(String, String)>> {
+    let Some(name) = prompt_input(term, bytes, keys, "create workspace", "").await? else {
+        return Ok(None);
+    };
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let agents = list_agents(wire).await?;
+    if agents.is_empty() {
+        show_message(term, "no agents online", bytes, keys).await?;
+        return Ok(None);
+    }
+    let Some(agent) = pick_agent_inline(term, bytes, keys, &agents, &name).await? else {
+        return Ok(None);
+    };
+    if let Some(err) = create_workspace(wire, &name, &agent).await? {
+        show_message(term, &err, bytes, keys).await?;
+        return Ok(None);
+    }
+    Ok(Some((agent, name)))
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +350,58 @@ fn paint_desktop(f: &mut ratatui::Frame) {
 /// the minimum representable vertical step. y overlaps the shadow's
 /// own y but the shadow still shows on the right; the press reads as
 /// a real two-axis tap. Springs back when `pressed = false`.
+/// Word-wrap a single-paragraph message to `width` columns. Splits on
+/// whitespace; any word longer than `width` is hard-broken so a long
+/// URL or path can't blow out the dialog. Width is measured in chars
+/// (close enough for the ASCII strings these dialogs carry — system
+/// notices like "agent 'foo' is offline; can't open 'bar'").
+fn wrap_text(msg: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![msg.to_string()];
+    }
+    let mut soft: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for word in msg.split_whitespace() {
+        let w = word.chars().count();
+        if cur_w == 0 {
+            cur.push_str(word);
+            cur_w = w;
+        } else if cur_w + 1 + w <= width {
+            cur.push(' ');
+            cur.push_str(word);
+            cur_w += 1 + w;
+        } else {
+            soft.push(std::mem::take(&mut cur));
+            cur.push_str(word);
+            cur_w = w;
+        }
+    }
+    if !cur.is_empty() {
+        soft.push(cur);
+    }
+    if soft.is_empty() {
+        return vec![String::new()];
+    }
+    let mut out: Vec<String> = Vec::new();
+    for line in soft {
+        if line.chars().count() <= width {
+            out.push(line);
+            continue;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        for chunk in chars.chunks(width) {
+            out.push(chunk.iter().collect());
+        }
+    }
+    out
+}
+
+/// Inset (left/right padding) applied to dialog body text so it
+/// doesn't kiss the border. Used by every helper that puts a
+/// free-form message inside a dialog.
+const DIALOG_TEXT_PAD: u16 = 2;
+
 fn paint_dialog_frame(f: &mut ratatui::Frame, want_w: u16, want_h: u16, pressed: bool) -> Rect {
     let area = f.area();
     let w = want_w.min(area.width.saturating_sub(4));
@@ -444,7 +528,7 @@ fn draw_layout(
 
     let label_w = items
         .iter()
-        .map(|r| r.name.chars().count() + r.badge.map(|b| b.width() + 1).unwrap_or(0))
+        .map(|r| r.name.chars().count() + r.badge.as_ref().map(|b| b.width() + 1).unwrap_or(0))
         .max()
         .unwrap_or(0);
     let want_w = ((label_w + 18)
@@ -536,10 +620,13 @@ pub struct PickerRow {
     pub badge: Option<Badge>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Badge {
-    pub glyph: &'static str, // "●" or "·"
-    pub label: &'static str, // " active" or " saved"
+    pub glyph: &'static str, // "●" or "·" or "◌"
+    /// Owned because workspace badges carry dynamic agent names
+    /// (e.g. ` [petez-laptop]`). Always pre-leaded with a space so
+    /// the badge reads as separated from the workspace name.
+    pub label: String,
     pub color: Color,
 }
 
@@ -547,15 +634,34 @@ impl Badge {
     pub fn active() -> Self {
         Badge {
             glyph: "●",
-            label: " active",
+            label: " active".into(),
             color: Color::Red,
         }
     }
     pub fn saved() -> Self {
         Badge {
             glyph: "·",
-            label: " saved",
+            label: " saved".into(),
             color: Color::Yellow,
+        }
+    }
+    /// Shown on a workspace whose agent is online but no in-flight
+    /// state. Carries the agent name so the user knows where it
+    /// lives even when no name collision forces an `@agent` suffix.
+    pub fn agent(name: &str) -> Self {
+        Badge {
+            glyph: "·",
+            label: format!(" [{}]", name),
+            color: Color::Cyan,
+        }
+    }
+    /// Bound agent is currently offline — workspace shows but is
+    /// not openable.
+    pub fn offline(agent: &str) -> Self {
+        Badge {
+            glyph: "◌",
+            label: format!(" {} offline", agent),
+            color: Color::DarkGray,
         }
     }
 
@@ -574,7 +680,7 @@ impl Badge {
 /// title bar (that one also has a trailing space).
 fn build_row(i: usize, row: &PickerRow, list_w: usize, selected: Option<usize>) -> ListItem<'static> {
     let prefix = format!("  {:>2}  ", i + 1);
-    let badge_w = row.badge.map(|b| b.width()).unwrap_or(0);
+    let badge_w = row.badge.as_ref().map(|b| b.width()).unwrap_or(0);
     let gutter = if row.badge.is_some() { 1 } else { 0 };
     let right_margin = 1usize;
     let used = prefix.chars().count() + row.name.chars().count() + gutter + badge_w + right_margin;
@@ -594,7 +700,7 @@ fn build_row(i: usize, row: &PickerRow, list_w: usize, selected: Option<usize>) 
             Span::styled(row.name.clone(), body_style),
             Span::styled(" ".repeat(pad + gutter), body_style),
         ];
-        if let Some(b) = row.badge {
+        if let Some(b) = row.badge.as_ref() {
             spans.push(Span::styled(
                 b.glyph,
                 Style::default()
@@ -603,7 +709,7 @@ fn build_row(i: usize, row: &PickerRow, list_w: usize, selected: Option<usize>) 
                     .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::styled(
-                b.label,
+                b.label.clone(),
                 Style::default().bg(HILITE_BG).fg(HILITE_FG),
             ));
         }
@@ -625,7 +731,7 @@ fn build_row(i: usize, row: &PickerRow, list_w: usize, selected: Option<usize>) 
         ),
         Span::styled(" ".repeat(pad + gutter), Style::default().bg(DIALOG_BG)),
     ];
-    if let Some(b) = row.badge {
+    if let Some(b) = row.badge.as_ref() {
         spans.push(Span::styled(
             b.glyph,
             Style::default()
@@ -634,7 +740,7 @@ fn build_row(i: usize, row: &PickerRow, list_w: usize, selected: Option<usize>) 
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
-            b.label,
+            b.label.clone(),
             Style::default().bg(DIALOG_BG).fg(Color::DarkGray),
         ));
     }
@@ -691,12 +797,29 @@ async fn show_message<B: ratatui::backend::Backend>(
     bytes: &mut ByteRx,
     keys: &mut MenuKeyQueue,
 ) -> Result<()> {
-    let msg_owned = msg.to_string();
+    // Dialog width is fixed-ish; height grows with how many lines the
+    // message wraps to. Reserve `DIALOG_TEXT_PAD` columns of breathing
+    // room on either side so the text doesn't run flush against the
+    // border, and a leading + trailing blank line inside the body.
+    let dialog_w: u16 = 56;
+    let text_w = (dialog_w as usize)
+        .saturating_sub(2) // border
+        .saturating_sub(DIALOG_TEXT_PAD as usize * 2);
+    let lines = wrap_text(msg, text_w);
+    // borders(2) + title bar(2) + top pad(1) + lines + bottom pad(1)
+    let dialog_h: u16 = 6u16.saturating_add(lines.len() as u16);
     term.draw(|f| {
-        let body = draw_titled_dialog(f, "cloudcode", 50, 7);
+        let body = draw_titled_dialog(f, "cloudcode", dialog_w, dialog_h);
+        let mut text: Vec<Line> = Vec::with_capacity(lines.len() + 2);
+        text.push(Line::raw(""));
+        for l in &lines {
+            text.push(Line::from(Span::raw(format!(
+                "{pad}{l}",
+                pad = " ".repeat(DIALOG_TEXT_PAD as usize),
+            ))));
+        }
         f.render_widget(
-            Paragraph::new(Line::from(Span::raw(msg_owned)))
-                .style(Style::default().bg(DIALOG_BG).fg(DIALOG_FG)),
+            Paragraph::new(text).style(Style::default().bg(DIALOG_BG).fg(DIALOG_FG)),
             body,
         );
         hint_bar(f, "Any key to continue");
@@ -764,23 +887,40 @@ async fn prompt_confirm<B: ratatui::backend::Backend>(
     keys: &mut MenuKeyQueue,
     msg: &str,
 ) -> Result<bool> {
+    let dialog_w: u16 = 60;
+    let text_w = (dialog_w as usize)
+        .saturating_sub(2)
+        .saturating_sub(DIALOG_TEXT_PAD as usize * 2);
+    let wrapped = wrap_text(msg, text_w);
+    // borders(2) + title bar(2) + top pad(1) + lines + gap(1) + buttons(1) + bottom pad(1)
+    let dialog_h: u16 = 8u16.saturating_add(wrapped.len() as u16);
+    let lines_len = wrapped.len() as u16;
     let draw = |term: &mut Terminal<B>, pressed_yes: bool| -> Result<()> {
-        let msg_owned = msg.to_string();
+        let wrapped = wrapped.clone();
         term.draw(move |f| {
-            let body = draw_titled_dialog(f, "Confirm", 56, 8);
+            let body = draw_titled_dialog(f, "Confirm", dialog_w, dialog_h);
             let body_chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(1),
-                    Constraint::Length(1),
-                    Constraint::Length(1),
+                    Constraint::Length(1),          // top pad
+                    Constraint::Length(lines_len),  // message
+                    Constraint::Length(1),          // gap
+                    Constraint::Length(1),          // buttons
                     Constraint::Min(0),
                 ])
                 .split(body);
+            let msg_lines: Vec<Line> = wrapped
+                .into_iter()
+                .map(|l| {
+                    Line::from(Span::raw(format!(
+                        "{pad}{l}",
+                        pad = " ".repeat(DIALOG_TEXT_PAD as usize),
+                    )))
+                })
+                .collect();
             f.render_widget(
-                Paragraph::new(Line::from(Span::raw(format!("  {}", msg_owned))))
-                    .style(Style::default().bg(DIALOG_BG).fg(DIALOG_FG)),
-                body_chunks[0],
+                Paragraph::new(msg_lines).style(Style::default().bg(DIALOG_BG).fg(DIALOG_FG)),
+                body_chunks[1],
             );
             let yes = ok_button("Yes", pressed_yes);
             let no = Span::styled("  < No >  ", Style::default().bg(DIALOG_BG).fg(DIALOG_FG));
@@ -789,7 +929,7 @@ async fn prompt_confirm<B: ratatui::backend::Backend>(
                     Line::from(vec![yes, Span::raw("    "), no]).alignment(Alignment::Center),
                 )
                 .style(Style::default().bg(DIALOG_BG)),
-                body_chunks[2],
+                body_chunks[3],
             );
             hint_bar(f, "y/Enter yes · n/Esc no");
         })?;
@@ -816,10 +956,52 @@ async fn prompt_confirm<B: ratatui::backend::Backend>(
 // Hub queries (text-only; menu doesn't expect binary frames)
 // ---------------------------------------------------------------------------
 
+/// Used by the create flow: present an inline agent picker over
+/// the supplied list (no extra round-trip), titled with what's
+/// being created. Returns None on Esc / q.
+async fn pick_agent_inline<B: ratatui::backend::Backend>(
+    term: &mut Terminal<B>,
+    bytes: &mut ByteRx,
+    keys: &mut MenuKeyQueue,
+    agents: &[String],
+    workspace_name: &str,
+) -> Result<Option<String>> {
+    if agents.is_empty() {
+        return Ok(None);
+    }
+    let mut a_state = ListState::default();
+    a_state.select(Some(0));
+    let rows: Vec<PickerRow> = agents
+        .iter()
+        .map(|n| PickerRow {
+            name: n.clone(),
+            badge: None,
+        })
+        .collect();
+    let title = format!("Create '{}' on which agent?", workspace_name);
+    let hint = "↑↓ move · Enter pick · Esc cancel";
+    loop {
+        term.draw(|f| {
+            draw_layout(f, "", &title, &rows, &mut a_state, hint, false)
+        })?;
+        let Some(k) = keys.next(bytes).await else {
+            return Ok(None);
+        };
+        match handle_list_key(k, &mut a_state, agents.len()) {
+            ListAction::Pick => {
+                return Ok(Some(agents[a_state.selected().unwrap_or(0)].clone()));
+            }
+            ListAction::Quit => return Ok(None),
+            ListAction::Pass => {}
+        }
+    }
+}
+
 /// Render the agent picker and return the chosen agent's name. Reads
 /// `crate::read_last_agent()` lazily so an Esc-back from stage 2
 /// highlights the agent the user just stepped away from, even within
 /// the same `menu::run` invocation.
+#[allow(dead_code)]
 async fn pick_agent_stage<B: ratatui::backend::Backend>(
     term: &mut Terminal<B>,
     wire: &mut Wire,
@@ -918,6 +1100,7 @@ async fn pick_agent_stage<B: ratatui::backend::Backend>(
 /// can fall back to the normal agent picker. Used after claude exits
 /// to land the user back in the workspace picker for the agent they
 /// were using.
+#[allow(dead_code)]
 async fn fast_bind(wire: &mut Wire, target: &str) -> Option<String> {
     // Sanity-check against the hub's view first: if the agent isn't
     // in the allow-listed online set, don't even attempt the bind
@@ -979,18 +1162,22 @@ async fn list_workspaces(wire: &mut Wire) -> Result<Vec<crate::proto::WorkspaceI
     }
 }
 
-async fn create_workspace(wire: &mut Wire, name: &str) -> Result<()> {
+/// `Ok(None)` = hub accepted; `Ok(Some(err))` = hub returned a
+/// SessionError with a human-readable reason the caller should
+/// surface in the TUI. Returns `Err` only on transport failure.
+async fn create_workspace(wire: &mut Wire, name: &str, agent: &str) -> Result<Option<String>> {
     wire.out_tx
         .send(OutFrame::Text(ClientToHub::CreateWorkspace {
             name: name.into(),
+            agent: agent.into(),
         }))
         .await
         .map_err(|_| anyhow!("hub disconnected"))?;
     loop {
         let m = expect_text(wire).await?;
         match m {
-            HubToClient::WorkspaceCreated { .. } => return Ok(()),
-            HubToClient::SessionError { .. } => return Ok(()),
+            HubToClient::WorkspaceCreated { .. } => return Ok(None),
+            HubToClient::SessionError { message } => return Ok(Some(message)),
             HubToClient::Ping => {
                 let _ = wire.out_tx.send(OutFrame::Text(ClientToHub::Pong)).await;
             }
@@ -999,18 +1186,19 @@ async fn create_workspace(wire: &mut Wire, name: &str) -> Result<()> {
     }
 }
 
-async fn delete_workspace(wire: &mut Wire, name: &str) -> Result<()> {
+async fn delete_workspace(wire: &mut Wire, name: &str, agent: &str) -> Result<Option<String>> {
     wire.out_tx
         .send(OutFrame::Text(ClientToHub::DeleteWorkspace {
             name: name.into(),
+            agent: agent.into(),
         }))
         .await
         .map_err(|_| anyhow!("hub disconnected"))?;
     loop {
         let m = expect_text(wire).await?;
         match m {
-            HubToClient::WorkspaceDeleted { .. } => return Ok(()),
-            HubToClient::SessionError { .. } => return Ok(()),
+            HubToClient::WorkspaceDeleted { .. } => return Ok(None),
+            HubToClient::SessionError { message } => return Ok(Some(message)),
             HubToClient::Ping => {
                 let _ = wire.out_tx.send(OutFrame::Text(ClientToHub::Pong)).await;
             }
@@ -1019,18 +1207,19 @@ async fn delete_workspace(wire: &mut Wire, name: &str) -> Result<()> {
     }
 }
 
-async fn reset_workspace(wire: &mut Wire, name: &str) -> Result<()> {
+async fn reset_workspace(wire: &mut Wire, name: &str, agent: &str) -> Result<Option<String>> {
     wire.out_tx
         .send(OutFrame::Text(ClientToHub::ResetWorkspace {
             name: name.into(),
+            agent: agent.into(),
         }))
         .await
         .map_err(|_| anyhow!("hub disconnected"))?;
     loop {
         let m = expect_text(wire).await?;
         match m {
-            HubToClient::WorkspaceReset { .. } => return Ok(()),
-            HubToClient::SessionError { .. } => return Ok(()),
+            HubToClient::WorkspaceReset { .. } => return Ok(None),
+            HubToClient::SessionError { message } => return Ok(Some(message)),
             HubToClient::Ping => {
                 let _ = wire.out_tx.send(OutFrame::Text(ClientToHub::Pong)).await;
             }
@@ -1044,4 +1233,37 @@ async fn expect_text(wire: &mut Wire) -> Result<HubToClient> {
         .recv()
         .await
         .ok_or_else(|| anyhow!("hub disconnected"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wrap_text;
+
+    #[test]
+    fn wraps_on_word_boundary() {
+        let out = wrap_text("agent 'PeteMacBookPro' is offline; can't open 'ws1'", 20);
+        assert!(out.len() >= 2);
+        for line in &out {
+            assert!(line.chars().count() <= 20, "line too long: {:?}", line);
+        }
+    }
+
+    #[test]
+    fn hard_breaks_overlong_words() {
+        let out = wrap_text("supercalifragilisticexpialidocious", 8);
+        assert_eq!(out.len(), 5);
+        assert_eq!(out[0], "supercal");
+    }
+
+    #[test]
+    fn short_message_stays_one_line() {
+        let out = wrap_text("hello world", 40);
+        assert_eq!(out, vec!["hello world".to_string()]);
+    }
+
+    #[test]
+    fn empty_message_yields_one_blank_line() {
+        let out = wrap_text("", 20);
+        assert_eq!(out, vec![String::new()]);
+    }
 }

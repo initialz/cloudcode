@@ -58,6 +58,10 @@ async fn run_once(state: Arc<AppState>) -> Result<(), RunError> {
         version: PROTOCOL_VERSION.into(),
         agent_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         target_triple: Some(crate::update::target_triple().to_string()),
+        // Seed hub's workspaces table with whatever we already have
+        // on disk. Hub upserts each `(account, this-agent, name)`;
+        // already-known bindings are a no-op.
+        workspaces: state.manager.list_workspace_paths(),
     };
     let hello_json = serde_json::to_string(&hello)
         .map_err(|e| RunError::Transient(format!("encode hello: {}", e)))?;
